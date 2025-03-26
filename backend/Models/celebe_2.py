@@ -13,11 +13,11 @@ from tqdm import tqdm  # Progress bar
 # Initialize face detector
 mtcnn = MTCNN(image_size=224, margin=20, post_process=True)
 
-# Augmentations (Fixed `ImageCompression` issue)
+# Augmentations
 transform = A.Compose([
     A.GaussianBlur(p=0.2),
     A.GaussNoise(p=0.2),
-    A.JpegCompression(quality_lower=85, quality_upper=95, p=0.5),  # ✅ Fixed compression
+    A.ImageCompression(quality=90, p=0.5),
     A.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
     ToTensorV2()
 ])
@@ -66,16 +66,7 @@ def continue_processing(category_folder):
     os.makedirs(train_dir, exist_ok=True)
     os.makedirs(val_dir, exist_ok=True)
 
-    # ✅ Check if frame directory exists before listing files
-    if not os.path.exists(frame_dir):
-        print(f"❌ Frame directory not found: {frame_dir}")
-        return
-
-    try:
-        image_files = [os.path.join(frame_dir, img) for img in os.listdir(frame_dir) if img.endswith(".jpg")]
-    except Exception as e:
-        print(f"❌ Error accessing frame directory: {e}")
-        return
+    image_files = [os.path.join(frame_dir, img) for img in os.listdir(frame_dir) if img.endswith(".jpg")]
 
     # Skip already processed images
     processed_train = set(os.listdir(train_dir))
@@ -98,7 +89,7 @@ def continue_processing(category_folder):
 
 # Paths
 output_root = "../image_data/image_dataset-4"
-category = "Celeb-synthesis"  # You can also process "Celeb-real" later
+category = "Celeb-synthesis"  # You can also process "Celeb-synthesis" later
 
 # Resume processing
 continue_processing(os.path.join(output_root, category))

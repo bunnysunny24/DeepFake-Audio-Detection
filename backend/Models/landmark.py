@@ -6,10 +6,9 @@ import dlib
 from torchvision import transforms
 
 # Paths to your dataset
-dataset_path = "../image_data/image-dataset-1"
-train_path = os.path.join(dataset_path, "../image_data/image-dataset-1/train")
-val_path = os.path.join(dataset_path, "../image_data/image-dataset-1/validation")
-
+dataset_path = os.path.abspath("../image_data/image-dataset-1")  # Absolute path
+train_path = os.path.join(dataset_path, "train")  
+val_path = os.path.join(dataset_path, "validation")
 # Initialize dlib face detector & landmark predictor
 detector = dlib.get_frontal_face_detector()
 predictor = dlib.shape_predictor("shape_predictor_68_face_landmarks.dat")

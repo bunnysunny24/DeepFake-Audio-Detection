@@ -1,0 +1,55 @@
+import os
+import cv2
+import numpy as np
+import mediapipe as mp
+from tqdm import tqdm
+
+# Initialize MediaPipe Face Mesh
+mp_face_mesh = mp.solutions.face_mesh
+face_mesh = mp_face_mesh.FaceMesh(static_image_mode=True, max_num_faces=1)
+
+# Paths
+DATASET_PATH = "D:/Bunny/Deepfake/backend/image_data/image-dataset-7"
+HEATMAP_PATH = "D:/Bunny/Deepfake/backend/image_data/landmark_heatmaps_7"
+
+# Create directories for heatmaps
+for phase in ["train", "validation"]:
+    for label in ["fake", "real"]:
+        os.makedirs(os.path.join(HEATMAP_PATH, phase, label), exist_ok=True)
+
+# Function to process images and generate heatmaps
+def process_images(image_folder, heatmap_folder):
+    image_files = [f for f in os.listdir(image_folder) if f.endswith('.jpg')]
+    
+    for image_file in tqdm(image_files, desc=f"Processing {image_folder}"):
+        image_path = os.path.join(image_folder, image_file)
+        heatmap_path = os.path.join(heatmap_folder, image_file.replace(".jpg", "_heatmap.jpg"))
+
+        # Read the image
+        frame = cv2.imread(image_path)
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        # Detect landmarks
+        results = face_mesh.process(rgb_frame)
+
+        if results.multi_face_landmarks:
+            heatmap = np.zeros_like(frame)
+            h, w, _ = frame.shape
+
+            for face_landmarks in results.multi_face_landmarks:
+                for landmark in face_landmarks.landmark:
+                    x, y = int(landmark.x * w), int(landmark.y * h)
+                    cv2.circle(heatmap, (x, y), 1, (255, 255, 255), -1)
+
+            # Save heatmap
+            cv2.imwrite(heatmap_path, heatmap)
+
+# Process both train and validation sets
+for phase in ["train", "validation"]:
+    for label in ["fake", "real"]:
+        image_folder = os.path.join(DATASET_PATH, phase, label)
+        heatmap_folder = os.path.join(HEATMAP_PATH, phase, label)
+
+        process_images(image_folder, heatmap_folder)
+
+print("✅ Landmark heatmaps generated and saved successfully!")
