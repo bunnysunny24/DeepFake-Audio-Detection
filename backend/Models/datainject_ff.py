@@ -18,9 +18,13 @@ class HybridDataset(Dataset):
 
             for img_name in os.listdir(img_folder):
                 img_path = os.path.join(img_folder, img_name)
-                heatmap_path = os.path.join(heatmap_folder, img_name)
 
-                if os.path.exists(heatmap_path):  # Ensure heatmap exists
+                # Modify heatmap filename to match dataset structure
+                base_name, ext = os.path.splitext(img_name)  # Get filename without extension
+                heatmap_name = f"{base_name}_heatmap{ext}"  # Append "_heatmap" before extension
+                heatmap_path = os.path.join(heatmap_folder, heatmap_name)
+
+                if os.path.exists(heatmap_path):  # Only add matching pairs
                     self.image_paths.append(img_path)
                     self.heatmap_paths.append(heatmap_path)
                     self.labels.append(self.label_map[label])
@@ -43,22 +47,23 @@ class HybridDataset(Dataset):
 transform = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
-    transforms.Normalize(mean=[0.5], std=[0.5])
+    transforms.Normalize(mean=[0.5], std=[0.5])  # Normalize grayscale images
 ])
 
 def get_dataloaders(batch_size=32):
     train_dataset = HybridDataset(
-        image_dir="image-dataset-7/train",
-        heatmap_dir="landmark_heatmaps_7/train",
+        image_dir=r"D:\Bunny\Deepfake\backend\image_data\image-dataset-7\train",
+        heatmap_dir=r"D:\Bunny\Deepfake\backend\image_data\landmark_heatmaps_7\train",
         transform=transform
     )
 
     val_dataset = HybridDataset(
-        image_dir="image-dataset-7/validation",
-        heatmap_dir="landmark_heatmaps_7/validation",
+        image_dir=r"D:\Bunny\Deepfake\backend\image_data\image-dataset-7\validation",
+        heatmap_dir=r"D:\Bunny\Deepfake\backend\image_data\landmark_heatmaps_7\validation",
         transform=transform
     )
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+
     return train_loader, val_loader
