@@ -1,30 +1,45 @@
-Deepfake audio Detection
-1. Prepossing them
-ff.py for processing the data and dividing them
-You will get two folder with 
--- Image-dataset-7
-|train\
-|---fake\
-|
-|--real\
-|
-|validation\
-|---fake\
-|
-etc
-|--real\
-|
+# Deepfake Audio Detection
 
-2. Generating heatmaps
-mediapipe_ff.py it converts the data into heatmap
---landmark_heatmaps
-|train\
-|---fake\
-|
-|--real\
-|
-|-alidation\
-|---fake\
-|
-|--real\
-|
+## Preprocessing
+
+1. Preprocessing the data using `ff.py`
+
+Run the following command to preprocess the data and divide it into training and validation sets:
+
+```bash
+python ff.py
+```
+
+You will get two folders with the following structure:
+
+```
+-- Image-dataset-7
+    |-- train
+        |-- fake
+        |-- real
+    |-- validation
+        |-- fake
+        |-- real
+```
+
+## Generating Heatmaps
+
+2. Generating heatmaps using `mediapipe_ff.py`
+
+Run the following command to convert the data into heatmaps:
+
+```bash
+python mediapipe_ff.py
+```
+
+You will get the following folder structure:
+
+```
+-- landmark_heatmaps
+    |-- train
+        |-- fake
+        |-- real
+    |-- validation
+        |-- fake
+        |-- real
+```
