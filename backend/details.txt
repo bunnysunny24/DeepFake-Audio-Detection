@@ -1,2 +1,15 @@
 A and C are real
-B and D are fake
+B and D are fake 
+ff+ dataset 
+celeb-df
+youtube videos
+differnt versions of a specifci humans
+
+
+first preposses of things
+-> ff++ --> image-dataset-7
+-> image-dataset --> image-dataset-2
+-> downloaded_celebvhq --> image-dataset-3
+-> Celeb_DF --> image-dataset-4
+
+python train_ff.py 
