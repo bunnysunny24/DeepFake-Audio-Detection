@@ -5,28 +5,24 @@ import timm  # Pretrained models
 class CrossAttention(nn.Module):
     def __init__(self, embed_dim, cnn_dim):
         super().__init__()
-        self.cnn_proj = nn.Linear(cnn_dim, embed_dim)  # Correct: (2560 -> 768)
+        self.cnn_proj = nn.Linear(cnn_dim, embed_dim)  # Adjust CNN output size
         self.query = nn.Linear(embed_dim, embed_dim)
         self.key = nn.Linear(embed_dim, embed_dim)
         self.value = nn.Linear(embed_dim, embed_dim)
         self.scale = embed_dim ** -0.5  # Scaling factor
 
     def forward(self, x1, x2):
-        x2 = self.cnn_proj(x2)  # Ensure EfficientNet's output matches ViT's size
+        x2 = self.cnn_proj(x2)  # Project EfficientNet features to ViT space
 
-        q = self.query(x1)  # (batch_size, 768)
-        k = self.key(x2)    # (batch_size, 768)
-        v = self.value(x2)  # (batch_size, 768)
+        q = self.query(x1)
+        k = self.key(x2)
+        v = self.value(x2)
 
-        attn_weights = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # (batch_size, 768, 768)
+        attn_weights = torch.matmul(q, k.transpose(-2, -1)) * self.scale
         attn_weights = torch.softmax(attn_weights, dim=-1)
 
         attn_output = torch.matmul(attn_weights, v)  # (batch_size, 768)
-
-        return attn_output + x1  # Residual Connection
-
-
-
+        return attn_output + x1  # Residual connection
 
 
 class HybridViT_CNN(nn.Module):
@@ -48,18 +44,27 @@ class HybridViT_CNN(nn.Module):
             nn.Linear(512, 256)
         )
 
+        # EAR Feature Processing
+        self.ear_fc = nn.Linear(1, 32)  # Maps EAR value to 32D
+
+        # Optical Flow Feature Processing
+        self.flow_fc = nn.Linear(2, 32)  # Maps optical flow (2D) to 32D
+
+        # LSTM for Optical Flow
+        self.lstm = nn.LSTM(32, 64, batch_first=True)  # 64 hidden units
+
         # Cross-Attention
         self.cross_attention = CrossAttention(embed_dim=768, cnn_dim=2560)
 
         # Final Classifier
         self.fc = nn.Sequential(
-            nn.Linear(vit_out_dim + cnn_out_dim + 256, 512),
+            nn.Linear(vit_out_dim + cnn_out_dim + 256 + 32 + 64, 512),  # Updated size
             nn.ReLU(),
             nn.Dropout(0.3),
             nn.Linear(512, num_classes)
         )
 
-    def forward(self, image, heatmap):
+    def forward(self, image, heatmap, ear, optical_flow):
         # CNN Features
         cnn_features = self.cnn(image)
 
@@ -73,8 +78,18 @@ class HybridViT_CNN(nn.Module):
         heatmap = heatmap.view(heatmap.size(0), -1)  # Flatten heatmap
         heatmap_features = self.mlp(heatmap)
 
+        # EAR Features
+        ear_features = self.ear_fc(ear.unsqueeze(1))
+
+        # Optical Flow Features
+        flow_features = self.flow_fc(optical_flow)
+
+        # Pass Optical Flow through LSTM
+        _, (lstm_output, _) = self.lstm(flow_features.unsqueeze(1))
+        lstm_output = lstm_output.squeeze(0)  # Extract last hidden state
+
         # Concatenate All Features
-        final_features = torch.cat([fused_features, cnn_features, heatmap_features], dim=1)
+        final_features = torch.cat([fused_features, cnn_features, heatmap_features, ear_features, lstm_output], dim=1)
 
         # Fully Connected Layer
         output = self.fc(final_features)
@@ -86,6 +101,8 @@ if __name__ == "__main__":
     model = HybridViT_CNN(num_classes=2)
     image = torch.randn(2, 3, 224, 224)  # Batch size of 2, RGB images
     heatmap = torch.randn(2, 1, 224, 224)  # Batch size of 2, single-channel heatmaps
+    ear = torch.randn(2, 1)  # Batch size of 2, single EAR values
+    optical_flow = torch.randn(2, 2)  # Batch size of 2, (x, y) optical flow values
 
-    output = model(image, heatmap)
-    print(output.shape)  # Should be (2, num_classes)
+    output = model(image, heatmap, ear, optical_flow)
+    print(output.shape)  # Expected: (2, num_classes)
