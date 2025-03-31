@@ -20,7 +20,6 @@ class HybridDataset(Dataset):
         self.transform_features = transform_features
         self.label_map = {"real": 0, "fake": 1}  # Assign labels
 
-        # Feature categories in segmented_mediapipe
         self.feature_classes = ["eye_glass", "left_eye", "right_eye", "nose", "mouth", "upper_lip", "lower_lip", "hair"]
 
         for label in ["real", "fake"]:
@@ -30,23 +29,22 @@ class HybridDataset(Dataset):
             optical_flow_folder = os.path.join(optical_flow_dir, label)
             segmented_folder = os.path.join(segmented_dir, label)
 
-            for img_name in os.listdir(img_folder):
-                if not img_name.lower().endswith(('.png', '.jpg', '.jpeg')):
+            if not os.path.exists(img_folder):
+                continue
+
+            for img_name in sorted(os.listdir(img_folder)):
+                if not img_name.lower().endswith((".png", ".jpg", ".jpeg")):
                     continue
 
-                img_path = os.path.join(img_folder, img_name)
                 base_name, ext = os.path.splitext(img_name)
-
+                img_path = os.path.join(img_folder, img_name)
                 heatmap_path = os.path.join(heatmap_folder, f"{base_name}_heatmap{ext}")
                 ear_path = os.path.join(ear_folder, f"{base_name}_ear.jpg")
                 optical_flow_path = os.path.join(optical_flow_folder, f"{base_name}_flow.jpg")
                 
-                # Paths for segmented Mediapipe features
-                segmented_paths = {}
-                for feature in self.feature_classes:
-                    segmented_paths[feature] = os.path.join(segmented_folder, f"{base_name}_{feature}.png")
-
-                # Ensure all required files exist
+                segmented_paths = {feature: os.path.join(segmented_folder, f"{base_name}_{feature}.png") 
+                                  for feature in self.feature_classes}
+                
                 if all(os.path.exists(p) for p in [heatmap_path, ear_path, optical_flow_path]) and \
                    all(os.path.exists(segmented_paths[f]) for f in self.feature_classes):
                     self.image_paths.append(img_path)
@@ -69,7 +67,11 @@ class HybridDataset(Dataset):
 
         segmented_features = {}
         for feature in self.feature_classes:
-            segmented_features[feature] = Image.open(self.segmented_paths[base_name][feature]).convert("L")
+            feature_path = self.segmented_paths.get(base_name, {}).get(feature)
+            if feature_path and os.path.exists(feature_path):
+                segmented_features[feature] = Image.open(feature_path).convert("L")
+            else:
+                segmented_features[feature] = torch.zeros((1, 112, 112))  # Placeholder tensor
 
         if self.transform_img:
             image = self.transform_img(image)

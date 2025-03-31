@@ -1,63 +1,47 @@
 import torch
 import torch.nn as nn
 import timm  # Pretrained models
+import torch.nn.functional as F
 
 class CrossAttention(nn.Module):
-    def __init__(self, embed_dim, cnn_dim):
+    def __init__(self, embed_dim, cnn_dim, num_heads=4):
         super().__init__()
-        self.cnn_proj = nn.Linear(cnn_dim, embed_dim)  # Adjust CNN output size
-        self.query = nn.Linear(embed_dim, embed_dim)
-        self.key = nn.Linear(embed_dim, embed_dim)
-        self.value = nn.Linear(embed_dim, embed_dim)
-        self.scale = embed_dim ** -0.5  # Scaling factor
+        self.cnn_proj = nn.Linear(cnn_dim, embed_dim)
+        self.multihead_attn = nn.MultiheadAttention(embed_dim, num_heads)
 
     def forward(self, x1, x2):
         x2 = self.cnn_proj(x2)  # Project EfficientNet features to ViT space
-        q = self.query(x1)
-        k = self.key(x2)
-        v = self.value(x2)
-        attn_weights = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-        attn_weights = torch.softmax(attn_weights, dim=-1)
-        attn_output = torch.matmul(attn_weights, v)
-        return attn_output + x1  # Residual connection
-
+        x1 = x1.unsqueeze(0)  # Convert to (seq, batch, dim) for attention
+        x2 = x2.unsqueeze(0)
+        attn_output, _ = self.multihead_attn(x1, x2, x2)
+        return attn_output.squeeze(0) + x1.squeeze(0)  # Residual connection
 
 class HybridViT_CNN(nn.Module):
     def __init__(self, num_classes=2):
         super(HybridViT_CNN, self).__init__()
-
+        
         # EfficientNet-B7 (CNN) for local features
         self.cnn = timm.create_model("tf_efficientnet_b7", pretrained=True, num_classes=0)
         cnn_out_dim = self.cnn.num_features
-
+        
         # Vision Transformer (ViT) for global features
         self.vit = timm.create_model("vit_base_patch16_224", pretrained=True, num_classes=0)
         vit_out_dim = self.vit.num_features
-
-        # MLP for Heatmaps
-        self.heatmap_mlp = nn.Sequential(
-            nn.Linear(224 * 224, 512),
-            nn.ReLU(),
-            nn.Linear(512, 256)
-        )
-
-        # Segmented & Degmented Image Processing
+        
+        # Cross-Attention
+        self.cross_attention = CrossAttention(embed_dim=vit_out_dim, cnn_dim=cnn_out_dim)
+        
+        # Feature processing layers
         self.segmented_fc = nn.Linear(cnn_out_dim, 256)
         self.degmented_fc = nn.Linear(cnn_out_dim, 256)
-
-        # EAR Feature Processing
+        self.heatmap_mlp = nn.Sequential(
+            nn.Linear(224 * 224, 512), nn.ReLU(), nn.Linear(512, 256)
+        )
         self.ear_fc = nn.Linear(1, 32)
-
-        # Optical Flow Feature Processing
         self.flow_fc = nn.Linear(2, 32)
-
-        # LSTM for Optical Flow
         self.lstm = nn.LSTM(32, 64, batch_first=True)
-
-        # Cross-Attention
-        self.cross_attention = CrossAttention(embed_dim=768, cnn_dim=2560)
-
-        # Final Classifier
+        
+        # Final classifier with gating mechanism
         self.fc = nn.Sequential(
             nn.Linear(vit_out_dim + cnn_out_dim + 256 + 256 + 256 + 32 + 64, 512),
             nn.ReLU(),
@@ -66,45 +50,26 @@ class HybridViT_CNN(nn.Module):
         )
 
     def forward(self, image, segmented, degmented, heatmap, ear, optical_flow):
-        # CNN Features
         cnn_features = self.cnn(image)
-
-        # ViT Features
         vit_features = self.vit(image)
-
-        # Apply Cross-Attention
         fused_features = self.cross_attention(vit_features, cnn_features)
-
-        # Segmented Image Features
+        
         segmented_features = self.segmented_fc(self.cnn(segmented))
-
-        # Degmented Image Features
         degmented_features = self.degmented_fc(self.cnn(degmented))
-
-        # Heatmap Features
-        heatmap = heatmap.view(heatmap.size(0), -1)
-        heatmap_features = self.heatmap_mlp(heatmap)
-
-        # EAR Features
+        heatmap_features = self.heatmap_mlp(heatmap.view(heatmap.size(0), -1))
         ear_features = self.ear_fc(ear.unsqueeze(1))
-
-        # Optical Flow Features
         flow_features = self.flow_fc(optical_flow)
         _, (lstm_output, _) = self.lstm(flow_features.unsqueeze(1))
         lstm_output = lstm_output.squeeze(0)
-
-        # Concatenate All Features
+        
         final_features = torch.cat([
             fused_features, cnn_features, segmented_features, degmented_features,
             heatmap_features, ear_features, lstm_output
         ], dim=1)
+        
+        return self.fc(final_features)
 
-        # Fully Connected Layer
-        output = self.fc(final_features)
-        return output
-
-
-# Test the model with dummy input
+# Model testing with dummy input
 if __name__ == "__main__":
     model = HybridViT_CNN(num_classes=2)
     image = torch.randn(2, 3, 224, 224)
@@ -113,6 +78,5 @@ if __name__ == "__main__":
     heatmap = torch.randn(2, 1, 224, 224)
     ear = torch.randn(2, 1)
     optical_flow = torch.randn(2, 2)
-
     output = model(image, segmented, degmented, heatmap, ear, optical_flow)
     print(output.shape)  # Expected: (2, num_classes)
