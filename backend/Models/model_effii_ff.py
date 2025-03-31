@@ -13,15 +13,12 @@ class CrossAttention(nn.Module):
 
     def forward(self, x1, x2):
         x2 = self.cnn_proj(x2)  # Project EfficientNet features to ViT space
-
         q = self.query(x1)
         k = self.key(x2)
         v = self.value(x2)
-
         attn_weights = torch.matmul(q, k.transpose(-2, -1)) * self.scale
         attn_weights = torch.softmax(attn_weights, dim=-1)
-
-        attn_output = torch.matmul(attn_weights, v)  # (batch_size, 768)
+        attn_output = torch.matmul(attn_weights, v)
         return attn_output + x1  # Residual connection
 
 
@@ -38,33 +35,37 @@ class HybridViT_CNN(nn.Module):
         vit_out_dim = self.vit.num_features
 
         # MLP for Heatmaps
-        self.mlp = nn.Sequential(
+        self.heatmap_mlp = nn.Sequential(
             nn.Linear(224 * 224, 512),
             nn.ReLU(),
             nn.Linear(512, 256)
         )
 
+        # Segmented & Degmented Image Processing
+        self.segmented_fc = nn.Linear(cnn_out_dim, 256)
+        self.degmented_fc = nn.Linear(cnn_out_dim, 256)
+
         # EAR Feature Processing
-        self.ear_fc = nn.Linear(1, 32)  # Maps EAR value to 32D
+        self.ear_fc = nn.Linear(1, 32)
 
         # Optical Flow Feature Processing
-        self.flow_fc = nn.Linear(2, 32)  # Maps optical flow (2D) to 32D
+        self.flow_fc = nn.Linear(2, 32)
 
         # LSTM for Optical Flow
-        self.lstm = nn.LSTM(32, 64, batch_first=True)  # 64 hidden units
+        self.lstm = nn.LSTM(32, 64, batch_first=True)
 
         # Cross-Attention
         self.cross_attention = CrossAttention(embed_dim=768, cnn_dim=2560)
 
         # Final Classifier
         self.fc = nn.Sequential(
-            nn.Linear(vit_out_dim + cnn_out_dim + 256 + 32 + 64, 512),  # Updated size
+            nn.Linear(vit_out_dim + cnn_out_dim + 256 + 256 + 256 + 32 + 64, 512),
             nn.ReLU(),
             nn.Dropout(0.3),
             nn.Linear(512, num_classes)
         )
 
-    def forward(self, image, heatmap, ear, optical_flow):
+    def forward(self, image, segmented, degmented, heatmap, ear, optical_flow):
         # CNN Features
         cnn_features = self.cnn(image)
 
@@ -74,22 +75,29 @@ class HybridViT_CNN(nn.Module):
         # Apply Cross-Attention
         fused_features = self.cross_attention(vit_features, cnn_features)
 
+        # Segmented Image Features
+        segmented_features = self.segmented_fc(self.cnn(segmented))
+
+        # Degmented Image Features
+        degmented_features = self.degmented_fc(self.cnn(degmented))
+
         # Heatmap Features
-        heatmap = heatmap.view(heatmap.size(0), -1)  # Flatten heatmap
-        heatmap_features = self.mlp(heatmap)
+        heatmap = heatmap.view(heatmap.size(0), -1)
+        heatmap_features = self.heatmap_mlp(heatmap)
 
         # EAR Features
         ear_features = self.ear_fc(ear.unsqueeze(1))
 
         # Optical Flow Features
         flow_features = self.flow_fc(optical_flow)
-
-        # Pass Optical Flow through LSTM
         _, (lstm_output, _) = self.lstm(flow_features.unsqueeze(1))
-        lstm_output = lstm_output.squeeze(0)  # Extract last hidden state
+        lstm_output = lstm_output.squeeze(0)
 
         # Concatenate All Features
-        final_features = torch.cat([fused_features, cnn_features, heatmap_features, ear_features, lstm_output], dim=1)
+        final_features = torch.cat([
+            fused_features, cnn_features, segmented_features, degmented_features,
+            heatmap_features, ear_features, lstm_output
+        ], dim=1)
 
         # Fully Connected Layer
         output = self.fc(final_features)
@@ -99,10 +107,12 @@ class HybridViT_CNN(nn.Module):
 # Test the model with dummy input
 if __name__ == "__main__":
     model = HybridViT_CNN(num_classes=2)
-    image = torch.randn(2, 3, 224, 224)  # Batch size of 2, RGB images
-    heatmap = torch.randn(2, 1, 224, 224)  # Batch size of 2, single-channel heatmaps
-    ear = torch.randn(2, 1)  # Batch size of 2, single EAR values
-    optical_flow = torch.randn(2, 2)  # Batch size of 2, (x, y) optical flow values
+    image = torch.randn(2, 3, 224, 224)
+    segmented = torch.randn(2, 3, 224, 224)
+    degmented = torch.randn(2, 3, 224, 224)
+    heatmap = torch.randn(2, 1, 224, 224)
+    ear = torch.randn(2, 1)
+    optical_flow = torch.randn(2, 2)
 
-    output = model(image, heatmap, ear, optical_flow)
+    output = model(image, segmented, degmented, heatmap, ear, optical_flow)
     print(output.shape)  # Expected: (2, num_classes)
