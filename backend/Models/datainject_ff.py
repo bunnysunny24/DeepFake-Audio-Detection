@@ -114,7 +114,7 @@ transform_features = transforms.Compose([
     transforms.Normalize(mean=[0.5], std=[0.5])
 ])
 
-def get_dataloaders(batch_size=32):
+def get_dataloaders(batch_size=32, train_subset_size=1000):
     train_dataset = HybridDataset(
         image_dir=r"D:\Bunny\Deepfake\backend\image_data\image-dataset-7\train",
         heatmap_dir=r"D:\Bunny\Deepfake\backend\image_data\landmark_heatmaps_7\train",
@@ -139,4 +139,8 @@ def get_dataloaders(batch_size=32):
         transform_features=transform_features
     )
 
-    return DataLoader(train_dataset, batch_size=batch_size, shuffle=True), DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    # Define a subset of the first 1000 images
+    train_subset_size = min(train_subset_size, len(train_dataset))
+    train_subset = torch.utils.data.Subset(train_dataset, list(range(train_subset_size)))
+
+    return DataLoader(train_subset, batch_size=batch_size, shuffle=True), DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
