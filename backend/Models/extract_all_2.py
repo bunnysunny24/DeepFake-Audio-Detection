@@ -3,11 +3,8 @@ import mediapipe as mp
 import numpy as np
 import os
 
-# Initialize Mediapipe Face Mesh
 mp_face_mesh = mp.solutions.face_mesh
 face_mesh = mp_face_mesh.FaceMesh(static_image_mode=True, max_num_faces=1, refine_landmarks=True)
-
-# Define 19 Feature Classes
 FEATURES = {
     "skin": [0, 10, 338, 297, 332],
     "left_brow": [70, 63, 105, 66, 107],
@@ -30,7 +27,6 @@ FEATURES = {
     "background": []
 }
 
-# Extract Features from Image
 def extract_features(image_path, output_dir):
     image = cv2.imread(image_path)
     if image is None:
@@ -39,44 +35,32 @@ def extract_features(image_path, output_dir):
 
     image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     results = face_mesh.process(image_rgb)
-    
     if not results.multi_face_landmarks:
         print(f"[WARNING] No face detected in {image_path}")
         return
 
     landmarks = results.multi_face_landmarks[0].landmark
     h, w, _ = image.shape
-
-    # Extract full filename correctly
-    original_filename = os.path.basename(image_path)  # Get full filename (e.g., '01_02__outside_talking_still_laughing__YVGY8LOK_0000.jpg')
-    original_filename_without_ext = original_filename.rsplit(".", 1)[0]  # Remove only the LAST extension
-
+    original_filename = os.path.basename(image_path) 
+    original_filename_without_ext = original_filename.rsplit(".", 1)[0]  
     for feature_name, landmark_ids in FEATURES.items():
         mask = np.zeros((h, w), dtype=np.uint8)
-
         for landmark_id in landmark_ids:
             x = int(landmarks[landmark_id].x * w)
             y = int(landmarks[landmark_id].y * h)
-            cv2.circle(mask, (x, y), 5, 255, -1)  # Draw keypoints
-
-        # Ensure filename is correct
+            cv2.circle(mask, (x, y), 5, 255, -1) 
         output_filename = f"{original_filename_without_ext}_{feature_name}.png"
         output_path = os.path.join(output_dir, output_filename)
         cv2.imwrite(output_path, mask)
-
         print(f"[INFO] Saved: {output_path}")
 
-# Process Only Train/Real Dataset
 def process_train_real(input_dir, output_dir):
     os.makedirs(output_dir, exist_ok=True)
-
     image_folder = os.path.join(input_dir, "validation", "real")
     output_folder = os.path.join(output_dir, "validation", "real")
     os.makedirs(output_folder, exist_ok=True)
-
     for image_file in os.listdir(image_folder):
         image_path = os.path.join(image_folder, image_file)
-
         extract_features(image_path, output_folder)
 
 if __name__ == "__main__":
