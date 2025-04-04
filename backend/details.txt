@@ -7,9 +7,15 @@ differnt versions of a specifci humans
 
 
 first preposses of things
--> ff++ --> image-dataset-7
+-> ff++ --> image-dataset-7 -> frames and divided them :- ff.py
+-->landmark_heatmaps_7 -> heatmap of images :- mediapipe_ff.py
+--->optical_flow_7 -> blur the imaes :-  ear_lips_ff.py
+---->ear_7 ->greyscale the images :- ear_lips_ff.py
+----->Segemented_mediapipe_7 -> heatmap of each feature :- extract_all_2.py
+------>extracted_features-3 -> each facial features :- new_extract_1.py
+
 -> image-dataset --> image-dataset-2
 -> downloaded_celebvhq --> image-dataset-3
 -> Celeb_DF --> image-dataset-4
 
-python train_ff.py 
+for audio
