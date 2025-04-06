@@ -9,7 +9,21 @@ import albumentations as A
 from albumentations.pytorch import ToTensorV2
 from moviepy.video.io.VideoFileClip import VideoFileClip
 import tempfile
-import mediapipe as mp
+import mediapipe as mp_face_mesh
+import multiprocessing as mp
+import warnings
+import contextlib
+
+# Suppress TensorFlow warnings about feedback tensors
+@contextlib.contextmanager
+def suppress_stderr():
+    with open(os.devnull, "w") as devnull:
+        old_stderr = os.dup(2)
+        os.dup2(devnull.fileno(), 2)
+        try:
+            yield
+        finally:
+            os.dup2(old_stderr, 2)
 
 # ============================ #
 #       Path Configuration     #
@@ -17,13 +31,14 @@ import mediapipe as mp
 
 metadata_path = r"D:\Bunny\Deepfake\backend\combined_data\LAV-DF\metadata.json"
 data_dir = r"D:\Bunny\Deepfake\backend\combined_data\LAV-DF"
-save_path = r"D:\Bunny\Deepfake\backend\combined_data\processed_data.json"
+save_dir = r"D:\Bunny\Deepfake\backend\combined_data"
+save_path = os.path.join(save_dir, "processed_data.json")
 
 # ============================ #
-#   Mediapipe FaceMesh Setup   #
+#    Mediapipe FaceMesh Setup   #
 # ============================ #
 
-mp_face_mesh = mp.solutions.face_mesh
+mp_face_mesh = mp_face_mesh.solutions.face_mesh
 face_mesh = mp_face_mesh.FaceMesh(static_image_mode=True, max_num_faces=1)
 
 # ============================ #
@@ -74,7 +89,6 @@ def normalize_faces(frames):
 
 def extract_audio_features(video_path, sr=16000):
     try:
-        print(f"🔊 Extracting audio from: {video_path}")
         temp_audio = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
         temp_audio.close()
         video = VideoFileClip(video_path)
@@ -82,16 +96,14 @@ def extract_audio_features(video_path, sr=16000):
         audio, _ = librosa.load(temp_audio.name, sr=sr)
         mel_spec = librosa.feature.melspectrogram(y=audio, sr=sr)
         log_mel_spec = librosa.power_to_db(mel_spec, ref=np.max)
-        print(f"✅ Mel spectrogram extracted successfully.")
         return log_mel_spec
     except Exception as e:
-        print(f"❌ Error processing {video_path}: {type(e).__name__} - {e}")
         return None
     finally:
         try:
             os.remove(temp_audio.name)
-        except Exception as cleanup_error:
-            print(f"⚠️ Failed to delete temp audio file: {cleanup_error}")
+        except Exception:
+            pass
 
 # ============================ #
 #   Step 3: Define Augmenters  #
@@ -120,12 +132,6 @@ def augment_audio(audio_tensor):
 #   Deepfake Detection Cues    #
 # ============================ #
 
-# ✂️ Keep all previous imports and path definitions as-is
-
-# ============================ #
-#   Updated Detection Functions #
-# ============================ #
-
 def detect_eye_blinking(frames):
     EAR_THRESHOLD = 0.2
     blink_count = 0
@@ -140,7 +146,7 @@ def detect_eye_blinking(frames):
     left_eye_indices = [33, 160, 158, 133, 153, 144]
     right_eye_indices = [362, 385, 387, 263, 373, 380]
 
-    with mp.solutions.face_mesh.FaceMesh(static_image_mode=True, max_num_faces=1) as face_mesh:
+    with mp_face_mesh.FaceMesh(static_image_mode=True, max_num_faces=1) as face_mesh:
         for frame in frames:
             results = face_mesh.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
             if results and results.multi_face_landmarks:
@@ -164,7 +170,7 @@ def detect_lip_sync_issue(frames, audio_spec):
     mouth_indices = [13, 14]
     mouth_movement = []
 
-    with mp.solutions.face_mesh.FaceMesh(static_image_mode=True, max_num_faces=1) as face_mesh:
+    with mp_face_mesh.FaceMesh(static_image_mode=True, max_num_faces=1) as face_mesh:
         for frame in frames:
             results = face_mesh.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
             if results and results.multi_face_landmarks:
@@ -185,7 +191,7 @@ def detect_facial_inconsistencies(frames):
     prev_landmarks = None
     shifts = []
 
-    with mp.solutions.face_mesh.FaceMesh(static_image_mode=True, max_num_faces=1) as face_mesh:
+    with mp_face_mesh.FaceMesh(static_image_mode=True, max_num_faces=1) as face_mesh:
         for frame in frames:
             results = face_mesh.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
             if results and results.multi_face_landmarks:
@@ -198,7 +204,6 @@ def detect_facial_inconsistencies(frames):
                 prev_landmarks = coords
 
     return np.mean(shifts) > 10 if shifts else False
-
 
 # ============================ #
 #     Step 4: Tag Hard Cases   #
@@ -240,34 +245,16 @@ def analyze_challenging_conditions(frames, audio_spec):
 #   Step 5: Process + Save     #
 # ============================ #
 
-# Load metadata
-with open(metadata_path, "r", encoding="utf-8") as f:
-    metadata = json.load(f)
-
-if os.path.exists(save_path):
-    with open(save_path, "r", encoding="utf-8") as f:
-        processed_data = json.load(f)
-        processed_files = {item["file"] for item in processed_data}
-else:
-    processed_data = []
-    processed_files = set()
-
-for entry in metadata:
-    if entry["file"] in processed_files:
-        print(f"⏩ Already processed: {entry['file']}")
-        continue
-
+def process_video(entry, data_dir, save_path):
     video_path = os.path.join(data_dir, entry["file"])
     if not os.path.exists(video_path):
-        print(f"❌ File not found: {video_path}")
-        continue
-
-    print(f"\n🔄 Processing: {entry['file']}")
+        print(f"File not found: {video_path}")
+        return None
 
     frames = extract_frames(video_path)
     if frames is None:
-        print(f"⚠️ Skipping {entry['file']} due to missing frames.")
-        continue
+        print(f"No frames extracted for {entry['file']}")
+        return None
 
     normalized_frames = normalize_faces(frames)
     augmented_frames = augment_frames(normalized_frames)
@@ -276,7 +263,6 @@ for entry in metadata:
     if audio_features is not None:
         augmented_audio = augment_audio(torch.tensor(audio_features))
     else:
-        print(f"⚠️ Skipping audio for {entry['file']} due to extraction error.")
         augmented_audio = None
 
     challenge_tags = analyze_challenging_conditions(frames, audio_features)
@@ -289,12 +275,43 @@ for entry in metadata:
             "audio": augmented_audio.tolist() if isinstance(augmented_audio, np.ndarray) else None,
             "tags": challenge_tags
         }
-        processed_data.append(video_data)
+        print(f"Successfully processed and saved data for {entry['file']}")
 
-        with open(save_path, "w", encoding="utf-8") as f:
-            json.dump(processed_data, f, indent=4)
+        # Save to JSON
+        if not os.path.exists(save_path):
+            with open(save_path, "w", encoding="utf-8") as f:
+                json.dump([video_data], f, indent=4)
+        else:
+            with open(save_path, "r+", encoding="utf-8") as f:
+                try:
+                    data = json.load(f)
+                except json.JSONDecodeError:
+                    data = []
+                data.append(video_data)
+                f.seek(0)
+                json.dump(data, f, indent=4)
 
-        print(f"✅ Saved progress after processing: {entry['file']}")
+        return video_data
 
     except Exception as e:
-        print(f"💥 Failed to process {entry['file']}: {type(e).__name__} - {e}")
+        print(f"Error processing {entry['file']}: {e}")
+        return None
+
+def process_videos(metadata, data_dir, save_path):
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+        print(f"Created directory: {save_dir}")
+
+    with mp.Pool(mp.cpu_count()) as pool:
+        results = pool.starmap(process_video, [(entry, data_dir, save_path) for entry in metadata])
+
+    processed_data = [result for result in results if result is not None]
+    print(f"Processed data for {len(processed_data)} videos.")
+
+if __name__ == "__main__":
+    with suppress_stderr():
+        with open(metadata_path, "r", encoding="utf-8") as f:
+            metadata = json.load(f)
+            print(f"Loaded metadata for {len(metadata)} videos.")
+
+        process_videos(metadata, data_dir, save_path)
