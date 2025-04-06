@@ -33,6 +33,7 @@ metadata_path = r"D:\Bunny\Deepfake\backend\combined_data\LAV-DF\metadata.json"
 data_dir = r"D:\Bunny\Deepfake\backend\combined_data\LAV-DF"
 save_dir = r"D:\Bunny\Deepfake\backend\combined_data"
 save_path = os.path.join(save_dir, "processed_data.json")
+log_path = os.path.join(save_dir, "processed_videos.log")
 
 # ============================ #
 #    Mediapipe FaceMesh Setup   #
@@ -245,7 +246,7 @@ def analyze_challenging_conditions(frames, audio_spec):
 #   Step 5: Process + Save     #
 # ============================ #
 
-def process_video(entry, data_dir, save_path):
+def process_video(entry, data_dir, save_path, log_path):
     video_path = os.path.join(data_dir, entry["file"])
     if not os.path.exists(video_path):
         print(f"File not found: {video_path}")
@@ -291,19 +292,41 @@ def process_video(entry, data_dir, save_path):
                 f.seek(0)
                 json.dump(data, f, indent=4)
 
+        # Log the processed video
+        with open(log_path, "a", encoding="utf-8") as log_file:
+            log_file.write(f"{entry['file']}\n")
+
         return video_data
 
     except Exception as e:
         print(f"Error processing {entry['file']}: {e}")
         return None
 
-def process_videos(metadata, data_dir, save_path):
+def process_videos(metadata, data_dir, save_path, log_path):
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
         print(f"Created directory: {save_dir}")
 
+    # Read the log file to get the list of already processed videos
+    processed_videos = set()
+    if os.path.exists(log_path):
+        with open(log_path, "r", encoding="utf-8") as log_file:
+            processed_videos = set(log_file.read().splitlines())
+
+    # Read the processed data JSON file to get the list of already processed videos
+    if os.path.exists(save_path):
+        with open(save_path, "r", encoding="utf-8") as f:
+            try:
+                processed_data = json.load(f)
+                processed_videos.update([entry["file"] for entry in processed_data])
+            except json.JSONDecodeError:
+                pass
+
+    # Filter out the already processed videos from the metadata
+    remaining_videos = [entry for entry in metadata if entry["file"] not in processed_videos]
+
     with mp.Pool(mp.cpu_count()) as pool:
-        results = pool.starmap(process_video, [(entry, data_dir, save_path) for entry in metadata])
+        results = pool.starmap(process_video, [(entry, data_dir, save_path, log_path) for entry in remaining_videos])
 
     processed_data = [result for result in results if result is not None]
     print(f"Processed data for {len(processed_data)} videos.")
@@ -314,4 +337,4 @@ if __name__ == "__main__":
             metadata = json.load(f)
             print(f"Loaded metadata for {len(metadata)} videos.")
 
-        process_videos(metadata, data_dir, save_path)
+        process_videos(metadata, data_dir, save_path, log_path)
