@@ -6,36 +6,53 @@ import torch
 from torchvision import transforms
 
 # Add the cloned repository to the system path
-sys.path.append('D:\\Bunny\\Deepfake\\backend\\models\\stylegan2-pytorch')
+sys.path.append(r'D:\Bunny\Deepfake\backend\models\stylegan2-pytorch')
 
 from model import Generator
 
 # Force the use of CPU
 device = torch.device('cpu')
+
+# Initialize the StyleGAN2 generator
 gan_model = Generator(size=1024, style_dim=512, n_mlp=8).to(device)
-gan_model.load_state_dict(torch.load('D:\\Bunny\\Deepfake\\backend\\combined_data\\stylegan2-horse-config-f.pkl', map_location=device))
+
+# Attempt to load the PyTorch-pretrained weights
+try:
+    checkpoint_path = r'D:\Bunny\Deepfake\backend\combined_data\stylegan2-horse-config-f.pt'  # Change to a PyTorch-compatible model file
+    gan_model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+    print("Model loaded successfully.")
+except FileNotFoundError:
+    print(f"Error: Checkpoint file not found at {checkpoint_path}. Please provide a valid PyTorch model checkpoint (.pt file).")
+    sys.exit(1)
+except Exception as e:
+    print(f"Error loading model: {e}")
+    sys.exit(1)
+
 gan_model.eval()
 
-# Directory setup
+# Directory setup for saving generated images
 output_dir = 'generated_deepfakes'
 if not os.path.exists(output_dir):
     os.makedirs(output_dir)
 
 # Function to generate deepfake images
 def generate_deepfake_images(num_images=100, image_size=256):
-    z_dim = 512
+    z_dim = 512  # Latent space dimension
     transform = transforms.Compose([
-        transforms.Resize(image_size),
+        transforms.Resize((image_size, image_size)),
         transforms.ToTensor(),
         transforms.Normalize([0.5] * 3, [0.5] * 3)
     ])
     for i in range(num_images):
-        z = torch.randn(1, z_dim).to(device)
+        z = torch.randn(1, z_dim).to(device)  # Generate random latent vector
         with torch.no_grad():
-            img_tensor = gan_model([z])[0]
-            img_tensor = (img_tensor.clamp(-1, 1) + 1) / 2
-            img_array = (img_tensor.squeeze().cpu().numpy() * 255).astype(np.uint8)
-            img = Image.fromarray(img_array.transpose(1, 2, 0))
+            # Generate an image using the model
+            img_tensor = gan_model([z])[0].clamp(-1, 1).cpu()
+            img_tensor = (img_tensor + 1) / 2  # Normalize to [0, 1]
+            img_array = (img_tensor.numpy() * 255).astype(np.uint8)
+            
+            # Convert to PIL Image and save
+            img = Image.fromarray(img_array.transpose(1, 2, 0), mode='RGB')
             img.save(os.path.join(output_dir, f'deepfake_{i}.png'))
         print(f'Generated {i+1}/{num_images} images.')
 
