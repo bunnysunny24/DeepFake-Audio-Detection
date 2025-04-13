@@ -120,10 +120,10 @@ audio_transform = Compose([
     AddGaussianNoise(min_amplitude=0.001, max_amplitude=0.015, p=0.5),
     PitchShift(min_semitones=-4, max_semitones=4, p=0.5),
     TimeStretch(min_rate=0.8, max_rate=1.25, p=0.5),
-    Shift(min_fraction=-0.5, max_fraction=0.5, p=0.5),
+    Shift(min_shift=-0.5, max_shift=0.5, p=0.5),
 ])
 
-# DataLoader function
+# DataLoader function 
 def get_data_loaders(json_path, data_dir, batch_size=8, validation_split=0.2, shuffle=True, transform=None, audio_transform=None):
     dataset = MultiModalDeepfakeDataset(
         json_path=json_path,
