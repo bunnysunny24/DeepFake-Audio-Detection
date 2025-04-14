@@ -73,34 +73,33 @@ class MultiModalDeepfakeDataset(Dataset):
                 raise ValueError(f"No valid frames extracted from {video_path}")
             video_frames = torch.stack(video_frames)
 
-            # Apply video augmentation if available
-            if self.transform:
-                video_frames = self.transform(video_frames)
-
-            # Load audio features (Mel-spectrogram)
+            # Load raw audio
             audio_path = os.path.join(self.data_dir, sample['file'].replace('.mp4', '.wav'))
             if not os.path.exists(audio_path):
                 raise FileNotFoundError(f"Audio file not found: {audio_path}")
 
             audio, _ = librosa.load(audio_path, sr=16000)
 
-            mel_spectrogram = librosa.feature.melspectrogram(y=audio, sr=16000, n_mels=128)
-            mel_spectrogram = librosa.power_to_db(mel_spectrogram, ref=np.max)
+            # Ensure audio is of fixed length (e.g., pad or truncate to 16000 samples)
+            if len(audio) > self.audio_length:
+                audio = audio[:self.audio_length]
+            else:
+                audio = np.pad(audio, (0, self.audio_length - len(audio)), mode='constant')
 
-            mel_spectrogram = mel_spectrogram[:, :self.audio_length] if mel_spectrogram.shape[1] > self.audio_length else \
-                              np.pad(mel_spectrogram, ((0, 0), (0, self.audio_length - mel_spectrogram.shape[1])), mode='constant')
-
-            audio_tensor = torch.tensor(mel_spectrogram, dtype=torch.float32)
+            audio_tensor = torch.tensor(audio, dtype=torch.float32)
             
             # Apply audio augmentation if available
             if self.audio_transform:
-                audio_tensor = self.audio_transform(audio_tensor)
+                audio_tensor = self.audio_transform(samples=audio_tensor.numpy(), sample_rate=16000)
+                audio_tensor = torch.tensor(audio_tensor, dtype=torch.float32)
 
-            label = torch.tensor(sample['label'], dtype=torch.long)
+            # Dynamically generate the label
+            label = 1 if sample['n_fakes'] > 0 else 0  # Fake if n_fakes > 0, else Real
+            label = torch.tensor(label, dtype=torch.long)
 
             return {
                 'video_frames': video_frames,  # (N, C, H, W)
-                'audio': audio_tensor,         # (128, audio_length)
+                'audio': audio_tensor,         # (audio_length)
                 'label': label                 # 0 or 1
             }
 
@@ -120,7 +119,7 @@ audio_transform = Compose([
     AddGaussianNoise(min_amplitude=0.001, max_amplitude=0.015, p=0.5),
     PitchShift(min_semitones=-4, max_semitones=4, p=0.5),
     TimeStretch(min_rate=0.8, max_rate=1.25, p=0.5),
-    Shift(min_shift=-0.5, max_shift=0.5, p=0.5),
+    Shift(min_shift=-0.5, max_shift=0.5, p=0.5),  # Updated arguments
 ])
 
 # DataLoader function 
