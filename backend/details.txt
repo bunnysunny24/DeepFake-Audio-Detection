@@ -20,3 +20,6 @@ first preposses of things
 
 for audio
 python train_multimodal.py --json_path "D:\Bunny\Deepfake\backend\combined_data\LAV-DF\metadata.json" --data_dir "D:\Bunny\Deepfake\backend\combined_data\LAV-DF" --batch_size 8 --num_epochs 50
+
+
+python train_multimodal.py --json_path "D:/Bunny/Deepfake/backend/combined_data/LAV-DF/metadata.json" --data_dir "D:/Bunny/Deepfake/backend/combined_data/LAV-DF" --batch_size 8 --num_epochs 10 --max_samples 100
