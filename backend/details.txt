@@ -23,3 +23,6 @@ python train_multimodal.py --json_path "D:\Bunny\Deepfake\backend\combined_data\
 
 
 python train_multimodal.py --json_path "D:/Bunny/Deepfake/backend/combined_data/LAV-DF/metadata.json" --data_dir "D:/Bunny/Deepfake/backend/combined_data/LAV-DF" --batch_size 8 --num_epochs 10 --max_samples 100
+
+
+python train_multimodal.py --json_path "D:\Bunny\Deepfake\backend\combined_data\LAV-DF\metadata.json" --data_dir "D:\Bunny\Deepfake\backend\combined_data\LAV-DF" --batch_size 8 --num_epochs 10 --num_workers 0 --max_samples 100 --checkpoint_dir "D:\Bunny\Deepfake\backend\Models\saved_models" --save_intermediate --save_intermediate_interval 20
