@@ -21,6 +21,7 @@ import pandas as pd
 import wandb
 import argparse
 from datetime import datetime
+import shutil
 
 
 def suppress_warnings():
@@ -327,6 +328,11 @@ class DeepfakeTrainer:
         # Initialize scaler for mixed precision
         self.scaler = GradScaler() if self.amp_enabled else None
         
+        # Create a specific run folder in the checkpoint directory
+        self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.run_checkpoint_dir = os.path.join(self.config.checkpoint_dir, f"run_{self.timestamp}")
+        os.makedirs(self.run_checkpoint_dir, exist_ok=True)
+        
     def setup_directories(self):
         """Set up directories for saving models, logs, and visualizations."""
         os.makedirs(self.config.output_dir, exist_ok=True)
@@ -336,10 +342,11 @@ class DeepfakeTrainer:
         self.run_dir = os.path.join(self.config.output_dir, f"run_{timestamp}")
         os.makedirs(self.run_dir, exist_ok=True)
         
-        # Create subdirectories
-        self.model_dir = os.path.join(self.run_dir, "models")
+        # Create checkpoint directory (using the specified path)
+        self.model_dir = self.config.checkpoint_dir
         os.makedirs(self.model_dir, exist_ok=True)
         
+        # Create subdirectories
         self.log_dir = os.path.join(self.run_dir, "logs")
         os.makedirs(self.log_dir, exist_ok=True)
         
@@ -350,6 +357,7 @@ class DeepfakeTrainer:
         os.makedirs(self.plot_dir, exist_ok=True)
         
         print(f"Run directory created at: {self.run_dir}")
+        print(f"Checkpoint directory created at: {self.model_dir}")
     
     def setup_wandb(self):
         """Initialize Weights & Biases for experiment tracking."""
@@ -502,6 +510,35 @@ class DeepfakeTrainer:
         
         print("Model, optimizer, and scheduler initialized")
     
+    def save_intermediate_checkpoint(self, epoch, batch_idx):
+        """Save intermediate checkpoint during training."""
+        if not self.config.save_intermediate:
+            return
+            
+        if batch_idx % self.config.save_intermediate_interval != 0:
+            return
+            
+        intermediate_dir = os.path.join(self.run_checkpoint_dir, "intermediate")
+        os.makedirs(intermediate_dir, exist_ok=True)
+        
+        checkpoint_path = os.path.join(
+            intermediate_dir, 
+            f"checkpoint_epoch_{epoch+1}_batch_{batch_idx}.pth"
+        )
+        
+        model_state_dict = self.model.module.state_dict() if self.distributed else self.model.state_dict()
+        
+        checkpoint = {
+            'epoch': epoch + 1,
+            'batch': batch_idx,
+            'model_state_dict': model_state_dict,
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'timestamp': datetime.now().strftime("%Y%m%d_%H%M%S")
+        }
+        
+        torch.save(checkpoint, checkpoint_path)
+        print(f"Intermediate checkpoint saved: {checkpoint_path}")
+    
     def train_epoch(self, epoch):
         """Train the model for one epoch."""
         self.model.train()
@@ -597,6 +634,10 @@ class DeepfakeTrainer:
                         )
                     except Exception as vis_error:
                         print(f"Error visualizing predictions: {vis_error}")
+                
+                # Save intermediate checkpoint if enabled
+                if self.is_main_process:
+                    self.save_intermediate_checkpoint(epoch, batch_idx)
                 
             except Exception as e:
                 print(f"Error in training batch {batch_idx}: {e}")
@@ -911,10 +952,25 @@ class DeepfakeTrainer:
     
     def save_checkpoint(self, epoch, val_acc, val_f1):
         """Save model checkpoint."""
-        # Save latest model
-        checkpoint_path = os.path.join(self.model_dir, f"checkpoint_epoch_{epoch+1}.pth")
+        # Save latest model in the run-specific folder
+        epoch_checkpoint_path = os.path.join(self.run_checkpoint_dir, f"checkpoint_epoch_{epoch+1}.pth")
         
         model_state_dict = self.model.module.state_dict() if self.distributed else self.model.state_dict()
+        
+        # Gather more metrics for the checkpoint
+        train_metrics = {
+            'loss': self.metrics['train_losses'][-1] if self.metrics['train_losses'] else None,
+            'accuracy': self.metrics['train_accuracies'][-1] if self.metrics['train_accuracies'] else None,
+            'f1': self.metrics['train_f1_scores'][-1] if self.metrics['train_f1_scores'] else None,
+            'auc': self.metrics['train_auc_scores'][-1] if self.metrics['train_auc_scores'] else None
+        }
+        
+        val_metrics = {
+            'loss': self.metrics['val_losses'][-1] if self.metrics['val_losses'] else None,
+            'accuracy': val_acc,
+            'f1': val_f1,
+            'auc': self.metrics['val_auc_scores'][-1] if self.metrics['val_auc_scores'] else None
+        }
         
         checkpoint = {
             'epoch': epoch + 1,
@@ -922,11 +978,19 @@ class DeepfakeTrainer:
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None,
             'scaler_state_dict': self.scaler.state_dict() if self.scaler else None,
-            'val_accuracy': val_acc,
-            'val_f1': val_f1
+            'train_metrics': train_metrics,
+            'val_metrics': val_metrics,
+            'config': vars(self.config),
+            'timestamp': self.timestamp
         }
         
-        torch.save(checkpoint, checkpoint_path)
+        # Save the checkpoint for this epoch
+        torch.save(checkpoint, epoch_checkpoint_path)
+        print(f"Checkpoint saved: {epoch_checkpoint_path}")
+        
+        # Save a copy in the main checkpoint directory as latest checkpoint
+        latest_path = os.path.join(self.model_dir, "latest_checkpoint.pth")
+        torch.save(checkpoint, latest_path)
         
         # Save best model
         is_best = False
@@ -936,22 +1000,51 @@ class DeepfakeTrainer:
             self.best_val_f1 = val_f1
             self.best_epoch = epoch
             
-            best_path = os.path.join(self.model_dir, "best_model.pth")
+            # Save in both the run-specific directory and the main checkpoint directory
+            best_path_run = os.path.join(self.run_checkpoint_dir, "best_model_v1.pth")
+            torch.save(checkpoint, best_path_run)
+            
+            # Main checkpoint directory best model
+            best_path = os.path.join(self.model_dir, "best_model_v1.pth")
             torch.save(checkpoint, best_path)
+            
+            # Also save a timestamped version of the best model
+            best_path_timestamped = os.path.join(
+                self.model_dir, 
+                f"best_model_epoch_{epoch+1}_acc_{val_acc:.4f}_f1_{val_f1:.4f}.pth"
+            )
+            torch.save(checkpoint, best_path_timestamped)
+            
             print(f"Best model saved (Epoch {epoch+1}, Accuracy: {val_acc:.4f}, F1: {val_f1:.4f})")
+            print(f"Path: {best_path}")
+            print(f"Timestamped path: {best_path_timestamped}")
         
         # Optionally remove old checkpoints to save space
         if self.config.keep_n_checkpoints > 0:
-            checkpoints = sorted([f for f in os.listdir(self.model_dir) if f.startswith("checkpoint")])
-            while len(checkpoints) > self.config.keep_n_checkpoints:
-                os.remove(os.path.join(self.model_dir, checkpoints[0]))
-                checkpoints = checkpoints[1:]
+            # Find all checkpoint files in the run directory
+            checkpoint_files = []
+            for file in os.listdir(self.run_checkpoint_dir):
+                if file.startswith("checkpoint_epoch_") and file.endswith(".pth"):
+                    checkpoint_files.append(os.path.join(self.run_checkpoint_dir, file))
+            
+            # Sort by modification time (oldest first)
+            checkpoint_files.sort(key=os.path.getmtime)
+            
+            # Keep only the most recent N checkpoints
+            while len(checkpoint_files) > self.config.keep_n_checkpoints:
+                try:
+                    os.remove(checkpoint_files[0])
+                    print(f"Removed old checkpoint: {checkpoint_files[0]}")
+                    checkpoint_files.pop(0)
+                except Exception as e:
+                    print(f"Error removing old checkpoint: {e}")
+                    break
         
         return is_best
     
     def load_best_model(self):
         """Load the best model for testing."""
-        best_model_path = os.path.join(self.model_dir, "best_model.pth")
+        best_model_path = os.path.join(self.model_dir, "best_model_v1.pth")
         if not os.path.exists(best_model_path):
             print("Best model not found. Using current model.")
             return
@@ -959,13 +1052,25 @@ class DeepfakeTrainer:
         print(f"Loading best model from: {best_model_path}")
         checkpoint = torch.load(best_model_path, map_location=self.device)
         
-        # Load model state dict
-        if self.distributed:
-            self.model.module.load_state_dict(checkpoint['model_state_dict'])
-        else:
-            self.model.load_state_dict(checkpoint['model_state_dict'])
-        
-        print(f"Loaded best model from epoch {checkpoint['epoch']} with validation accuracy {checkpoint['val_accuracy']:.4f}")
+        try:
+            # Load model state dict
+            if self.distributed:
+                self.model.module.load_state_dict(checkpoint['model_state_dict'])
+            else:
+                self.model.load_state_dict(checkpoint['model_state_dict'])
+            
+            print(f"Loaded best model from epoch {checkpoint['epoch']} with validation accuracy {checkpoint['val_metrics']['accuracy']:.4f}")
+            
+            # Optionally load optimizer and scheduler states as well
+            if 'optimizer_state_dict' in checkpoint and self.config.resume_optimizer:
+                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                print("Optimizer state loaded")
+                
+            if 'scheduler_state_dict' in checkpoint and self.scheduler is not None and self.config.resume_scheduler:
+                self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                print("Scheduler state loaded")
+        except Exception as e:
+            print(f"Error loading best model: {e}")
     
     def save_final_metrics(self, test_loss, test_metrics):
         """Save final metrics to JSON file."""
@@ -990,11 +1095,18 @@ class DeepfakeTrainer:
             'test_metrics': test_metrics
         }
         
+        # Save in log directory
         metrics_path = os.path.join(self.log_dir, "final_metrics.json")
         with open(metrics_path, 'w') as f:
             json.dump(final_metrics, f, indent=4)
         
+        # Also save in checkpoint directory
+        metrics_path_checkpoint = os.path.join(self.run_checkpoint_dir, "final_metrics.json")
+        with open(metrics_path_checkpoint, 'w') as f:
+            json.dump(final_metrics, f, indent=4)
+        
         print(f"Final metrics saved to: {metrics_path}")
+        print(f"Final metrics also saved to: {metrics_path_checkpoint}")
 
 
 def parse_arguments():
@@ -1005,6 +1117,8 @@ def parse_arguments():
     parser.add_argument('--json_path', type=str, required=True, help='Path to JSON file with dataset metadata.')
     parser.add_argument('--data_dir', type=str, required=True, help='Path to directory containing video and audio files.')
     parser.add_argument('--output_dir', type=str, default='./output', help='Path to output directory.')
+    parser.add_argument('--checkpoint_dir', type=str, default='D:/Bunny/Deepfake/backend/Models/saved_models',
+                        help='Path to save model checkpoints.')
     parser.add_argument('--max_samples', type=int, default=None, help='Maximum number of samples to use from dataset.')
     
     # Model parameters
@@ -1044,6 +1158,14 @@ def parse_arguments():
     parser.add_argument('--gradient_clip', type=float, default=1.0, help='Gradient clipping value. 0 disables clipping.')
     parser.add_argument('--pretrained_path', type=str, default=None, help='Path to pretrained model weights.')
     
+    # Checkpoint parameters
+    parser.add_argument('--resume_training', action='store_true', help='Resume training from the best model checkpoint.')
+    parser.add_argument('--resume_optimizer', action='store_true', help='Resume optimizer state when resuming training.')
+    parser.add_argument('--resume_scheduler', action='store_true', help='Resume scheduler state when resuming training.')
+    parser.add_argument('--save_every_epoch', action='store_true', help='Save a checkpoint after every epoch.')
+    parser.add_argument('--save_intermediate', action='store_true', help='Save intermediate checkpoints during training.')
+    parser.add_argument('--save_intermediate_interval', type=int, default=100, help='Interval (in batches) for saving intermediate checkpoints.')
+    
     # Hardware parameters
     parser.add_argument('--device', type=str, default='cuda', choices=['cuda', 'cpu'], help='Device to use.')
     parser.add_argument('--amp_enabled', action='store_true', help='Enable automatic mixed precision.')
@@ -1072,6 +1194,18 @@ def main():
     # Parse arguments
     args = parse_arguments()
     
+    # Make sure the checkpoint directory exists
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
+    print(f"Checkpoint directory: {args.checkpoint_dir}")
+    
+    # Resume training from checkpoint if requested
+    if args.resume_training:
+        checkpoint_path = os.path.join(args.checkpoint_dir, "best_model_v1.pth")
+        if os.path.exists(checkpoint_path):
+            print(f"Found checkpoint for resuming training: {checkpoint_path}")
+        else:
+            print(f"Checkpoint not found at {checkpoint_path}. Training from scratch.")
+    
     # Initialize trainer
     trainer = DeepfakeTrainer(args)
     
@@ -1083,6 +1217,24 @@ def main():
     print(f"Test Accuracy: {test_metrics['accuracy']:.4f}")
     print(f"Test F1 Score: {test_metrics['f1']:.4f}")
     print(f"Test AUC Score: {test_metrics['auc']:.4f}")
+    
+    # Create a zip archive of the best model for easier distribution
+    try:
+        best_model_path = os.path.join(args.checkpoint_dir, "best_model.pth")
+        if os.path.exists(best_model_path):
+            import zipfile
+            zip_path = os.path.join(args.checkpoint_dir, f"best_model_{trainer.timestamp}.zip")
+            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                zipf.write(best_model_path, os.path.basename(best_model_path))
+                
+                # Also include the config file
+                config_path = os.path.join(trainer.run_dir, "config.json")
+                if os.path.exists(config_path):
+                    zipf.write(config_path, os.path.basename(config_path))
+                    
+            print(f"Zipped best model saved to: {zip_path}")
+    except Exception as e:
+        print(f"Error creating model zip archive: {e}")
     
     # Close WandB
     if args.use_wandb and trainer.is_main_process:
