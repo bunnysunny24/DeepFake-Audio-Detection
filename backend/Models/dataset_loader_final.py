@@ -1,4 +1,6 @@
-
+import torch.nn.functional as F
+import scipy
+from scipy import signal
 import json
 import os
 import numpy as np
@@ -1010,7 +1012,7 @@ class MultiModalDeepfakeDataset(Dataset):
                     # Convert to blink score (lower EAR = more closed eyes)
                     # Typical threshold for blink detection is around 0.2
                     blink_score = 1.0 - min(1.0, max(0.0, ear * 3))  # Scale and invert
-                    blink_scores.append(blink_score.item())
+                    blink_scores.append(float(blink_score) if isinstance(blink_score, torch.Tensor) else blink_score)
             else:
                 # Fallback to simpler detection directly from frames
                 for i in range(num_frames):
