@@ -1979,7 +1979,7 @@ class MultiModalDeepfakeModel(nn.Module):
         
         # Face embedding processor
         self.face_embedding_processor = nn.Sequential(
-            nn.Linear(512, 256),
+            nn.Linear(32, 256),
             nn.ReLU(),
             nn.Linear(256, 128)
         )
