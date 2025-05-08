@@ -2719,6 +2719,25 @@ class MultiModalDeepfakeModel(nn.Module):
             else:
                 final_features = transformer_output
             
+            # Add feature adapter for classifier
+            expected_classifier_dim = 1792  # Set this to match your classifier's expected input dimension
+            if final_features.shape[-1] != expected_classifier_dim:
+                print(f"[INFO] Adjusting feature dimensions from {final_features.shape[-1]} to {expected_classifier_dim}")
+                
+                # Create a temporary adapter
+                temp_adapter = nn.Linear(final_features.shape[-1], expected_classifier_dim).to(device)
+                
+                # Initialize with reasonable values (identity-like mapping where possible)
+                with torch.no_grad():
+                    temp_adapter.weight.zero_()
+                    min_dim = min(final_features.shape[-1], expected_classifier_dim)
+                    for i in range(min_dim):
+                        temp_adapter.weight[i, i] = 1.0
+                    temp_adapter.bias.zero_()
+                
+                # Apply the adapter
+                final_features = temp_adapter(final_features)
+            
             # Main classification
             output = self.classifier(final_features)
             
