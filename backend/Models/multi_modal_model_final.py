@@ -470,19 +470,16 @@ class HeadPoseEstimator(nn.Module):
 
 
 class EyeAnalysisModule(nn.Module):
-    """Analyzes eye movements including blinking and pupil dilation."""
-    def __init__(self, landmark_dim=36, hidden_dim=64):  # 36 = 18 eye landmarks * 2 coordinates
+    """Analyzes eye movements including blinking and pupil dilation with automatic dimension adjustment."""
+    def __init__(self, hidden_dim=64):
         super(EyeAnalysisModule, self).__init__()
+        self.hidden_dim = hidden_dim
+        self.landmark_dim = None  # Will be initialized dynamically
         
-        # Eye feature encoder
-        self.eye_encoder = nn.Sequential(
-            nn.Linear(landmark_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU()
-        )
+        # Placeholder for dynamically created components
+        self.eye_encoder = None
         
+        # Components that don't depend on input dimension
         # Blink detector
         self.blink_detector = nn.Sequential(
             nn.Linear(hidden_dim // 2, hidden_dim // 4),
@@ -513,6 +510,19 @@ class EyeAnalysisModule(nn.Module):
             nn.Linear(hidden_dim, 1),
             nn.Sigmoid()
         )
+    
+    def _init_eye_encoder(self, landmark_dim):
+        """Dynamically initialize the eye encoder based on input dimensions"""
+        self.landmark_dim = landmark_dim
+        self.eye_encoder = nn.Sequential(
+            nn.Linear(landmark_dim, self.hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(self.hidden_dim, self.hidden_dim // 2),
+            nn.ReLU()
+        ).to(next(self.blink_detector.parameters()).device)
+        
+        print(f"[INFO] Dynamically initialized eye encoder with input dim {landmark_dim}")
         
     def forward(self, eye_landmarks):
         """
@@ -522,22 +532,50 @@ class EyeAnalysisModule(nn.Module):
         Returns:
             Tuple of (naturalness_score, blinks, pupil_dilation)
         """
+        # Handle None or empty input
+        if eye_landmarks is None or eye_landmarks.numel() == 0:
+            device = next(self.blink_detector.parameters()).device
+            batch_size = 1
+            seq_len = 1
+            if eye_landmarks is not None and len(eye_landmarks.shape) >= 2:
+                batch_size, seq_len = eye_landmarks.shape[:2]
+            
+            return (
+                torch.ones(batch_size, 1, device=device) * 0.5,  # naturalness
+                torch.zeros(batch_size, seq_len, device=device),  # blinks
+                torch.zeros(batch_size, seq_len, device=device)   # pupil dilation
+            )
+        
+        # Get batch size and sequence length
         batch_size, seq_len = eye_landmarks.shape[:2]
+        
+        # Initialize or update eye encoder if needed
+        current_landmark_dim = eye_landmarks.shape[2]
+        if self.eye_encoder is None or self.landmark_dim != current_landmark_dim:
+            self._init_eye_encoder(current_landmark_dim)
         
         blinks = []
         pupil_dilations = []
         
-        # Process each frame
+        # Process each frame with exception handling
         for t in range(seq_len):
-            features = self.eye_encoder(eye_landmarks[:, t])
-            
-            # Detect blink
-            blink = self.blink_detector(features)
-            blinks.append(blink)
-            
-            # Estimate pupil dilation
-            dilation = self.pupil_estimator(features)
-            pupil_dilations.append(dilation)
+            try:
+                features = self.eye_encoder(eye_landmarks[:, t])
+                
+                # Detect blink
+                blink = self.blink_detector(features)
+                blinks.append(blink)
+                
+                # Estimate pupil dilation
+                dilation = self.pupil_estimator(features)
+                pupil_dilations.append(dilation)
+                
+            except Exception as e:
+                print(f"[WARNING] Error processing frame {t}: {e}")
+                # Create fallback values
+                device = eye_landmarks.device
+                blinks.append(torch.ones(batch_size, 1, device=device) * 0.5)
+                pupil_dilations.append(torch.ones(batch_size, 1, device=device) * 0.5)
         
         # Stack across time
         blinks = torch.stack(blinks, dim=1)  # [batch, frames, 1]
