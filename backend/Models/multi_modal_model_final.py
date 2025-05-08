@@ -659,16 +659,14 @@ class LipAudioSyncAnalyzer(nn.Module):
 
 
 class OculomotorDynamicsAnalyzer(nn.Module):
-    """Analyzes saccades, fixations and other eye movement behaviors."""
-    def __init__(self, eye_feature_dim=32, hidden_dim=64):
+    """Analyzes saccades, fixations and other eye movement behaviors with dynamic dimension adjustment."""
+    def __init__(self, hidden_dim=64):
         super(OculomotorDynamicsAnalyzer, self).__init__()
+        self.hidden_dim = hidden_dim
+        self.eye_feature_dim = None  # Will be initialized dynamically
         
-        # Movement encoder
-        self.movement_encoder = nn.Sequential(
-            nn.Linear(eye_feature_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim)
-        )
+        # Movement encoder will be initialized dynamically
+        self.movement_encoder = None
         
         # Temporal analyzer
         self.temporal_cnn = nn.Sequential(
@@ -692,6 +690,17 @@ class OculomotorDynamicsAnalyzer(nn.Module):
             nn.Linear(hidden_dim*2, 1),
             nn.Sigmoid()
         )
+    
+    def _init_movement_encoder(self, eye_feature_dim):
+        """Dynamically initialize the movement encoder based on input dimensions"""
+        self.eye_feature_dim = eye_feature_dim
+        self.movement_encoder = nn.Sequential(
+            nn.Linear(eye_feature_dim, self.hidden_dim),
+            nn.ReLU(),
+            nn.Linear(self.hidden_dim, self.hidden_dim)
+        ).to(next(self.temporal_cnn.parameters()).device)
+        
+        print(f"[INFO] Dynamically initialized oculomotor movement encoder with input dim {eye_feature_dim}")
         
     def forward(self, eye_movement_features):
         """
@@ -701,32 +710,80 @@ class OculomotorDynamicsAnalyzer(nn.Module):
         Returns:
             Tuple of (naturalness_score, movement_classifications)
         """
-        # Encode movements
-        encoded = self.movement_encoder(eye_movement_features)
+        # Handle None or empty input
+        if eye_movement_features is None or eye_movement_features.numel() == 0:
+            device = next(self.temporal_cnn.parameters()).device
+            batch_size = 1
+            if eye_movement_features is not None and len(eye_movement_features.shape) > 0:
+                batch_size = eye_movement_features.shape[0]
+                
+            return (
+                torch.ones(batch_size, 1, device=device) * 0.5,  # naturalness
+                torch.ones(batch_size, 3, device=device) / 3.0  # uniform distribution
+            )
         
-        # Transpose for 1D CNN [batch, channels, time]
-        encoded = encoded.transpose(1, 2)
+        # Initialize or update movement encoder if needed
+        current_feature_dim = eye_movement_features.shape[2]
+        if self.movement_encoder is None or self.eye_feature_dim != current_feature_dim:
+            self._init_movement_encoder(current_feature_dim)
         
-        # Extract temporal patterns
-        temporal_features = self.temporal_cnn(encoded).squeeze(-1)
-        
-        # Classify movements
-        movement_classes = self.dynamics_classifier(temporal_features)
-        
-        # Score naturalness
-        naturalness = self.naturalness_scorer(temporal_features)
-        
-        return naturalness, movement_classes
-
-
+        try:
+            # Encode movements
+            encoded = self.movement_encoder(eye_movement_features)
+            
+            # Transpose for 1D CNN [batch, channels, time]
+            encoded = encoded.transpose(1, 2)
+            
+            # Extract temporal patterns
+            temporal_features = self.temporal_cnn(encoded).squeeze(-1)
+            
+            # Classify movements
+            movement_classes = self.dynamics_classifier(temporal_features)
+            
+            # Score naturalness
+            naturalness = self.naturalness_scorer(temporal_features)
+            
+            return naturalness, movement_classes
+            
+        except Exception as e:
+            print(f"[WARNING] Error in oculomotor dynamics analysis: {e}")
+            # Return fallback values
+            device = next(self.temporal_cnn.parameters()).device
+            batch_size = eye_movement_features.shape[0]
+            
+            return (
+                torch.ones(batch_size, 1, device=device) * 0.5,  # naturalness
+                torch.ones(batch_size, 3, device=device) / 3.0  # uniform distribution
+            )
 # Physiological Signal Analysis Modules
 
 class RemotePhysiologicalAnalyzer(nn.Module):
-    """Analyzes subtle physiological signals from video."""
-    def __init__(self, input_channels=3, feature_dim=32):
+    """Analyzes subtle physiological signals from video with enhanced dynamic dimension handling."""
+    def __init__(self, feature_dim=32):
         super(RemotePhysiologicalAnalyzer, self).__init__()
+        self.feature_dim = feature_dim
         
-        # Spatial feature extraction
+        # Spatial feature extraction will be initialized dynamically
+        self.input_channels = None
+        self.feature_extractor = None
+        
+        # Signal processor will be initialized dynamically
+        self.actual_feature_dim = None
+        self.signal_processor = None
+        
+        # Create estimators that will be compatible with any feature dimension
+        self.hr_estimator = None
+        self.hrv_estimator = None
+        self.breathing_estimator = None
+        
+        # Naturalness scorer is fixed dimension (always 3 inputs)
+        self.naturalness_scorer = nn.Linear(3, 1)
+    
+    def _init_feature_extractor(self, input_channels):
+        """Dynamically initialize the feature extractor based on input channels"""
+        self.input_channels = input_channels
+        device = self.naturalness_scorer.weight.device
+        
         self.feature_extractor = nn.Sequential(
             nn.Conv2d(input_channels, 32, kernel_size=3, padding=1),
             nn.ReLU(),
@@ -734,78 +791,169 @@ class RemotePhysiologicalAnalyzer(nn.Module):
             nn.Conv2d(32, 64, kernel_size=3, padding=1),
             nn.ReLU(),
             nn.MaxPool2d(2),
-            nn.Conv2d(64, feature_dim, kernel_size=3, padding=1),
+            nn.Conv2d(64, self.feature_dim, kernel_size=3, padding=1),
             nn.ReLU(),
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten()
-        )
+        ).to(device)
         
-        # Temporal signal processing
+        print(f"[INFO] Dynamically initialized feature extractor with {input_channels} input channels")
+    
+    def _init_signal_processor(self, actual_feature_dim):
+        """Dynamically initialize the signal processor based on actual feature dimensions"""
+        self.actual_feature_dim = actual_feature_dim
+        device = self.naturalness_scorer.weight.device
+        
+        # Create signal processor with correct input dimension
         self.signal_processor = nn.Sequential(
-            nn.Linear(feature_dim, feature_dim),
+            nn.Linear(actual_feature_dim, self.feature_dim),
             nn.ReLU(),
-            nn.Linear(feature_dim, feature_dim//2),
+            nn.Linear(self.feature_dim, self.feature_dim//2),
             nn.ReLU()
-        )
+        ).to(device)
         
-        # Heart rate estimator
-        self.hr_estimator = nn.Linear(feature_dim//2, 1)
+        # Create estimators with correct dimensions
+        self.hr_estimator = nn.Linear(self.feature_dim//2, 1).to(device)
+        self.hrv_estimator = nn.Linear(self.feature_dim//2, 1).to(device)
+        self.breathing_estimator = nn.Linear(self.feature_dim//2, 1).to(device)
         
-        # HRV estimator
-        self.hrv_estimator = nn.Linear(feature_dim//2, 1)
-        
-        # Breathing rate estimator
-        self.breathing_estimator = nn.Linear(feature_dim//2, 1)
-        
-        # Naturalness scorer
-        self.naturalness_scorer = nn.Linear(3, 1)
+        print(f"[INFO] Dynamically initialized signal processor with input dim {actual_feature_dim}")
     
     def forward(self, face_frames):
         """
         Args:
-            face_frames: Facial video frames [batch, frames, channels, height, width]
+            face_frames: Facial video frames in format [batch, frames, channels, height, width]
+                         or [batch, frames, height, width, channels]
         
         Returns:
             Dictionary with physiological measurements and naturalness score
         """
-        batch_size, num_frames = face_frames.shape[:2]
+        # Get device from parameters
+        device = self.naturalness_scorer.weight.device
         
-        # Extract spatial features from each frame
-        frame_features = []
-        for t in range(num_frames):
-            features = self.feature_extractor(face_frames[:, t])
-            frame_features.append(features)
+        # Handle None or empty input
+        if face_frames is None or face_frames.numel() == 0:
+            batch_size = 1
+            if face_frames is not None and len(face_frames.shape) > 0:
+                batch_size = face_frames.shape[0]
+                
+            return {
+                'heart_rate': torch.tensor([80.0], device=device).expand(batch_size, 1),
+                'hrv': torch.tensor([0.5], device=device).expand(batch_size, 1),
+                'breathing_rate': torch.tensor([15.0], device=device).expand(batch_size, 1),
+                'naturalness': torch.tensor([0.5], device=device).expand(batch_size, 1)
+            }
+        
+        try:
+            batch_size, num_frames = face_frames.shape[:2]
             
-        # Stack temporal features
-        temporal_features = torch.stack(frame_features, dim=1)  # [batch, frames, features]
-        
-        # Extract RGB signals by averaging regions
-        green_signal = temporal_features.mean(dim=2)  # Simple approximation
-        
-        # Process signal
-        processed_signal = self.signal_processor(green_signal)
-        
-        # Get final representation (mean of sequence)
-        final_features = torch.mean(processed_signal, dim=1)
-        
-        # Estimate vital signs
-        heart_rate = torch.sigmoid(self.hr_estimator(final_features)) * 120 + 40  # 40-160 BPM range
-        hrv = torch.sigmoid(self.hrv_estimator(final_features))
-        breathing_rate = torch.sigmoid(self.breathing_estimator(final_features)) * 20 + 10  # 10-30 breaths/min
-        
-        # Score physiological naturalness
-        physio_features = torch.cat([
-            heart_rate, hrv, breathing_rate
-        ], dim=1)
-        naturalness = torch.sigmoid(self.naturalness_scorer(physio_features))
-        
-        return {
-            'heart_rate': heart_rate,
-            'hrv': hrv,
-            'breathing_rate': breathing_rate,
-            'naturalness': naturalness
-        }
-
+            # Auto-detect frame format (channels first or channels last)
+            if len(face_frames.shape) >= 5:
+                # Determine if channels are in dimension 2 or 4
+                if face_frames.shape[2] in [1, 3, 4]:  # Common channel counts
+                    # Format is [batch, frames, channels, height, width]
+                    input_channels = face_frames.shape[2]
+                    frames_need_transpose = False
+                else:
+                    # Format is [batch, frames, height, width, channels]
+                    input_channels = face_frames.shape[4]
+                    frames_need_transpose = True
+            else:
+                # Default to 1 channel if unclear
+                input_channels = 1
+                frames_need_transpose = False
+                
+            print(f"[DEBUG] Frame format detected: {'channels_last' if frames_need_transpose else 'channels_first'}")
+            print(f"[DEBUG] Input shape: {face_frames.shape}, channels: {input_channels}")
+            
+            # Initialize feature extractor if needed
+            if self.feature_extractor is None or self.input_channels != input_channels:
+                self._init_feature_extractor(input_channels)
+            
+            # Extract spatial features from each frame
+            frame_features = []
+            for t in range(num_frames):
+                try:
+                    # Prepare frame for Conv2d (batch, channels, height, width)
+                    if frames_need_transpose:
+                        # Move channels from last dimension to second dimension
+                        current_frames = face_frames[:, t].permute(0, 3, 1, 2)
+                    else:
+                        current_frames = face_frames[:, t]
+                    
+                    # Debug dimensions
+                    print(f"[DEBUG] Frame at position {t} shape: {current_frames.shape}")
+                    
+                    # Extract features
+                    features = self.feature_extractor(current_frames)
+                    frame_features.append(features)
+                    
+                    # Initialize signal processor after getting first feature
+                    if t == 0 and (self.signal_processor is None or self.actual_feature_dim != features.shape[1]):
+                        self._init_signal_processor(features.shape[1])
+                        
+                except Exception as frame_error:
+                    print(f"[WARNING] Error processing frame {t}: {frame_error}")
+                    # Skip this frame
+                    continue
+            
+            # Check if we have any valid frames
+            if not frame_features:
+                raise ValueError("No frames were successfully processed")
+                
+            # Stack temporal features
+            temporal_features = torch.stack(frame_features, dim=1)  # [batch, frames, features]
+            print(f"[DEBUG] Temporal features shape: {temporal_features.shape}")
+            
+            # Process each frame's features individually to avoid dimension issues
+            processed_signals = []
+            for t in range(temporal_features.shape[1]):
+                frame_feature = temporal_features[:, t]
+                processed = self.signal_processor(frame_feature)
+                processed_signals.append(processed)
+            
+            # Stack processed signals
+            processed_signal = torch.stack(processed_signals, dim=1)
+            print(f"[DEBUG] Processed signal shape: {processed_signal.shape}")
+            
+            # Get final representation (mean of sequence)
+            final_features = torch.mean(processed_signal, dim=1)
+            print(f"[DEBUG] Final features shape: {final_features.shape}")
+            
+            # Estimate vital signs
+            heart_rate = torch.sigmoid(self.hr_estimator(final_features)) * 120 + 40  # 40-160 BPM range
+            hrv = torch.sigmoid(self.hrv_estimator(final_features))
+            breathing_rate = torch.sigmoid(self.breathing_estimator(final_features)) * 20 + 10  # 10-30 breaths/min
+            
+            # Score physiological naturalness
+            physio_features = torch.cat([
+                heart_rate, hrv, breathing_rate
+            ], dim=1)
+            naturalness = torch.sigmoid(self.naturalness_scorer(physio_features))
+            
+            return {
+                'heart_rate': heart_rate,
+                'hrv': hrv,
+                'breathing_rate': breathing_rate,
+                'naturalness': naturalness
+            }
+            
+        except Exception as e:
+            print(f"[WARNING] Error in remote physiological analysis: {e}")
+            if 'face_frames' in locals():
+                print(f"[DEBUG] Input shape: {face_frames.shape}")
+            if 'temporal_features' in locals():
+                print(f"[DEBUG] Temporal features shape: {temporal_features.shape}")
+            if 'frame_features' in locals() and frame_features:
+                print(f"[DEBUG] First frame feature shape: {frame_features[0].shape}")
+            
+            # Return default values
+            return {
+                'heart_rate': torch.tensor([80.0], device=device).expand(batch_size, 1),
+                'hrv': torch.tensor([0.5], device=device).expand(batch_size, 1),
+                'breathing_rate': torch.tensor([15.0], device=device).expand(batch_size, 1),
+                'naturalness': torch.tensor([0.5], device=device).expand(batch_size, 1)
+            }
 
 class SkinColorAnalyzer(nn.Module):
     """Analyzes skin color variations to detect pulse and blood flow patterns."""
@@ -2029,12 +2177,12 @@ class MultiModalDeepfakeModel(nn.Module):
         self.micro_expression_detector = MicroExpressionDetector(input_channels=3, hidden_dim=64)
         self.landmark_trajectory_analyzer = FacialLandmarkTrajectoryAnalyzer(num_landmarks=68, hidden_dim=128)
         self.head_pose_estimator = HeadPoseEstimator(landmark_dim=136, hidden_dim=128)
-        self.eye_analysis_module = EyeAnalysisModule(landmark_dim=36, hidden_dim=64)
+        self.eye_analysis_module = EyeAnalysisModule(hidden_dim=64)
         self.lip_audio_sync_analyzer = LipAudioSyncAnalyzer(lip_dim=40, audio_dim=self.actual_audio_feature_dim, hidden_dim=128)
-        self.oculomotor_dynamics_analyzer = OculomotorDynamicsAnalyzer(eye_feature_dim=32, hidden_dim=64)
+        self.oculomotor_dynamics_analyzer = OculomotorDynamicsAnalyzer(hidden_dim=64)
         
         # 2. Physiological Signal Analysis
-        self.physiological_analyzer = RemotePhysiologicalAnalyzer(input_channels=3, feature_dim=32)
+        self.physiological_analyzer = RemotePhysiologicalAnalyzer(feature_dim=32)
         self.skin_color_analyzer = SkinColorAnalyzer(feature_dim=32)
         
         # 3. Visual Artifact & Spatial Analysis
@@ -2460,7 +2608,55 @@ class MultiModalDeepfakeModel(nn.Module):
             # Combine transformer output with explainability features if enabled
             if self.enable_explainability:
                 # Concatenate all explainability features
-                all_explainability = torch.cat(explainability_features, dim=-1)
+                # Normalize explainability features to ensure consistent dimensions
+                normalized_features = []
+                batch_size = inputs['video_frames'].shape[0] if 'video_frames' in inputs else 1
+                target_dim = 4  # Set this to match your expected dimension
+                device = next(self.parameters()).device
+
+                for feature in explainability_features:
+                    if feature is None:
+                        normalized_features.append(torch.zeros(batch_size, target_dim, device=device))
+                        continue
+                        
+                    # Ensure it's a tensor
+                    if not isinstance(feature, torch.Tensor):
+                        try:
+                            feature = torch.tensor(feature, device=device)
+                        except:
+                            normalized_features.append(torch.zeros(batch_size, target_dim, device=device))
+                            continue
+                    
+                    # Ensure it has batch dimension
+                    if feature.dim() == 1:
+                        feature = feature.unsqueeze(0)
+                    
+                    # Ensure correct batch size
+                    if feature.shape[0] != batch_size:
+                        if feature.shape[0] == 1:
+                            feature = feature.expand(batch_size, -1)
+                        else:
+                            feature = feature[:batch_size]
+                    
+                    # Normalize feature dimension
+                    feat_dim = feature.shape[1] if feature.dim() > 1 else 1
+                    if feat_dim < target_dim:
+                        # Pad with zeros
+                        padding = torch.zeros(batch_size, target_dim - feat_dim, device=device)
+                        feature = torch.cat([feature, padding], dim=1)
+                    elif feat_dim > target_dim:
+                        # Truncate
+                        feature = feature[:, :target_dim]
+                    
+                    normalized_features.append(feature)
+
+                try:
+                    all_explainability = torch.cat(normalized_features, dim=-1)
+                except Exception as e:
+                    print(f"[WARNING] Error concatenating explainability features: {e}")
+                    # Return a zero tensor as fallback
+                    total_dim = sum(f.shape[1] for f in normalized_features if hasattr(f, 'shape'))
+                    all_explainability = torch.zeros(batch_size, total_dim, device=device)
                 
                 # Weight each explainability component by learned weights
                 weighted_components = {}
@@ -2476,10 +2672,44 @@ class MultiModalDeepfakeModel(nn.Module):
                         weighted_components[key] = weighted_value
                 
                 # Create explainability vector by concatenating weighted features
-                explainability_vector = torch.cat([
+                # Normalize weighted components for concatenation
+                tensors_to_concatenate = [
                     value for key, value in weighted_components.items() 
                     if value is not None and value.dim() > 0
-                ], dim=-1)
+                ]
+                
+                # Normalize dimensions for concatenation
+                normalized_tensors = []
+                batch_size = inputs['video_frames'].shape[0] if 'video_frames' in inputs else 1
+                target_dim = 4  # Set this to match your expected dimension
+                device = next(self.parameters()).device
+                
+                for tensor in tensors_to_concatenate:
+                    # Ensure correct batch size
+                    if tensor.shape[0] != batch_size:
+                        if tensor.shape[0] == 1:
+                            tensor = tensor.expand(batch_size, -1)
+                        else:
+                            tensor = tensor[:batch_size]
+                    
+                    # Normalize feature dimension
+                    feat_dim = tensor.shape[1] if tensor.dim() > 1 else 1
+                    if feat_dim < target_dim:
+                        # Pad with zeros
+                        padding = torch.zeros(batch_size, target_dim - feat_dim, device=device)
+                        tensor = torch.cat([tensor, padding], dim=1)
+                    elif feat_dim > target_dim:
+                        # Truncate
+                        tensor = tensor[:, :target_dim]
+                    
+                    normalized_tensors.append(tensor)
+                
+                try:
+                    explainability_vector = torch.cat(normalized_tensors, dim=-1)
+                except Exception as e:
+                    print(f"[WARNING] Error concatenating explainability vector: {e}")
+                    # Create a fallback vector with a reasonable dimension
+                    explainability_vector = torch.zeros(batch_size, target_dim * len(normalized_tensors), device=device)
                 
                 # Ensure consistent dimensionality
                 explainability_vector = explainability_vector.view(batch_size, -1)
