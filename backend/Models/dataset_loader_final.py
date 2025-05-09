@@ -92,13 +92,18 @@ class MultiModalDeepfakeDataset(Dataset):
         
         # Limit to first 100 samples for faster processing
         max_samples = 100
+        # max_to_validate = min(max_samples, len(self.data))
+        # print(f"Using first {max_to_validate} samples out of {len(self.data)} total.")
         max_to_validate = min(max_samples, len(self.data))
-        print(f"Using first {max_to_validate} samples out of {len(self.data)} total.")
+
+        # To this:
+        print("Validating all samples...")
+        max_to_validate = len(self.data)
         
         valid_indices = []
         
         # Add progress indicators for validation
-        progress_interval = max(1, max_to_validate // 10)  # Show progress ~10 times
+        progress_interval = max(1, max_to_validate // 100)  # Show progress ~100 times
         
         for idx in range(max_to_validate):
             if idx % progress_interval == 0 or idx == max_to_validate - 1:
