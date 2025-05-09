@@ -128,5 +128,6 @@ python3 train_multimodal.py \
 source /home/srmist54/backend/Models/enter/bin/activate
 wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
 bash Miniconda3-latest-Linux-x86_64.sh
-
+conda create -n dlib_env python=3.10 -y
+conda activate dlib_env
 
