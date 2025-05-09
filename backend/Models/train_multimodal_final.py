@@ -22,6 +22,8 @@ import wandb
 import argparse
 from datetime import datetime
 import shutil
+import torch.multiprocessing as mp
+mp.set_start_method('spawn', force=True)
 
 
 def suppress_warnings():
@@ -430,7 +432,7 @@ class DeepfakeTrainer:
         self.best_val_accuracy = 0.0
         self.best_val_f1 = 0.0
         self.best_epoch = 0
-        self.early_stop_counter = a
+        self.early_stop_counter = 0
         
         # Initialize scaler for mixed precision
         self.scaler = GradScaler() if self.amp_enabled else None
@@ -1166,93 +1168,93 @@ class DeepfakeTrainer:
         
         return avg_loss, metrics_dict
     
-def train_and_validate(self):
-    """Train and validate the model for the specified number of epochs."""
-    print(f"Starting training for {self.config.num_epochs} epochs...")
-    
-    # Start from the resumed epoch if checkpoint was loaded
-    start_epoch = getattr(self, 'start_epoch', 0)
-    print(f"Starting from epoch {start_epoch+1}")
-    
-    for epoch in range(start_epoch, self.config.num_epochs):
-        epoch_start_time = time.time()
+    def train_and_validate(self):
+        """Train and validate the model for the specified number of epochs."""
+        print(f"Starting training for {self.config.num_epochs} epochs...")
         
-        # Training phase
-        train_loss, train_acc, train_precision, train_recall, train_f1, train_auc = self.train_epoch(epoch)
+        # Start from the resumed epoch if checkpoint was loaded
+        start_epoch = getattr(self, 'start_epoch', 0)
+        print(f"Starting from epoch {start_epoch+1}")
         
-        # Validation phase
-        val_loss, val_acc, val_precision, val_recall, val_f1, val_auc = self.validate_epoch(epoch)
-        
-        # Update learning rate scheduler if using plateau scheduler
-        if self.scheduler is not None:
-            if self.config.scheduler == 'plateau':
-                # ReduceLROnPlateau step with validation metrics
-                self.scheduler.step(val_f1)  # or val_acc
-            else:
-                self.scheduler.step()
-        
-        # Calculate epoch time
-        epoch_time = time.time() - epoch_start_time
-        
-        # Print epoch summary
-        if self.is_main_process:
-            print(f"\nEpoch {epoch+1}/{self.config.num_epochs} completed in {epoch_time:.2f}s")
-            print(f"Train - Loss: {train_loss:.4f}, Accuracy: {train_acc:.4f}, F1: {train_f1:.4f}, AUC: {train_auc:.4f}")
-            print(f"Val   - Loss: {val_loss:.4f}, Accuracy: {val_acc:.4f}, F1: {val_f1:.4f}, AUC: {val_auc:.4f}")
+        for epoch in range(start_epoch, self.config.num_epochs):
+            epoch_start_time = time.time()
             
-            # Save checkpoint
-            self.save_checkpoint(epoch, val_acc, val_f1)
+            # Training phase
+            train_loss, train_acc, train_precision, train_recall, train_f1, train_auc = self.train_epoch(epoch)
             
-            # Plot metrics
-            for metric_name, train_values, val_values in [
-                ('loss', self.metrics['train_losses'], self.metrics['val_losses']),
-                ('accuracy', self.metrics['train_accuracies'], self.metrics['val_accuracies']),
-                ('f1', self.metrics['train_f1_scores'], self.metrics['val_f1_scores']),
-                ('auc', self.metrics['train_auc_scores'], self.metrics['val_auc_scores'])
-            ]:
-                plot_path = plot_metrics(train_values, val_values, metric_name, epoch+1, self.plot_dir)
+            # Validation phase
+            val_loss, val_acc, val_precision, val_recall, val_f1, val_auc = self.validate_epoch(epoch)
+            
+            # Update learning rate scheduler if using plateau scheduler
+            if self.scheduler is not None:
+                if self.config.scheduler == 'plateau':
+                    # ReduceLROnPlateau step with validation metrics
+                    self.scheduler.step(val_f1)  # or val_acc
+                else:
+                    self.scheduler.step()
+            
+            # Calculate epoch time
+            epoch_time = time.time() - epoch_start_time
+            
+            # Print epoch summary
+            if self.is_main_process:
+                print(f"\nEpoch {epoch+1}/{self.config.num_epochs} completed in {epoch_time:.2f}s")
+                print(f"Train - Loss: {train_loss:.4f}, Accuracy: {train_acc:.4f}, F1: {train_f1:.4f}, AUC: {train_auc:.4f}")
+                print(f"Val   - Loss: {val_loss:.4f}, Accuracy: {val_acc:.4f}, F1: {val_f1:.4f}, AUC: {val_auc:.4f}")
                 
-                # Log metrics plot to WandB
+                # Save checkpoint
+                self.save_checkpoint(epoch, val_acc, val_f1)
+                
+                # Plot metrics
+                for metric_name, train_values, val_values in [
+                    ('loss', self.metrics['train_losses'], self.metrics['val_losses']),
+                    ('accuracy', self.metrics['train_accuracies'], self.metrics['val_accuracies']),
+                    ('f1', self.metrics['train_f1_scores'], self.metrics['val_f1_scores']),
+                    ('auc', self.metrics['train_auc_scores'], self.metrics['val_auc_scores'])
+                ]:
+                    plot_path = plot_metrics(train_values, val_values, metric_name, epoch+1, self.plot_dir)
+                    
+                    # Log metrics plot to WandB
+                    if self.config.use_wandb:
+                        wandb.log({f"{metric_name}_plot": wandb.Image(plot_path)})
+                
+                # Log epoch metrics to WandB
                 if self.config.use_wandb:
-                    wandb.log({f"{metric_name}_plot": wandb.Image(plot_path)})
-            
-            # Log epoch metrics to WandB
-            if self.config.use_wandb:
-                wandb.log({
-                    'epoch': epoch + 1,
-                    'train_loss': train_loss,
-                    'val_loss': val_loss,
-                    'train_accuracy': train_acc,
-                    'val_accuracy': val_acc,
-                    'train_precision': train_precision,
-                    'val_precision': val_precision,
-                    'train_recall': train_recall,
-                    'val_recall': val_recall,
-                    'train_f1': train_f1,
-                    'val_f1': val_f1,
-                    'train_auc': train_auc,
-                    'val_auc': val_auc,
-                    'learning_rate': get_lr(self.optimizer),
-                    'epoch_time': epoch_time
-                })
-            
-            # Check for early stopping
-            if val_f1 > self.best_val_f1:
-                self.best_val_f1 = val_f1
-                self.best_val_accuracy = val_acc
-                self.best_epoch = epoch + 1
-                self.early_stop_counter = 0
+                    wandb.log({
+                        'epoch': epoch + 1,
+                        'train_loss': train_loss,
+                        'val_loss': val_loss,
+                        'train_accuracy': train_acc,
+                        'val_accuracy': val_acc,
+                        'train_precision': train_precision,
+                        'val_precision': val_precision,
+                        'train_recall': train_recall,
+                        'val_recall': val_recall,
+                        'train_f1': train_f1,
+                        'val_f1': val_f1,
+                        'train_auc': train_auc,
+                        'val_auc': val_auc,
+                        'learning_rate': get_lr(self.optimizer),
+                        'epoch_time': epoch_time
+                    })
                 
-                # Save best model
-                self.save_best_model(epoch, val_acc, val_f1)
-            else:
-                self.early_stop_counter += 1
-                print(f"Early stopping counter: {self.early_stop_counter}/{self.config.early_stopping_patience}")
-            
-            if self.early_stop_counter >= self.config.early_stopping_patience:
-                print(f"\nEarly stopping triggered after {epoch+1} epochs")
-                print(f"Best validation F1: {self.best_val_f1:.4f}, Accuracy: {self.best_val_accuracy:.4f} (Epoch {self.best_epoch})")
-                break
+                # Check for early stopping
+                if val_f1 > self.best_val_f1:
+                    self.best_val_f1 = val_f1
+                    self.best_val_accuracy = val_acc
+                    self.best_epoch = epoch + 1
+                    self.early_stop_counter = 0
+                    
+                    # Save best model
+                    self.save_best_model(epoch, val_acc, val_f1)
+                else:
+                    self.early_stop_counter += 1
+                    print(f"Early stopping counter: {self.early_stop_counter}/{self.config.early_stopping_patience}")
+                
+                if self.early_stop_counter >= self.config.early_stopping_patience:
+                    print(f"\nEarly stopping triggered after {epoch+1} epochs")
+                    print(f"Best validation F1: {self.best_val_f1:.4f}, Accuracy: {self.best_val_accuracy:.4f} (Epoch {self.best_epoch})")
+                    break
         
         # Print training summary
         if self.is_main_process:
