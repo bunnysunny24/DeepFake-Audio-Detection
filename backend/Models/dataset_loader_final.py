@@ -396,10 +396,32 @@ class MultiModalDeepfakeDataset(Dataset):
                 
                 if self.detect_faces:
                     try:
-                        # Convert to PIL for face detector
+                        
                         # Convert to PIL for face detector - ensure it's 8-bit RGB
-                        frame_rgb_8bit = (frame_rgb * 255).astype(np.uint8) if frame_rgb.dtype != np.uint8 else frame_rgb
-                        pil_img = Image.fromarray(frame_rgb_8bit)
+                        # Ensure frame_rgb has valid values and shape
+                        if frame_rgb.shape[2] != 3 or np.isnan(frame_rgb).any():
+                            raise ValueError("Invalid frame format")
+                        # Convert to 8-bit RGB with additional safety checks
+                        if frame_rgb.dtype != np.uint8:
+                            if frame_rgb.max() <= 1.0:
+                                frame_rgb_8bit = (frame_rgb * 255).astype(np.uint8)
+                            else:
+                                # Already in correct range, just convert type
+                                frame_rgb_8bit = frame_rgb.astype(np.uint8)
+                        else:
+                            frame_rgb_8bit = frame_rgb
+                        
+                        # Additional check to ensure values are in valid range
+                        if frame_rgb_8bit.min() < 0 or frame_rgb_8bit.max() > 255:
+                            frame_rgb_8bit = np.clip(frame_rgb_8bit, 0, 255).astype(np.uint8)
+                        
+                        # Verify shape before creating PIL image
+                        if frame_rgb_8bit.shape[2] != 3:
+                            raise ValueError(f"Expected RGB image with 3 channels, got shape {frame_rgb_8bit.shape}")
+                        
+                        # Convert to PIL with explicit mode
+                        pil_img = Image.fromarray(frame_rgb_8bit, mode='RGB')
+                            
                         
                         # Detect faces
                         boxes, probs = self.face_detector.detect(pil_img)
