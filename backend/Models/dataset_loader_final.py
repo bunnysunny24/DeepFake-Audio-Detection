@@ -397,7 +397,9 @@ class MultiModalDeepfakeDataset(Dataset):
                 if self.detect_faces:
                     try:
                         # Convert to PIL for face detector
-                        pil_img = Image.fromarray(frame_rgb)
+                        # Convert to PIL for face detector - ensure it's 8-bit RGB
+                        frame_rgb_8bit = (frame_rgb * 255).astype(np.uint8) if frame_rgb.dtype != np.uint8 else frame_rgb
+                        pil_img = Image.fromarray(frame_rgb_8bit)
                         
                         # Detect faces
                         boxes, probs = self.face_detector.detect(pil_img)
