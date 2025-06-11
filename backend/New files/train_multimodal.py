@@ -1,5 +1,5 @@
 from multi_modal_model import MultiModalDeepfakeModel
-from dataset_loader import get_data_loaders, get_transforms
+from dataset_loader import get_data_loaders, get_transforms, get_transforms_enhanced
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -22,6 +22,8 @@ import wandb
 import argparse
 from datetime import datetime
 import shutil
+import torch.multiprocessing as mp
+mp.set_start_method('spawn', force=True)
 
 
 def suppress_warnings():
@@ -234,7 +236,7 @@ def save_visualizations(inputs, outputs, results, epoch, sample_idx, viz_dir):
                     f.write(f"\nOverall confidence: {explanation['confidence']:.4f}\n")
         
         # Generate and save attention maps if model has this capability
-        if hasattr(model, 'get_attention_maps'):
+        if 'model' in locals() and hasattr(model, 'get_attention_maps'):
             try:
                 with torch.no_grad():
                     attention_maps = model.get_attention_maps(inputs)
@@ -248,6 +250,113 @@ def save_visualizations(inputs, outputs, results, epoch, sample_idx, viz_dir):
                         )
             except Exception as e:
                 print(f"Error generating attention maps: {e}")
+                
+        # NEW: Visualize facial landmarks if available
+        if 'facial_landmarks' in inputs and inputs['facial_landmarks'] is not None:
+            try:
+                landmarks = inputs['facial_landmarks'][sample_idx].cpu().numpy()
+                
+                for t in range(min(max_viz_frames, landmarks.shape[0])):
+                    # Load the frame
+                    frame_path = os.path.join(frames_dir, f'frame_{t}.jpg')
+                    if os.path.exists(frame_path):
+                        frame = cv2.imread(frame_path)
+                        
+                        # Draw landmarks
+                        lm = landmarks[t]
+                        for i in range(0, len(lm), 2):
+                            if i+1 < len(lm) and lm[i] > 0 and lm[i+1] > 0:
+                                x, y = int(lm[i]), int(lm[i+1])
+                                cv2.circle(frame, (x, y), 2, (0, 255, 0), -1)
+                        
+                        # Save the frame with landmarks
+                        cv2.imwrite(
+                            os.path.join(frames_dir, f'frame_{t}_landmarks.jpg'),
+                            frame
+                        )
+            except Exception as e:
+                print(f"Error visualizing facial landmarks: {e}")
+                
+        # NEW: Visualize head pose if available
+        if 'head_pose' in inputs and inputs['head_pose'] is not None:
+            try:
+                head_pose = inputs['head_pose'][sample_idx].cpu().numpy()
+                
+                # Create a plot of head pose over time
+                plt.figure(figsize=(10, 5))
+                time_axis = np.arange(len(head_pose))
+                plt.plot(time_axis, head_pose[:, 0], label='Pitch', color='red')
+                plt.plot(time_axis, head_pose[:, 1], label='Yaw', color='green')
+                plt.plot(time_axis, head_pose[:, 2], label='Roll', color='blue')
+                plt.title(f'Head Pose Over Time - Sample {sample_idx}')
+                plt.xlabel('Frame')
+                plt.ylabel('Angle (normalized)')
+                plt.legend()
+                plt.grid(True)
+                
+                # Save the plot
+                plt.savefig(os.path.join(frames_dir, 'head_pose.png'))
+                plt.close()
+            except Exception as e:
+                print(f"Error visualizing head pose: {e}")
+                
+        # NEW: Visualize eye blink pattern if available
+        if 'eye_blink_features' in inputs and inputs['eye_blink_features'] is not None:
+            try:
+                blink_pattern = inputs['eye_blink_features'][sample_idx].cpu().numpy()
+                
+                # Create a plot of blink pattern over time
+                plt.figure(figsize=(10, 3))
+                time_axis = np.arange(len(blink_pattern))
+                plt.plot(time_axis, blink_pattern, label='Blink Score', color='purple')
+                plt.title(f'Eye Blink Pattern - Sample {sample_idx}')
+                plt.xlabel('Frame')
+                plt.ylabel('Blink Score')
+                plt.ylim([0, 1])
+                plt.grid(True)
+                
+                # Save the plot
+                plt.savefig(os.path.join(frames_dir, 'eye_blink_pattern.png'))
+                plt.close()
+            except Exception as e:
+                print(f"Error visualizing eye blink pattern: {e}")
+                
+        # NEW: Visualize pulse signal if available
+        if 'pulse_signal' in inputs and inputs['pulse_signal'] is not None:
+            try:
+                pulse = inputs['pulse_signal'][sample_idx].cpu().numpy()
+                
+                # Create a plot of pulse signal over time
+                plt.figure(figsize=(10, 3))
+                time_axis = np.arange(len(pulse))
+                plt.plot(time_axis, pulse, label='Pulse Signal', color='red')
+                plt.title(f'Pulse Signal - Sample {sample_idx}')
+                plt.xlabel('Frame')
+                plt.ylabel('Signal Amplitude')
+                plt.grid(True)
+                
+                # Save the plot
+                plt.savefig(os.path.join(frames_dir, 'pulse_signal.png'))
+                plt.close()
+            except Exception as e:
+                print(f"Error visualizing pulse signal: {e}")
+                
+        # NEW: Visualize frequency domain features if available
+        if 'frequency_features' in inputs and inputs['frequency_features'] is not None:
+            try:
+                freq_features = inputs['frequency_features'][sample_idx].cpu().numpy()
+                
+                # Create heatmap of frequency features
+                plt.figure(figsize=(6, 6))
+                sns.heatmap(freq_features[0], cmap='viridis')
+                plt.title(f'Frequency Domain Features - Sample {sample_idx}')
+                plt.axis('off')
+                
+                # Save the plot
+                plt.savefig(os.path.join(frames_dir, 'frequency_features.png'))
+                plt.close()
+            except Exception as e:
+                print(f"Error visualizing frequency features: {e}")
                 
     except Exception as e:
         print(f"Error saving visualizations: {e}")
@@ -333,6 +442,61 @@ class DeepfakeTrainer:
         self.run_checkpoint_dir = os.path.join(self.config.checkpoint_dir, f"run_{self.timestamp}")
         os.makedirs(self.run_checkpoint_dir, exist_ok=True)
         
+        # Initialize starting epoch
+        self.start_epoch = 0
+        
+        # Check for resume checkpoint
+        if hasattr(config, 'resume_checkpoint') and config.resume_checkpoint:
+            self.load_checkpoint(config.resume_checkpoint)
+    
+    def load_checkpoint(self, checkpoint_path):
+        """Load checkpoint and resume training state."""
+        if not os.path.exists(checkpoint_path):
+            print(f"Warning: Checkpoint file not found at {checkpoint_path}")
+            return
+        
+        print(f"Loading checkpoint from: {checkpoint_path}")
+        
+        try:
+            # Load checkpoint on appropriate device
+            checkpoint = torch.load(checkpoint_path, map_location=self.device)
+            
+            # Load model weights
+            if self.distributed:
+                self.model.module.load_state_dict(checkpoint['model_state_dict'])
+            else:
+                self.model.load_state_dict(checkpoint['model_state_dict'])
+            
+            # Load optimizer state
+            if 'optimizer_state_dict' in checkpoint:
+                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            
+            # Load scheduler state if available
+            if self.scheduler is not None and 'scheduler_state_dict' in checkpoint and checkpoint['scheduler_state_dict'] is not None:
+                self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            
+            # Update metrics and best values if available
+            if 'accuracy' in checkpoint:
+                self.best_val_accuracy = checkpoint['accuracy']
+            
+            if 'f1_score' in checkpoint:
+                self.best_val_f1 = checkpoint['f1_score']
+            
+            # Set the starting epoch
+            self.start_epoch = checkpoint.get('epoch', 0)
+            
+            # Load metrics history if available
+            if 'metrics' in checkpoint:
+                self.metrics = checkpoint['metrics']
+            
+            print(f"Checkpoint loaded successfully. Resuming from epoch {self.start_epoch}")
+            print(f"Previous best metrics - Accuracy: {self.best_val_accuracy:.4f}, F1: {self.best_val_f1:.4f}")
+        
+        except Exception as e:
+            print(f"Error loading checkpoint: {e}")
+            import traceback
+            traceback.print_exc()
+        
     def setup_directories(self):
         """Set up directories for saving models, logs, and visualizations."""
         os.makedirs(self.config.output_dir, exist_ok=True)
@@ -365,10 +529,26 @@ class DeepfakeTrainer:
             project_name = self.config.wandb_project or "deepfake-detection"
             run_name = self.config.wandb_run_name or f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
             
+            # Define detailed tags for better tracking
+            tags = [
+                f"backbone_visual:{self.config.backbone_visual}",
+                f"backbone_audio:{self.config.backbone_audio}",
+                f"fusion:{self.config.fusion_type}"
+            ]
+            
+            # Add enhanced feature tags
+            if hasattr(self.config, 'detect_faces') and self.config.detect_faces:
+                tags.append("facial_analysis")
+            if hasattr(self.config, 'enhanced_preprocessing') and self.config.enhanced_preprocessing:
+                tags.append("enhanced_preprocessing")
+            if hasattr(self.config, 'enhanced_augmentation') and self.config.enhanced_augmentation:
+                tags.append("enhanced_augmentation")
+            
             wandb.init(
                 project=project_name,
                 name=run_name,
-                config=vars(self.config)
+                config=vars(self.config),
+                tags=tags
             )
             
             print(f"Weights & Biases initialized: {project_name}/{run_name}")
@@ -398,11 +578,7 @@ class DeepfakeTrainer:
             dist.init_process_group(backend='nccl', init_method='env://')
             torch.cuda.set_device(self.local_rank)
         
-        # Get training and validation transforms
-        train_video_transform, train_audio_transform = get_transforms('train')
-        val_video_transform, val_audio_transform = get_transforms('val')
-        
-        # Load data loaders
+        # Get data loaders with appropriate options
         self.train_loader, self.val_loader, self.test_loader, self.class_weights = get_data_loaders(
             json_path=self.config.json_path,
             data_dir=self.config.data_dir,
@@ -414,7 +590,9 @@ class DeepfakeTrainer:
             max_samples=self.config.max_samples,
             detect_faces=self.config.detect_faces,
             compute_spectrograms=self.config.compute_spectrograms,
-            temporal_features=self.config.temporal_features
+            temporal_features=self.config.temporal_features,
+            enhanced_preprocessing=getattr(self.config, 'enhanced_preprocessing', True),
+            enhanced_augmentation=getattr(self.config, 'enhanced_augmentation', False)
         )
         
         print(f"Data loaders created: {len(self.train_loader)} train batches, "
@@ -617,10 +795,17 @@ class DeepfakeTrainer:
                 
                 # Log batch results to WandB
                 if self.config.use_wandb and self.is_main_process and batch_idx % self.config.log_interval == 0:
+                    # Log component weights if available
+                    component_weights = {}
+                    if 'component_weights' in results and results['component_weights'] is not None:
+                        for i, weight in enumerate(results['component_weights']):
+                            component_weights[f'component_weight_{i}'] = weight.item()
+                    
                     wandb.log({
                         'batch_loss': loss.item(),
                         'learning_rate': get_lr(self.optimizer),
-                        'batch': batch_idx + epoch * len(self.train_loader)
+                        'batch': batch_idx + epoch * len(self.train_loader),
+                        **component_weights
                     })
                     
                 # Visualize sample predictions periodically
@@ -641,6 +826,8 @@ class DeepfakeTrainer:
                 
             except Exception as e:
                 print(f"Error in training batch {batch_idx}: {e}")
+                import traceback
+                traceback.print_exc()
                 continue
         
         # Calculate average loss and metrics
@@ -664,6 +851,9 @@ class DeepfakeTrainer:
         
         val_progress = tqdm(self.val_loader, desc=f"Epoch {epoch+1}/{self.config.num_epochs} [Val]", 
                           disable=not self.is_main_process)
+        
+        # Track component contributions to analyze feature importance
+        all_component_contributions = {}
         
         with torch.no_grad():
             for batch_idx, batch in enumerate(val_progress):
@@ -707,6 +897,22 @@ class DeepfakeTrainer:
                         except Exception as vis_error:
                             print(f"Error visualizing predictions: {vis_error}")
                     
+                    # Track component contributions for feature importance analysis
+                    if 'component_contributions' in results and results['component_contributions'] is not None:
+                        for key, value in results['component_contributions'].items():
+                            if key not in all_component_contributions:
+                                all_component_contributions[key] = []
+                            
+                            # Extract scalar value if it's a tensor
+                            if isinstance(value, torch.Tensor):
+                                if value.numel() == 1:
+                                    all_component_contributions[key].append(value.item())
+                                else:
+                                    # Average for multi-element tensors
+                                    all_component_contributions[key].append(value.mean().item())
+                            elif isinstance(value, (int, float)):
+                                all_component_contributions[key].append(value)
+                    
                 except Exception as e:
                     print(f"Error in validation batch {batch_idx}: {e}")
                     continue
@@ -728,6 +934,38 @@ class DeepfakeTrainer:
             # Log confusion matrix to WandB
             if self.config.use_wandb:
                 wandb.log({f"confusion_matrix_epoch_{epoch+1}": wandb.Image(cm_path)})
+                
+            # Log component importance for feature analysis to WandB
+            if self.config.use_wandb and all_component_contributions:
+                component_importance = {}
+                for key, values in all_component_contributions.items():
+                    if values:
+                        avg_value = np.mean(values)
+                        component_importance[f"component_{key}"] = avg_value
+                
+                wandb.log(component_importance)
+                
+                # Create feature importance chart
+                if component_importance:
+                    plt.figure(figsize=(12, 6))
+                    keys = sorted(component_importance.keys())
+                    values = [component_importance[k] for k in keys]
+                    
+                    # Sort by value
+                    sorted_indices = np.argsort(values)
+                    sorted_keys = [keys[i] for i in sorted_indices]
+                    sorted_values = [values[i] for i in sorted_indices]
+                    
+                    plt.barh(sorted_keys, sorted_values)
+                    plt.title("Feature Importance Scores")
+                    plt.xlabel("Average Contribution")
+                    plt.tight_layout()
+                    
+                    feature_importance_path = os.path.join(self.plot_dir, f"feature_importance_epoch_{epoch+1}.png")
+                    plt.savefig(feature_importance_path)
+                    plt.close()
+                    
+                    wandb.log({f"feature_importance_epoch_{epoch+1}": wandb.Image(feature_importance_path)})
         
         # Return metrics
         return avg_loss, accuracy, precision, recall, f1, auc_score
@@ -749,6 +987,9 @@ class DeepfakeTrainer:
             'issues_found': [],
             'confidence_score': []
         }
+        
+        # Track detailed component results for analysis
+        detailed_component_results = {}
         
         with torch.no_grad():
             for batch_idx, batch in enumerate(test_progress):
@@ -798,12 +1039,41 @@ class DeepfakeTrainer:
                             if 'confidence' in explanation:
                                 confidence_score = explanation['confidence']
                         
+                        # Basic result data
                         results_data['file_path'].append(file_paths[i] if i < len(file_paths) else 'unknown')
                         results_data['true_label'].append(int(batch_y_true[i]))
                         results_data['pred_label'].append(int(predictions[i]))
                         results_data['confidence'].append(float(confidences[i]))
                         results_data['issues_found'].append('; '.join(issues))
                         results_data['confidence_score'].append(float(confidence_score))
+                        
+                        # Extract and store component contributions for detailed analysis
+                        if 'component_contributions' in results and results['component_contributions'] is not None:
+                            for key, value in results['component_contributions'].items():
+                                if key not in detailed_component_results:
+                                    detailed_component_results[key] = []
+                                
+                                # Extract value for this sample
+                                if isinstance(value, torch.Tensor):
+                                    if value.numel() == 1:
+                                        detailed_component_results[key].append(value.item())
+                                    elif i < value.size(0):
+                                        # First value for this batch item
+                                        if value[i].numel() == 1:
+                                            detailed_component_results[key].append(value[i].item())
+                                        else:
+                                            detailed_component_results[key].append(value[i].mean().item())
+                                    else:
+                                        detailed_component_results[key].append(0.0)
+                                elif isinstance(value, (int, float)):
+                                    detailed_component_results[key].append(value)
+                                elif isinstance(value, dict) and 'naturalness' in value:
+                                    if isinstance(value['naturalness'], torch.Tensor):
+                                        detailed_component_results[key].append(value['naturalness'].item())
+                                    else:
+                                        detailed_component_results[key].append(value['naturalness'])
+                                else:
+                                    detailed_component_results[key].append(0.0)
                     
                     # Visualize sample predictions periodically
                     if (batch_idx + 1) % self.config.visualization_interval == 0 and self.is_main_process:
@@ -819,6 +1089,8 @@ class DeepfakeTrainer:
                     
                 except Exception as e:
                     print(f"Error in test batch {batch_idx}: {e}")
+                    import traceback
+                    traceback.print_exc()
                     continue
         
         # Calculate average loss and metrics
@@ -850,10 +1122,49 @@ class DeepfakeTrainer:
         
         # Save detailed results to CSV
         if self.is_main_process:
+            # Basic results
             results_df = pd.DataFrame(results_data)
             results_path = os.path.join(self.log_dir, "test_results.csv")
             results_df.to_csv(results_path, index=False)
             print(f"Test results saved to: {results_path}")
+            
+            # Add component results to detailed analysis DataFrame
+            for key, values in detailed_component_results.items():
+                if len(values) == len(results_data['file_path']):
+                    results_df[f"component_{key}"] = values
+            
+            # Save enhanced results with component details
+            enhanced_results_path = os.path.join(self.log_dir, "test_results_detailed.csv")
+            results_df.to_csv(enhanced_results_path, index=False)
+            print(f"Detailed test results with component analysis saved to: {enhanced_results_path}")
+            
+            # Create feature importance visualization
+            if detailed_component_results:
+                # Calculate average importance for each component
+                component_importance = {}
+                for key, values in detailed_component_results.items():
+                    if values:
+                        component_importance[key] = np.mean(values)
+                
+                # Sort components by importance
+                sorted_components = sorted(component_importance.items(), key=lambda x: x[1], reverse=True)
+                
+                # Create feature importance chart
+                plt.figure(figsize=(12, 8))
+                component_names = [item[0] for item in sorted_components]
+                component_values = [item[1] for item in sorted_components]
+                
+                plt.barh(component_names, component_values)
+                plt.title("Component Importance in Deepfake Detection")
+                plt.xlabel("Average Contribution")
+                plt.tight_layout()
+                
+                feature_importance_path = os.path.join(self.plot_dir, "feature_importance_test.png")
+                plt.savefig(feature_importance_path)
+                plt.close()
+                
+                if self.config.use_wandb:
+                    wandb.log({"feature_importance_test": wandb.Image(feature_importance_path)})
         
         return avg_loss, metrics_dict
     
@@ -861,7 +1172,11 @@ class DeepfakeTrainer:
         """Train and validate the model for the specified number of epochs."""
         print(f"Starting training for {self.config.num_epochs} epochs...")
         
-        for epoch in range(self.config.num_epochs):
+        # Start from the resumed epoch if checkpoint was loaded
+        start_epoch = getattr(self, 'start_epoch', 0)
+        print(f"Starting from epoch {start_epoch+1}")
+        
+        for epoch in range(start_epoch, self.config.num_epochs):
             epoch_start_time = time.time()
             
             # Training phase
@@ -922,324 +1237,244 @@ class DeepfakeTrainer:
                         'learning_rate': get_lr(self.optimizer),
                         'epoch_time': epoch_time
                     })
-            
-            # Check for early stopping
-            if val_acc > self.best_val_accuracy:
-                self.best_val_accuracy = val_acc
-                self.early_stop_counter = 0
-            elif val_f1 > self.best_val_f1:
-                self.best_val_f1 = val_f1
-                self.early_stop_counter = 0
-            else:
-                self.early_stop_counter += 1
                 
-            if self.early_stop_counter >= self.config.early_stopping_patience:
-                print(f"\nEarly stopping triggered after {epoch+1} epochs!")
-                break
+                # Check for early stopping
+                if val_f1 > self.best_val_f1:
+                    self.best_val_f1 = val_f1
+                    self.best_val_accuracy = val_acc
+                    self.best_epoch = epoch + 1
+                    self.early_stop_counter = 0
+                    
+                    # Save best model
+                    self.save_best_model(epoch, val_acc, val_f1)
+                else:
+                    self.early_stop_counter += 1
+                    print(f"Early stopping counter: {self.early_stop_counter}/{self.config.early_stopping_patience}")
+                
+                if self.early_stop_counter >= self.config.early_stopping_patience:
+                    print(f"\nEarly stopping triggered after {epoch+1} epochs")
+                    print(f"Best validation F1: {self.best_val_f1:.4f}, Accuracy: {self.best_val_accuracy:.4f} (Epoch {self.best_epoch})")
+                    break
         
-        # Load best model for testing
-        self.load_best_model()
-        
-        # Test the model
-        test_loss, test_metrics = self.test_model()
-        
-        # Save final metrics
-        self.save_final_metrics(test_loss, test_metrics)
-        
-        print("\nTraining completed!")
-        print(f"Best validation accuracy: {self.best_val_accuracy:.4f} at epoch {self.best_epoch+1}")
-        return test_metrics
+        # Print training summary
+        if self.is_main_process:
+            print("\nTraining completed!")
+            print(f"Best validation F1: {self.best_val_f1:.4f}, Accuracy: {self.best_val_accuracy:.4f} (Epoch {self.best_epoch})")
+            
+            # Load best model for testing
+            self.load_best_model()
+            
+            # Test the model
+            test_loss, test_metrics = self.test_model()
+            
+            # Save final results
+            final_results = {
+                'best_epoch': self.best_epoch,
+                'best_val_accuracy': float(self.best_val_accuracy),
+                'best_val_f1': float(self.best_val_f1),
+                'test_loss': float(test_loss),
+                'test_accuracy': float(test_metrics['accuracy']),
+                'test_precision': float(test_metrics['precision']),
+                'test_recall': float(test_metrics['recall']),
+                'test_f1': float(test_metrics['f1']),
+                'test_auc': float(test_metrics['auc']),
+                'training_time': time.time() - self.training_start_time if hasattr(self, 'training_start_time') else None,
+                'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                'config': vars(self.config)
+            }
+            
+            # Save as JSON
+            final_results_path = os.path.join(self.log_dir, "final_results.json")
+            with open(final_results_path, 'w') as f:
+                # Handle non-serializable values
+                serializable_results = {}
+                for key, value in final_results.items():
+                    if key == 'config':
+                        # Convert config to serializable dict
+                        config_dict = {}
+                        for k, v in value.items():
+                            if isinstance(v, (int, float, str, bool, list, dict, type(None))):
+                                config_dict[k] = v
+                            else:
+                                config_dict[k] = str(v)
+                        serializable_results[key] = config_dict
+                    elif isinstance(value, (int, float, str, bool, list, dict, type(None))):
+                        serializable_results[key] = value
+                    else:
+                        serializable_results[key] = str(value)
+                
+                json.dump(serializable_results, f, indent=4)
+            
+            print(f"Final results saved to: {final_results_path}")
     
-    def save_checkpoint(self, epoch, val_acc, val_f1):
+    def save_checkpoint(self, epoch, accuracy, f1_score):
         """Save model checkpoint."""
-        # Save latest model in the run-specific folder
-        epoch_checkpoint_path = os.path.join(self.run_checkpoint_dir, f"checkpoint_epoch_{epoch+1}.pth")
+        checkpoint_dir = os.path.join(self.run_checkpoint_dir, "regular")
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        
+        checkpoint_path = os.path.join(
+            checkpoint_dir,
+            f"checkpoint_epoch_{epoch+1}_acc_{accuracy:.4f}_f1_{f1_score:.4f}.pth"
+        )
         
         model_state_dict = self.model.module.state_dict() if self.distributed else self.model.state_dict()
-        
-        # Gather more metrics for the checkpoint
-        train_metrics = {
-            'loss': self.metrics['train_losses'][-1] if self.metrics['train_losses'] else None,
-            'accuracy': self.metrics['train_accuracies'][-1] if self.metrics['train_accuracies'] else None,
-            'f1': self.metrics['train_f1_scores'][-1] if self.metrics['train_f1_scores'] else None,
-            'auc': self.metrics['train_auc_scores'][-1] if self.metrics['train_auc_scores'] else None
-        }
-        
-        val_metrics = {
-            'loss': self.metrics['val_losses'][-1] if self.metrics['val_losses'] else None,
-            'accuracy': val_acc,
-            'f1': val_f1,
-            'auc': self.metrics['val_auc_scores'][-1] if self.metrics['val_auc_scores'] else None
-        }
         
         checkpoint = {
             'epoch': epoch + 1,
             'model_state_dict': model_state_dict,
             'optimizer_state_dict': self.optimizer.state_dict(),
-            'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None,
-            'scaler_state_dict': self.scaler.state_dict() if self.scaler else None,
-            'train_metrics': train_metrics,
-            'val_metrics': val_metrics,
-            'config': vars(self.config),
-            'timestamp': self.timestamp
+            'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler is not None else None,
+            'accuracy': accuracy,
+            'f1_score': f1_score,
+            'timestamp': datetime.now().strftime("%Y%m%d_%H%M%S")
         }
         
-        # Save the checkpoint for this epoch
-        torch.save(checkpoint, epoch_checkpoint_path)
-        print(f"Checkpoint saved: {epoch_checkpoint_path}")
+        torch.save(checkpoint, checkpoint_path)
+        print(f"Checkpoint saved: {checkpoint_path}")
+    
+    def save_best_model(self, epoch, accuracy, f1_score):
+        """Save best model checkpoint."""
+        best_model_path = os.path.join(self.run_checkpoint_dir, "best_model.pth")
         
-        # Save a copy in the main checkpoint directory as latest checkpoint
-        latest_path = os.path.join(self.model_dir, "latest_checkpoint.pth")
-        torch.save(checkpoint, latest_path)
+        model_state_dict = self.model.module.state_dict() if self.distributed else self.model.state_dict()
         
-        # Save best model
-        is_best = False
-        if val_acc > self.best_val_accuracy or (val_acc == self.best_val_accuracy and val_f1 > self.best_val_f1):
-            is_best = True
-            self.best_val_accuracy = val_acc
-            self.best_val_f1 = val_f1
-            self.best_epoch = epoch
-            
-            # Save in both the run-specific directory and the main checkpoint directory
-            best_path_run = os.path.join(self.run_checkpoint_dir, "best_model_v1.pth")
-            torch.save(checkpoint, best_path_run)
-            
-            # Main checkpoint directory best model
-            best_path = os.path.join(self.model_dir, "best_model_v1.pth")
-            torch.save(checkpoint, best_path)
-            
-            # Also save a timestamped version of the best model
-            best_path_timestamped = os.path.join(
-                self.model_dir, 
-                f"best_model_epoch_{epoch+1}_acc_{val_acc:.4f}_f1_{val_f1:.4f}.pth"
-            )
-            torch.save(checkpoint, best_path_timestamped)
-            
-            print(f"Best model saved (Epoch {epoch+1}, Accuracy: {val_acc:.4f}, F1: {val_f1:.4f})")
-            print(f"Path: {best_path}")
-            print(f"Timestamped path: {best_path_timestamped}")
+        checkpoint = {
+            'epoch': epoch + 1,
+            'model_state_dict': model_state_dict,
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler is not None else None,
+            'accuracy': accuracy,
+            'f1_score': f1_score,
+            'timestamp': datetime.now().strftime("%Y%m%d_%H%M%S")
+        }
         
-        # Optionally remove old checkpoints to save space
-        if self.config.keep_n_checkpoints > 0:
-            # Find all checkpoint files in the run directory
-            checkpoint_files = []
-            for file in os.listdir(self.run_checkpoint_dir):
-                if file.startswith("checkpoint_epoch_") and file.endswith(".pth"):
-                    checkpoint_files.append(os.path.join(self.run_checkpoint_dir, file))
-            
-            # Sort by modification time (oldest first)
-            checkpoint_files.sort(key=os.path.getmtime)
-            
-            # Keep only the most recent N checkpoints
-            while len(checkpoint_files) > self.config.keep_n_checkpoints:
-                try:
-                    os.remove(checkpoint_files[0])
-                    print(f"Removed old checkpoint: {checkpoint_files[0]}")
-                    checkpoint_files.pop(0)
-                except Exception as e:
-                    print(f"Error removing old checkpoint: {e}")
-                    break
+        torch.save(checkpoint, best_model_path)
+        print(f"Best model saved: {best_model_path}")
         
-        return is_best
+        # Copy to fixed best model location for easy reference
+        shutil.copy(best_model_path, os.path.join(self.model_dir, "best_model.pth"))
     
     def load_best_model(self):
         """Load the best model for testing."""
-        best_model_path = os.path.join(self.model_dir, "best_model_v1.pth")
+        best_model_path = os.path.join(self.run_checkpoint_dir, "best_model.pth")
+        
         if not os.path.exists(best_model_path):
-            print("Best model not found. Using current model.")
+            print(f"Best model not found at {best_model_path}. Using current model.")
             return
         
         print(f"Loading best model from: {best_model_path}")
         checkpoint = torch.load(best_model_path, map_location=self.device)
         
-        try:
-            # Load model state dict
-            if self.distributed:
-                self.model.module.load_state_dict(checkpoint['model_state_dict'])
-            else:
-                self.model.load_state_dict(checkpoint['model_state_dict'])
-            
-            print(f"Loaded best model from epoch {checkpoint['epoch']} with validation accuracy {checkpoint['val_metrics']['accuracy']:.4f}")
-            
-            # Optionally load optimizer and scheduler states as well
-            if 'optimizer_state_dict' in checkpoint and self.config.resume_optimizer:
-                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                print("Optimizer state loaded")
-                
-            if 'scheduler_state_dict' in checkpoint and self.scheduler is not None and self.config.resume_scheduler:
-                self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-                print("Scheduler state loaded")
-        except Exception as e:
-            print(f"Error loading best model: {e}")
+        # Load model weights
+        if self.distributed:
+            self.model.module.load_state_dict(checkpoint['model_state_dict'])
+        else:
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+        
+        print(f"Best model loaded (Epoch {checkpoint['epoch']}, Accuracy: {checkpoint['accuracy']:.4f}, F1: {checkpoint['f1_score']:.4f})")
     
-    def save_final_metrics(self, test_loss, test_metrics):
-        """Save final metrics to JSON file."""
-        final_metrics = {
-            'train_metrics': {
-                'loss': self.metrics['train_losses'][-1],
-                'accuracy': self.metrics['train_accuracies'][-1],
-                'f1': self.metrics['train_f1_scores'][-1],
-                'auc': self.metrics['train_auc_scores'][-1]
-            },
-            'val_metrics': {
-                'loss': self.metrics['val_losses'][-1],
-                'accuracy': self.metrics['val_accuracies'][-1],
-                'f1': self.metrics['val_f1_scores'][-1],
-                'auc': self.metrics['val_auc_scores'][-1]
-            },
-            'best_val_metrics': {
-                'accuracy': self.best_val_accuracy,
-                'f1': self.best_val_f1,
-                'epoch': self.best_epoch + 1
-            },
-            'test_metrics': test_metrics
-        }
+    def run(self):
+        """Run the full training pipeline."""
+        # Record start time
+        self.training_start_time = time.time()
         
-        # Save in log directory
-        metrics_path = os.path.join(self.log_dir, "final_metrics.json")
-        with open(metrics_path, 'w') as f:
-            json.dump(final_metrics, f, indent=4)
+        # Train and validate
+        self.train_and_validate()
         
-        # Also save in checkpoint directory
-        metrics_path_checkpoint = os.path.join(self.run_checkpoint_dir, "final_metrics.json")
-        with open(metrics_path_checkpoint, 'w') as f:
-            json.dump(final_metrics, f, indent=4)
+        # Finalize experiment on WandB
+        if self.config.use_wandb and self.is_main_process:
+            wandb.finish()
         
-        print(f"Final metrics saved to: {metrics_path}")
-        print(f"Final metrics also saved to: {metrics_path_checkpoint}")
+        # Clean up distributed training resources
+        if self.distributed:
+            dist.destroy_process_group()
 
 
-def parse_arguments():
-    """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description='Train a multimodal deepfake detection model.')
+def parse_args():
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(description="Multimodal Deepfake Detection Training")
     
     # Data parameters
-    parser.add_argument('--json_path', type=str, required=True, help='Path to JSON file with dataset metadata.')
-    parser.add_argument('--data_dir', type=str, required=True, help='Path to directory containing video and audio files.')
-    parser.add_argument('--output_dir', type=str, default='./output', help='Path to output directory.')
-    parser.add_argument('--checkpoint_dir', type=str, default='D:/Bunny/Deepfake/backend/Models/saved_models',
-                        help='Path to save model checkpoints.')
-    parser.add_argument('--max_samples', type=int, default=None, help='Maximum number of samples to use from dataset.')
+    parser.add_argument('--json_path', type=str, required=True, help='Path to dataset JSON file')
+    parser.add_argument('--data_dir', type=str, required=True, help='Path to data directory')
+    parser.add_argument('--output_dir', type=str, default='./outputs', help='Output directory for runs')
+    parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints', help='Directory to save checkpoints')
     
     # Model parameters
-    parser.add_argument('--num_classes', type=int, default=2, help='Number of classes (2 for binary classification).')
-    parser.add_argument('--video_feature_dim', type=int, default=1024, help='Dimension of video features.')
-    parser.add_argument('--audio_feature_dim', type=int, default=1024, help='Dimension of audio features.')
-    parser.add_argument('--transformer_dim', type=int, default=768, help='Dimension of transformer features.')
-    parser.add_argument('--num_transformer_layers', type=int, default=4, help='Number of transformer layers.')
-    parser.add_argument('--enable_face_mesh', action='store_true', help='Enable face mesh analysis.')
-    parser.add_argument('--enable_explainability', action='store_true', help='Enable model explainability.')
-    parser.add_argument('--fusion_type', type=str, default='attention', choices=['attention', 'concat'], help='Type of fusion.')
-    parser.add_argument('--backbone_visual', type=str, default='efficientnet', choices=['efficientnet', 'swin'], help='Visual backbone model.')
-    parser.add_argument('--backbone_audio', type=str, default='wav2vec2', choices=['wav2vec2', 'hubert'], help='Audio backbone model.')
-    parser.add_argument('--use_spectrogram', action='store_true', help='Use spectrogram features.')
-    parser.add_argument('--detect_deepfake_type', action='store_true', help='Detect deepfake type.')
-    parser.add_argument('--num_deepfake_types', type=int, default=7, help='Number of deepfake types.')
-    parser.add_argument('--deepfake_type_weight', type=float, default=0.2, help='Weight of deepfake type loss.')
-    parser.add_argument('--detect_faces', action='store_true', help='Detect and extract facial features.')
-    parser.add_argument('--compute_spectrograms', action='store_true', help='Compute audio spectrograms.')
-    parser.add_argument('--temporal_features', action='store_true', help='Compute temporal consistency features.')
-    
+    parser.add_argument('--backbone_visual', type=str, default='efficientnet', choices=['efficientnet', 'swin'], help='Visual backbone architecture')
+    parser.add_argument('--backbone_audio', type=str, default='wav2vec2', choices=['wav2vec2', 'hubert'], help='Audio backbone architecture')
+    parser.add_argument('--fusion_type', type=str, default='attention', choices=['attention', 'concat'], help='Fusion type for multimodal features')
+    parser.add_argument('--video_feature_dim', type=int, default=1024, help='Dimension of video features')
+    parser.add_argument('--audio_feature_dim', type=int, default=1024, help='Dimension of audio features')
+    parser.add_argument('--transformer_dim', type=int, default=768, help='Dimension of transformer encoder')
+    parser.add_argument('--num_transformer_layers', type=int, default=4, help='Number of transformer encoder layers')
+    parser.add_argument('--num_classes', type=int, default=2, help='Number of output classes (real/fake)')
+    parser.add_argument('--num_deepfake_types', type=int, default=7, help='Number of deepfake types for fine-grained classification')
+    parser.add_argument('--enable_face_mesh', action='store_true', help='Enable face mesh analysis')
+    parser.add_argument('--enable_explainability', action='store_true', help='Enable model explainability components')
+    parser.add_argument('--use_spectrogram', action='store_true', help='Use audio spectrogram features')
+    parser.add_argument('--detect_deepfake_type', action='store_true', help='Enable deepfake type detection')
+    parser.add_argument('--deepfake_type_weight', type=float, default=0.3, help='Weight for deepfake type classification loss')
+    parser.add_argument('--detect_faces', action='store_true', help='Enable face detection')
+    parser.add_argument('--compute_spectrograms', action='store_true', help='Compute audio spectrograms')
+    parser.add_argument('--temporal_features', action='store_true', help='Compute temporal consistency features')
+    parser.add_argument('--enhanced_preprocessing', action='store_true', help='Enable enhanced preprocessing features (physiological, etc.)')
+    parser.add_argument('--enhanced_augmentation', action='store_true', help='Enable enhanced data augmentation')
+    parser.add_argument('--resume_checkpoint', type=str, default=None, help='Path to checkpoint file to resume training from')
     # Training parameters
-    parser.add_argument('--batch_size', type=int, default=8, help='Batch size.')
-    parser.add_argument('--num_epochs', type=int, default=50, help='Number of epochs.')
-    parser.add_argument('--learning_rate', type=float, default=0.0001, help='Learning rate.')
-    parser.add_argument('--weight_decay', type=float, default=0.01, help='Weight decay.')
-    parser.add_argument('--validation_split', type=float, default=0.2, help='Fraction of data to use for validation.')
-    parser.add_argument('--test_split', type=float, default=0.1, help='Fraction of data to use for testing.')
-    parser.add_argument('--optimizer', type=str, default='adamw', choices=['adam', 'adamw', 'sgd'], help='Optimizer.')
-    parser.add_argument('--scheduler', type=str, default='cosine', choices=['step', 'cosine', 'plateau', 'none'], help='Learning rate scheduler.')
-    parser.add_argument('--scheduler_step_size', type=int, default=10, help='Step size for StepLR scheduler.')
-    parser.add_argument('--scheduler_gamma', type=float, default=0.1, help='Gamma for StepLR and ReduceLROnPlateau schedulers.')
-    parser.add_argument('--scheduler_patience', type=int, default=5, help='Patience for ReduceLROnPlateau scheduler.')
-    parser.add_argument('--warmup_epochs', type=int, default=2, help='Number of warmup epochs.')
-    parser.add_argument('--early_stopping_patience', type=int, default=10, help='Patience for early stopping.')
-    parser.add_argument('--use_weighted_loss', action='store_true', help='Use weighted loss for imbalanced data.')
-    parser.add_argument('--gradient_clip', type=float, default=1.0, help='Gradient clipping value. 0 disables clipping.')
-    parser.add_argument('--pretrained_path', type=str, default=None, help='Path to pretrained model weights.')
+    parser.add_argument('--batch_size', type=int, default=8, help='Batch size')
+    parser.add_argument('--num_epochs', type=int, default=30, help='Number of training epochs')
+    parser.add_argument('--learning_rate', type=float, default=1e-4, help='Learning rate')
+    parser.add_argument('--weight_decay', type=float, default=1e-5, help='Weight decay')
+    parser.add_argument('--max_samples', type=int, default=None, help='Maximum number of samples to use')
+    parser.add_argument('--num_workers', type=int, default=4, help='Number of data loader workers')
+    parser.add_argument('--validation_split', type=float, default=0.2, help='Validation split ratio')
+    parser.add_argument('--test_split', type=float, default=0.1, help='Test split ratio')
+    parser.add_argument('--use_weighted_loss', action='store_true', help='Use class-weighted loss function')
+    parser.add_argument('--optimizer', type=str, default='adamw', choices=['adam', 'adamw', 'sgd'], help='Optimizer to use')
+    parser.add_argument('--scheduler', type=str, default='cosine', choices=['step', 'cosine', 'plateau', 'none'], help='Learning rate scheduler')
+    parser.add_argument('--scheduler_step_size', type=int, default=10, help='Step size for StepLR scheduler')
+    parser.add_argument('--scheduler_gamma', type=float, default=0.1, help='Gamma for StepLR scheduler')
+    parser.add_argument('--scheduler_patience', type=int, default=5, help='Patience for ReduceLROnPlateau scheduler')
+    parser.add_argument('--warmup_epochs', type=int, default=2, help='Number of warmup epochs')
+    parser.add_argument('--early_stopping_patience', type=int, default=10, help='Patience for early stopping')
+    parser.add_argument('--gradient_clip', type=float, default=1.0, help='Gradient clipping value')
     
-    # Checkpoint parameters
-    parser.add_argument('--resume_training', action='store_true', help='Resume training from the best model checkpoint.')
-    parser.add_argument('--resume_optimizer', action='store_true', help='Resume optimizer state when resuming training.')
-    parser.add_argument('--resume_scheduler', action='store_true', help='Resume scheduler state when resuming training.')
-    parser.add_argument('--save_every_epoch', action='store_true', help='Save a checkpoint after every epoch.')
-    parser.add_argument('--save_intermediate', action='store_true', help='Save intermediate checkpoints during training.')
-    parser.add_argument('--save_intermediate_interval', type=int, default=100, help='Interval (in batches) for saving intermediate checkpoints.')
-    
-    # Hardware parameters
-    parser.add_argument('--device', type=str, default='cuda', choices=['cuda', 'cpu'], help='Device to use.')
-    parser.add_argument('--amp_enabled', action='store_true', help='Enable automatic mixed precision.')
-    parser.add_argument('--distributed', action='store_true', help='Enable distributed training.')
-    parser.add_argument('--local_rank', type=int, default=0, help='Local rank for distributed training.')
-    parser.add_argument('--num_workers', type=int, default=4, help='Number of worker threads for data loading.')
+    # Distributed training parameters
+    parser.add_argument('--distributed', action='store_true', help='Enable distributed training')
+    parser.add_argument('--local_rank', type=int, default=0, help='Local rank for distributed training')
     
     # Logging and visualization parameters
-    parser.add_argument('--use_wandb', action='store_true', help='Use Weights & Biases for experiment tracking.')
-    parser.add_argument('--wandb_project', type=str, default=None, help='WandB project name.')
-    parser.add_argument('--wandb_run_name', type=str, default=None, help='WandB run name.')
-    parser.add_argument('--log_interval', type=int, default=10, help='Number of batches between logging.')
-    parser.add_argument('--visualization_interval', type=int, default=50, help='Number of batches between visualizations.')
-    parser.add_argument('--keep_n_checkpoints', type=int, default=3, help='Number of checkpoints to keep.')
-    parser.add_argument('--debug', action='store_true', help='Enable debug mode with verbose output.')
-    parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility.')
+    parser.add_argument('--use_wandb', action='store_true', help='Use Weights & Biases for logging')
+    parser.add_argument('--wandb_project', type=str, default='deepfake-detection', help='WandB project name')
+    parser.add_argument('--wandb_run_name', type=str, default=None, help='WandB run name')
+    parser.add_argument('--log_interval', type=int, default=10, help='Interval for logging batch results')
+    parser.add_argument('--visualization_interval', type=int, default=50, help='Interval for visualizing predictions')
+    parser.add_argument('--save_intermediate', action='store_true', help='Save intermediate checkpoints')
+    parser.add_argument('--save_intermediate_interval', type=int, default=500, help='Interval for saving intermediate checkpoints')
+    
+    # Misc parameters
+    parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
+    parser.add_argument('--device', type=str, default='cuda', help='Device to use (cuda or cpu)')
+    parser.add_argument('--amp_enabled', action='store_true', help='Enable automatic mixed precision')
+    parser.add_argument('--debug', action='store_true', help='Enable debug mode')
+    parser.add_argument('--pretrained_path', type=str, default=None, help='Path to pretrained model weights')
     
     return parser.parse_args()
 
 
 def main():
-    """Main function to run the training and testing."""
+    """Main entry point."""
+    # Parse arguments
+    args = parse_args()
+    
     # Suppress warnings
     suppress_warnings()
     
-    # Parse arguments
-    args = parse_arguments()
-    
-    # Make sure the checkpoint directory exists
-    os.makedirs(args.checkpoint_dir, exist_ok=True)
-    print(f"Checkpoint directory: {args.checkpoint_dir}")
-    
-    # Resume training from checkpoint if requested
-    if args.resume_training:
-        checkpoint_path = os.path.join(args.checkpoint_dir, "best_model_v1.pth")
-        if os.path.exists(checkpoint_path):
-            print(f"Found checkpoint for resuming training: {checkpoint_path}")
-        else:
-            print(f"Checkpoint not found at {checkpoint_path}. Training from scratch.")
-    
-    # Initialize trainer
+    # Create trainer and run
     trainer = DeepfakeTrainer(args)
-    
-    # Train and validate the model
-    test_metrics = trainer.train_and_validate()
-    
-    # Print final results
-    print("\nFinal Results:")
-    print(f"Test Accuracy: {test_metrics['accuracy']:.4f}")
-    print(f"Test F1 Score: {test_metrics['f1']:.4f}")
-    print(f"Test AUC Score: {test_metrics['auc']:.4f}")
-    
-    # Create a zip archive of the best model for easier distribution
-    try:
-        best_model_path = os.path.join(args.checkpoint_dir, "best_model.pth")
-        if os.path.exists(best_model_path):
-            import zipfile
-            zip_path = os.path.join(args.checkpoint_dir, f"best_model_{trainer.timestamp}.zip")
-            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                zipf.write(best_model_path, os.path.basename(best_model_path))
-                
-                # Also include the config file
-                config_path = os.path.join(trainer.run_dir, "config.json")
-                if os.path.exists(config_path):
-                    zipf.write(config_path, os.path.basename(config_path))
-                    
-            print(f"Zipped best model saved to: {zip_path}")
-    except Exception as e:
-        print(f"Error creating model zip archive: {e}")
-    
-    # Close WandB
-    if args.use_wandb and trainer.is_main_process:
-        wandb.finish()
+    trainer.run()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

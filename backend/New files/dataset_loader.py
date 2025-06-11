@@ -1,3 +1,6 @@
+import torch.nn.functional as F
+import scipy
+from scipy import signal
 import json
 import os
 import numpy as np
@@ -9,17 +12,22 @@ import cv2
 import warnings
 from audiomentations import Compose, AddGaussianNoise, PitchShift, TimeStretch, Shift
 import albumentations as A
-from facenet_pytorch import MTCNN
+try:
+    from facenet_pytorch import MTCNN
+except ImportError:
+    print("Warning: facenet_pytorch not found, some face detection features will be limited")
 from scipy.signal import spectrogram
 import librosa
 from PIL import Image
 import random
 import math
+import scipy.ndimage as ndimage
 
 
 class MultiModalDeepfakeDataset(Dataset):
     def __init__(self, json_path, data_dir, max_frames=32, audio_length=16000, transform=None, audio_transform=None, 
-                 logging=False, phase='train', detect_faces=True, compute_spectrograms=True, temporal_features=True):
+                 logging=False, phase='train', detect_faces=True, compute_spectrograms=True, temporal_features=True,
+                 enhanced_preprocessing=True):
         if not os.path.exists(json_path):
             raise FileNotFoundError(f"JSON file not found at: {json_path}")
         with open(json_path, 'r', encoding='utf-8') as f:
@@ -35,6 +43,7 @@ class MultiModalDeepfakeDataset(Dataset):
         self.detect_faces = detect_faces
         self.compute_spectrograms = compute_spectrograms
         self.temporal_features = temporal_features
+        self.enhanced_preprocessing = enhanced_preprocessing
         
         # Optional face detector for more focused analysis
         if self.detect_faces:
@@ -55,6 +64,24 @@ class MultiModalDeepfakeDataset(Dataset):
         # Calculate class weights for imbalanced datasets
         self.class_weights = self._calculate_class_weights()
         
+        # Initialize facial landmark detector if available (for enhanced facial analysis)
+        if self.enhanced_preprocessing:
+            try:
+                import dlib
+                # Try to load dlib's face detector and landmark predictor
+                self.dlib_detector = dlib.get_frontal_face_detector()
+                model_path = "shape_predictor_68_face_landmarks.dat"
+                if os.path.exists(model_path):
+                    self.landmark_predictor = dlib.shape_predictor(model_path)
+                    print("Facial landmark predictor initialized successfully")
+                else:
+                    print(f"Warning: Facial landmark model not found at {model_path}")
+                    self.landmark_predictor = None
+            except Exception as e:
+                print(f"Warning: Could not initialize facial landmark detector: {e}")
+                self.dlib_detector = None
+                self.landmark_predictor = None
+        
         print(f"Dataset initialized with {len(self.valid_indices)} valid samples out of {len(self.data)} total.")
         print(f"Class distribution: {self.class_counts}")
 
@@ -65,13 +92,18 @@ class MultiModalDeepfakeDataset(Dataset):
         
         # Limit to first 100 samples for faster processing
         max_samples = 100
+        # max_to_validate = min(max_samples, len(self.data))
+        # print(f"Using first {max_to_validate} samples out of {len(self.data)} total.")
         max_to_validate = min(max_samples, len(self.data))
-        print(f"Using first {max_to_validate} samples out of {len(self.data)} total.")
+
+        # To this:
+        print("Validating all samples...")
+        max_to_validate = len(self.data)
         
         valid_indices = []
         
         # Add progress indicators for validation
-        progress_interval = max(1, max_to_validate // 10)  # Show progress ~10 times
+        progress_interval = max(1, max_to_validate // 100)  # Show progress ~100 times
         
         for idx in range(max_to_validate):
             if idx % progress_interval == 0 or idx == max_to_validate - 1:
@@ -138,11 +170,11 @@ class MultiModalDeepfakeDataset(Dataset):
             )
 
             # Load video/audio with proper error handling
-            video_frames, face_embeddings, temporal_consistency = self._load_video(video_path)
+            video_frames, face_embeddings, temporal_consistency, facial_landmarks = self._load_video(video_path)
             if video_frames is None:
                 raise ValueError(f"Video loading failed for sample {actual_idx}. Path: {video_path}")
                 
-            audio_tensor, audio_spectrogram = self._load_audio(audio_path)
+            audio_tensor, audio_spectrogram, mfcc_features = self._load_audio(audio_path)
             if audio_tensor is None:
                 raise ValueError(f"Audio loading failed for sample {actual_idx}. Path: {audio_path}")
 
@@ -153,12 +185,12 @@ class MultiModalDeepfakeDataset(Dataset):
             
             if sample.get('n_fakes', 0) > 0:
                 if sample.get('modify_video', False) and original_video_path:
-                    original_video_frames, _, _ = self._load_video(original_video_path)
+                    original_video_frames, _, _, _ = self._load_video(original_video_path)
                     if original_video_frames is None and self.logging:
                         print(f"⚠️ Warning: Original video loading failed for sample {actual_idx}. Path: {original_video_path}")
                         
                 if sample.get('modify_audio', False) and original_audio_path:
-                    original_audio_tensor, _ = self._load_audio(original_audio_path)
+                    original_audio_tensor, _, _ = self._load_audio(original_audio_path)
                     if original_audio_tensor is None and self.logging:
                         print(f"⚠️ Warning: Original audio loading failed for sample {actual_idx}. Path: {original_audio_path}")
                 
@@ -181,6 +213,25 @@ class MultiModalDeepfakeDataset(Dataset):
             # Calculate ELA (Error Level Analysis) for forgery detection
             ela_features = self._extract_ela_features(video_frames) if video_frames is not None else None
             
+            # NEW: Extract pulse signal features if enhanced preprocessing is enabled
+            pulse_signal = None
+            skin_color_variations = None
+            if self.enhanced_preprocessing and video_frames is not None:
+                pulse_signal = self._extract_pulse_signal(video_frames)
+                skin_color_variations = self._extract_skin_color_variations(video_frames)
+                
+            # NEW: Extract head pose features
+            head_pose_features = None
+            if facial_landmarks is not None:
+                head_pose_features = self._estimate_head_pose(facial_landmarks)
+            
+            # NEW: Extract eye blinking patterns
+            eye_blink_features = self._extract_eye_blink_patterns(video_frames, facial_landmarks)
+            
+            # NEW: Extract frequency domain features
+            frequency_features = self._extract_frequency_features(video_frames)
+            
+            # Label: 1 for fake, 0 for real
             label = torch.tensor(1 if sample.get('n_fakes', 0) > 0 else 0, dtype=torch.long)
             
             # Fine-grained deepfake type if available
@@ -191,7 +242,7 @@ class MultiModalDeepfakeDataset(Dataset):
             if self.logging:
                 print(f"✅ Successfully loaded sample at index {actual_idx}")
 
-            return {
+            result = {
                 'video_frames': video_frames,
                 'audio': audio_tensor,
                 'audio_spectrogram': audio_spectrogram,
@@ -208,12 +259,23 @@ class MultiModalDeepfakeDataset(Dataset):
                 'metadata_features': metadata_features,
                 'ela_features': ela_features,
                 'audio_visual_sync': audio_visual_sync_features,
-                'file_path': video_path  # For explainability and error analysis
+                'file_path': video_path,  # For explainability and error analysis
+                'facial_landmarks': facial_landmarks,  # NEW
+                'mfcc_features': mfcc_features,  # NEW
+                'pulse_signal': pulse_signal,  # NEW
+                'skin_color_variations': skin_color_variations,  # NEW
+                'head_pose': head_pose_features,  # NEW
+                'eye_blink_features': eye_blink_features,  # NEW
+                'frequency_features': frequency_features  # NEW
             }
+
+            return result
 
         except Exception as e:
             if self.logging:
                 print(f"❌ Error in __getitem__ for index {actual_idx}: {e}")
+                import traceback
+                traceback.print_exc()
             # Return a placeholder sample instead of raising to avoid training crashes
             return self._get_placeholder_sample()
 
@@ -235,8 +297,17 @@ class MultiModalDeepfakeDataset(Dataset):
         # Create a blank tensor with appropriate dimensions
         video_frames = torch.zeros((self.max_frames, 3, 224, 224))
         audio_tensor = torch.zeros(self.audio_length)
-        audio_spectrogram = torch.zeros((128, 128))
+        audio_spectrogram = torch.zeros((1, 128, 128))
         label = torch.tensor(0, dtype=torch.long)  # Assume real by default
+        facial_landmarks = torch.zeros((self.max_frames, 136))  # 68 landmarks with x,y coordinates
+        
+        # Additional placeholder features
+        mfcc_features = torch.zeros((40, 100))  # Placeholder MFCC shape
+        pulse_signal = torch.zeros(self.max_frames)
+        skin_color_variations = torch.zeros((self.max_frames, 3))
+        head_pose_features = torch.zeros((self.max_frames, 3))  # pitch, yaw, roll
+        eye_blink_features = torch.zeros(self.max_frames)
+        frequency_features = torch.zeros((1, 32, 32))
         
         return {
             'video_frames': video_frames,
@@ -255,28 +326,35 @@ class MultiModalDeepfakeDataset(Dataset):
             'metadata_features': torch.zeros(10),
             'ela_features': torch.zeros((224, 224)),
             'audio_visual_sync': torch.zeros(5),
-            'file_path': 'placeholder'
+            'file_path': 'placeholder',
+            'facial_landmarks': facial_landmarks,
+            'mfcc_features': mfcc_features,
+            'pulse_signal': pulse_signal,
+            'skin_color_variations': skin_color_variations,
+            'head_pose': head_pose_features,
+            'eye_blink_features': eye_blink_features,
+            'frequency_features': frequency_features
         }
 
     def _load_video(self, path):
         if not path or not os.path.exists(path):
             if self.logging:
                 warnings.warn(f"⚠️ Video file not found: {path}")
-            return None, None, None
+            return None, None, None, None
 
         try:
             cap = cv2.VideoCapture(path)
             if not cap.isOpened():
                 if self.logging:
                     warnings.warn(f"⚠️ Failed to open video: {path}")
-                return None, None, None
+                return None, None, None, None
 
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             fps = cap.get(cv2.CAP_PROP_FPS)
             if total_frames <= 0:
                 if self.logging:
                     warnings.warn(f"⚠️ Video has no frames: {path}")
-                return None, None, None
+                return None, None, None, None
                 
             # Create sampling indices for frames - more intelligent sampling strategy
             if self.phase == 'train':
@@ -296,6 +374,7 @@ class MultiModalDeepfakeDataset(Dataset):
                 
             video_frames = []
             face_crops = []
+            all_landmarks = []
             prev_face_locs = None
 
             for frame_idx in frame_indices:
@@ -313,11 +392,14 @@ class MultiModalDeepfakeDataset(Dataset):
                 face_crop = None
                 face_detected = False
                 consistency_score = 1.0  # Default - perfect consistency
+                landmarks = []
                 
                 if self.detect_faces:
                     try:
                         # Convert to PIL for face detector
-                        pil_img = Image.fromarray(frame_rgb)
+                        # Convert to PIL for face detector - ensure it's 8-bit RGB
+                        frame_rgb_8bit = (frame_rgb * 255).astype(np.uint8) if frame_rgb.dtype != np.uint8 else frame_rgb
+                        pil_img = Image.fromarray(frame_rgb_8bit)
                         
                         # Detect faces
                         boxes, probs = self.face_detector.detect(pil_img)
@@ -347,9 +429,32 @@ class MultiModalDeepfakeDataset(Dataset):
                             if face_crop.size != 0:
                                 face_crop = cv2.resize(face_crop, (224, 224))
                                 face_crops.append(face_crop)
+                                
+                            # Extract facial landmarks if enhanced preprocessing is enabled
+                            if self.enhanced_preprocessing and hasattr(self, 'dlib_detector') and self.dlib_detector is not None:
+                                # Convert to grayscale for dlib
+                                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                                
+                                # Detect faces
+                                dlib_faces = self.dlib_detector(gray)
+                                
+                                if dlib_faces and hasattr(self, 'landmark_predictor') and self.landmark_predictor is not None:
+                                    # Get facial landmarks
+                                    shape = self.landmark_predictor(gray, dlib_faces[0])
+                                    
+                                    # Convert landmarks to list of (x, y) coordinates
+                                    landmarks = []
+                                    for i in range(68):
+                                        x = shape.part(i).x
+                                        y = shape.part(i).y
+                                        landmarks.extend([x, y])  # Flatten to [x1, y1, x2, y2, ...]
+                                
                     except Exception as e:
                         if self.logging:
                             print(f"Face detection error on frame {frame_idx}: {e}")
+                
+                # Extract facial landmarks even if no face was detected (for consistency)
+                all_landmarks.append(landmarks if landmarks else [0] * 136)  # 68 landmarks * 2 coordinates
                 
                 # Resize frame
                 frame_rgb = cv2.resize(frame_rgb, (224, 224))
@@ -370,7 +475,7 @@ class MultiModalDeepfakeDataset(Dataset):
             if not video_frames:
                 if self.logging:
                     warnings.warn(f"⚠️ No valid frames extracted from video: {path}")
-                return None, None, None
+                return None, None, None, None
 
             # Stack frames into a tensor
             video_tensor = torch.stack(video_frames)
@@ -393,19 +498,22 @@ class MultiModalDeepfakeDataset(Dataset):
                 
             # Temporal consistency feature
             temporal_consistency = torch.tensor(consistency_score).float()
+            
+            # Convert facial landmarks to tensor
+            facial_landmarks_tensor = torch.tensor(all_landmarks, dtype=torch.float32)
 
-            return video_tensor, face_embeddings, temporal_consistency
+            return video_tensor, face_embeddings, temporal_consistency, facial_landmarks_tensor
 
         except Exception as e:
             if self.logging:
                 warnings.warn(f"⚠️ Error loading video file: {path}. Error: {e}")
-            return None, None, None
+            return None, None, None, None
 
     def _load_audio(self, path):
         if not path or not os.path.exists(path):
             if self.logging:
                 warnings.warn(f"⚠️ Audio file not found: {path}")
-            return None, None
+            return None, None, None
         try:
             # Load audio with torchaudio
             audio, sample_rate = torchaudio.load(path)
@@ -462,13 +570,32 @@ class MultiModalDeepfakeDataset(Dataset):
                     audio_spec = torch.zeros((1, 128, 128), dtype=torch.float32)
             else:
                 audio_spec = torch.zeros((1, 128, 128), dtype=torch.float32)
+            
+            # NEW: Extract MFCC features
+            mfcc_features = None
+            try:
+                # Extract MFCCs
+                mfccs = librosa.feature.mfcc(
+                    y=audio, 
+                    sr=sample_rate, 
+                    n_mfcc=40,  # Number of MFCC coefficients
+                    hop_length=512,
+                    n_fft=2048
+                )
+                # Normalize
+                mfccs = (mfccs - np.mean(mfccs)) / (np.std(mfccs) + 1e-8)
+                mfcc_features = torch.tensor(mfccs, dtype=torch.float32)
+            except Exception as e:
+                if self.logging:
+                    warnings.warn(f"⚠️ Error computing MFCC features: {e}")
+                mfcc_features = torch.zeros((40, 100), dtype=torch.float32)  # Default shape
 
-            return torch.tensor(audio, dtype=torch.float32), audio_spec
+            return torch.tensor(audio, dtype=torch.float32), audio_spec, mfcc_features
             
         except Exception as e:
             if self.logging:
                 warnings.warn(f"⚠️ Error loading audio file: {path}. Error: {e}")
-            return None, None
+            return None, None, None
             
     def _extract_metadata_features(self, video_path):
         """Extract metadata features like compression artifacts."""
@@ -655,6 +782,307 @@ class MultiModalDeepfakeDataset(Dataset):
             if self.logging:
                 warnings.warn(f"⚠️ Error extracting A/V sync features: {e}")
             return torch.zeros(5, dtype=torch.float32)
+    
+    # NEW METHODS FOR ENHANCED FEATURES
+    
+    def _extract_pulse_signal(self, video_frames):
+        """Extract subtle color variations to detect pulse signal (rPPG)."""
+        try:
+            if video_frames is None or len(video_frames) < 2:
+                return torch.zeros(self.max_frames, dtype=torch.float32)
+            
+            # Extract green channel from frames (most sensitive to blood flow changes)
+            green_values = []
+            
+            for i in range(len(video_frames)):
+                frame = video_frames[i].permute(1, 2, 0).cpu().numpy()
+                
+                # Simple skin detection (very basic)
+                r, g, b = frame[:, :, 0], frame[:, :, 1], frame[:, :, 2]
+                skin_mask = (r > 0.4) & (g > 0.2) & (b > 0.2) & (r > g) & (r > b)
+                
+                # If skin detected, get mean green value of skin region
+                if np.any(skin_mask):
+                    green_mean = np.mean(g[skin_mask])
+                else:
+                    green_mean = np.mean(g)  # Fallback to full frame
+                
+                green_values.append(green_mean)
+            
+            # Convert to numpy array
+            signal = np.array(green_values)
+            
+            # Simple signal processing: bandpass filter for heart rate range (0.7-4Hz, approx 40-240 BPM)
+            if len(signal) > 5:  # Need enough points for filtering
+                # Estimated frame rate: assume 30fps for simplicity
+                fps = 30
+                
+                # Design bandpass filter
+                nyquist = fps / 2
+                low = 0.7 / nyquist
+                high = 4.0 / nyquist
+                b, a = scipy.signal.butter(3, [low, high], btype='band')
+                
+                # Apply filter
+                filtered_signal = scipy.signal.filtfilt(b, a, signal)
+                
+                # Normalize
+                filtered_signal = (filtered_signal - np.mean(filtered_signal)) / (np.std(filtered_signal) + 1e-8)
+            else:
+                filtered_signal = signal
+            
+            # Ensure correct length
+            if len(filtered_signal) < self.max_frames:
+                filtered_signal = np.pad(filtered_signal, 
+                                        (0, self.max_frames - len(filtered_signal)), 
+                                        mode='constant')
+            else:
+                filtered_signal = filtered_signal[:self.max_frames]
+            
+            return torch.tensor(filtered_signal, dtype=torch.float32)
+            
+        except Exception as e:
+            if self.logging:
+                warnings.warn(f"⚠️ Error extracting pulse signal: {e}")
+            return torch.zeros(self.max_frames, dtype=torch.float32)
+    
+    def _extract_skin_color_variations(self, video_frames):
+        """Extract skin color variations over time to detect blood flow patterns."""
+        try:
+            if video_frames is None or len(video_frames) < 2:
+                return torch.zeros((self.max_frames, 3), dtype=torch.float32)
+            
+            # Extract average skin color (RGB) from each frame
+            skin_colors = []
+            
+            for i in range(len(video_frames)):
+                frame = video_frames[i].permute(1, 2, 0).cpu().numpy()
+                
+                # Simple skin detection
+                r, g, b = frame[:, :, 0], frame[:, :, 1], frame[:, :, 2]
+                skin_mask = (r > 0.4) & (g > 0.2) & (b > 0.2) & (r > g) & (r > b)
+                
+                # If skin detected, get mean RGB values of skin region
+                if np.any(skin_mask):
+                    r_mean = np.mean(r[skin_mask])
+                    g_mean = np.mean(g[skin_mask])
+                    b_mean = np.mean(b[skin_mask])
+                else:
+                    r_mean = np.mean(r)  # Fallback to full frame
+                    g_mean = np.mean(g)
+                    b_mean = np.mean(b)
+                
+                skin_colors.append([r_mean, g_mean, b_mean])
+            
+            # Convert to numpy array
+            skin_colors = np.array(skin_colors)
+            
+            # Ensure correct length
+            if len(skin_colors) < self.max_frames:
+                skin_colors = np.pad(skin_colors, 
+                                    ((0, self.max_frames - len(skin_colors)), (0, 0)), 
+                                    mode='constant')
+            else:
+                skin_colors = skin_colors[:self.max_frames]
+            
+            return torch.tensor(skin_colors, dtype=torch.float32)
+            
+        except Exception as e:
+            if self.logging:
+                warnings.warn(f"⚠️ Error extracting skin color variations: {e}")
+            return torch.zeros((self.max_frames, 3), dtype=torch.float32)
+    
+    def _estimate_head_pose(self, facial_landmarks):
+        """Estimate head pose (pitch, yaw, roll) from facial landmarks."""
+        try:
+            if facial_landmarks is None or facial_landmarks.size(0) == 0:
+                return torch.zeros((self.max_frames, 3), dtype=torch.float32)
+            
+            # Simple head pose estimation from 2D landmarks
+            # This is a very simplified approach - more sophisticated methods exist
+            
+            # Get number of frames
+            num_frames = facial_landmarks.size(0)
+            
+            # Placeholder for head pose estimates
+            head_poses = []
+            
+            for i in range(num_frames):
+                landmarks = facial_landmarks[i]
+                
+                # Check if landmarks are valid (non-zero)
+                if torch.sum(landmarks) < 1e-6:
+                    head_poses.append([0, 0, 0])  # Default pose
+                    continue
+                
+                # Extract key landmarks for pose estimation
+                # These indices are based on the 68-point facial landmark model
+                # Left eye center
+                left_eye_x = (landmarks[2*36] + landmarks[2*39]) / 2
+                left_eye_y = (landmarks[2*36+1] + landmarks[2*39+1]) / 2
+                
+                # Right eye center
+                right_eye_x = (landmarks[2*42] + landmarks[2*45]) / 2
+                right_eye_y = (landmarks[2*42+1] + landmarks[2*45+1]) / 2
+                
+                # Nose tip
+                nose_x = landmarks[2*30]
+                nose_y = landmarks[2*30+1]
+                
+                # Mouth center
+                mouth_x = (landmarks[2*48] + landmarks[2*54]) / 2
+                mouth_y = (landmarks[2*48+1] + landmarks[2*54+1]) / 2
+                
+                # Calculate simplified pose estimates
+                # Yaw: horizontal head rotation (left-right)
+                eye_diff_x = left_eye_x - right_eye_x
+                yaw = eye_diff_x.item() if abs(eye_diff_x.item()) < 100 else 0
+                
+                # Pitch: vertical head rotation (up-down)
+                eyes_center_y = (left_eye_y + right_eye_y) / 2
+                nose_mouth_diff_y = nose_y - mouth_y
+                pitch = (eyes_center_y - nose_y).item() if abs(eyes_center_y - nose_y) < 100 else 0
+                
+                # Roll: tilting of the head
+                eye_diff_y = left_eye_y - right_eye_y
+                roll = eye_diff_y.item() if abs(eye_diff_y.item()) < 100 else 0
+                
+                # Normalize and scale values to reasonable range
+                yaw = yaw / 50.0
+                pitch = pitch / 30.0
+                roll = roll / 20.0
+                
+                head_poses.append([pitch, yaw, roll])
+            
+            # Convert to tensor
+            head_poses = np.array(head_poses)
+            
+            # Ensure correct length
+            if len(head_poses) < self.max_frames:
+                head_poses = np.pad(head_poses, 
+                                    ((0, self.max_frames - len(head_poses)), (0, 0)), 
+                                    mode='constant')
+            else:
+                head_poses = head_poses[:self.max_frames]
+            
+            return torch.tensor(head_poses, dtype=torch.float32)
+            
+        except Exception as e:
+            if self.logging:
+                warnings.warn(f"⚠️ Error estimating head pose: {e}")
+            return torch.zeros((self.max_frames, 3), dtype=torch.float32)
+    
+    def _extract_eye_blink_patterns(self, video_frames, facial_landmarks):
+        """Extract eye blinking patterns from facial landmarks or direct frame analysis."""
+        try:
+            if video_frames is None or len(video_frames) < 2:
+                return torch.zeros(self.max_frames, dtype=torch.float32)
+            
+            num_frames = len(video_frames)
+            blink_scores = []
+            
+            if facial_landmarks is not None and facial_landmarks.size(0) > 0:
+                # Extract eye aspect ratio from landmarks
+                for i in range(min(num_frames, facial_landmarks.size(0))):
+                    landmarks = facial_landmarks[i]
+                    
+                    # Check if landmarks are valid
+                    if torch.sum(landmarks) < 1e-6:
+                        blink_scores.append(0.5)  # Default value (undefined)
+                        continue
+                    
+                    # Calculate eye aspect ratio (EAR) for each eye
+                    # Left eye indices (based on 68-point model): 36-41
+                    left_eye_pts = [(landmarks[2*j], landmarks[2*j+1]) for j in range(36, 42)]
+                    
+                    # Right eye indices: 42-47
+                    right_eye_pts = [(landmarks[2*j], landmarks[2*j+1]) for j in range(42, 48)]
+                    
+                    # Calculate EAR (h/w ratio)
+                    def eye_aspect_ratio(eye):
+                        # Compute vertical distances
+                        v1 = torch.sqrt((eye[1][0] - eye[5][0])**2 + (eye[1][1] - eye[5][1])**2)
+                        v2 = torch.sqrt((eye[2][0] - eye[4][0])**2 + (eye[2][1] - eye[4][1])**2)
+                        
+                        # Compute horizontal distance
+                        h = torch.sqrt((eye[0][0] - eye[3][0])**2 + (eye[0][1] - eye[3][1])**2)
+                        
+                        # Return ratio
+                        return (v1 + v2) / (2.0 * h + 1e-6)
+                    
+                    left_ear = eye_aspect_ratio(left_eye_pts)
+                    right_ear = eye_aspect_ratio(right_eye_pts)
+                    
+                    # Average EAR
+                    ear = (left_ear + right_ear) / 2.0
+                    
+                    # Convert to blink score (lower EAR = more closed eyes)
+                    # Typical threshold for blink detection is around 0.2
+                    blink_score = 1.0 - min(1.0, max(0.0, ear * 3))  # Scale and invert
+                    blink_scores.append(float(blink_score) if isinstance(blink_score, torch.Tensor) else blink_score)
+            else:
+                # Fallback to simpler detection directly from frames
+                for i in range(num_frames):
+                    frame = video_frames[i].permute(1, 2, 0).cpu().numpy()
+                    
+                    # Very basic eye detection and scoring (placeholder)
+                    # In a real implementation, this would be more sophisticated
+                    blink_scores.append(0.5)  # Default (undefined)
+            
+            # Ensure correct length
+            if len(blink_scores) < self.max_frames:
+                blink_scores = np.pad(blink_scores, (0, self.max_frames - len(blink_scores)), mode='constant')
+            else:
+                blink_scores = blink_scores[:self.max_frames]
+            
+            return torch.tensor(blink_scores, dtype=torch.float32)
+            
+        except Exception as e:
+            if self.logging:
+                warnings.warn(f"⚠️ Error extracting eye blink patterns: {e}")
+            return torch.zeros(self.max_frames, dtype=torch.float32)
+    
+    def _extract_frequency_features(self, video_frames):
+        """Extract frequency domain features to detect artifacts from generative models."""
+        try:
+            if video_frames is None or len(video_frames) == 0:
+                return torch.zeros((1, 32, 32), dtype=torch.float32)
+            
+            # Use first frame for frequency analysis
+            first_frame = video_frames[0].cpu()
+            
+            # Convert to grayscale if it's RGB
+            if first_frame.shape[0] == 3:
+                gray_frame = 0.299 * first_frame[0] + 0.587 * first_frame[1] + 0.114 * first_frame[2]
+            else:
+                gray_frame = first_frame[0]
+            
+            # Apply 2D FFT
+            freq_domain = torch.fft.fft2(gray_frame)
+            
+            # Shift zero frequency to center
+            freq_domain_shifted = torch.fft.fftshift(freq_domain)
+            
+            # Get magnitude spectrum (log scale for better visualization)
+            magnitude_spectrum = torch.log(torch.abs(freq_domain_shifted) + 1e-10)
+            
+            # Resize to fixed dimensions for consistent processing
+            magnitude_spectrum = F.interpolate(
+                magnitude_spectrum.unsqueeze(0).unsqueeze(0),  # Add batch and channel dims
+                size=(32, 32),
+                mode='bilinear',
+                align_corners=False
+            ).squeeze(0)  # Remove batch dim, keep channel dim
+            
+            # Normalize
+            magnitude_spectrum = (magnitude_spectrum - magnitude_spectrum.min()) / (magnitude_spectrum.max() - magnitude_spectrum.min() + 1e-8)
+            
+            return magnitude_spectrum
+            
+        except Exception as e:
+            if self.logging:
+                warnings.warn(f"⚠️ Error extracting frequency features: {e}")
+            return torch.zeros((1, 32, 32), dtype=torch.float32)
 
 
 def get_transforms(phase='train'):
@@ -688,10 +1116,46 @@ def get_transforms(phase='train'):
     return video_transform, audio_transform
 
 
+def get_transforms_enhanced(phase='train'):
+    """Enhanced transforms with more diverse augmentations."""
+    if phase == 'train':
+        # Advanced training transforms with augmentation
+        video_transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.RandomResizedCrop(224, scale=(0.8, 1.0)),
+            transforms.RandomHorizontalFlip(),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+            transforms.RandomRotation(15),
+            transforms.RandomAffine(degrees=0, translate=(0.1, 0.1), scale=(0.9, 1.1)),
+            transforms.RandomPerspective(distortion_scale=0.2, p=0.5),
+            transforms.RandomErasing(p=0.2, scale=(0.02, 0.15), ratio=(0.3, 3.3)),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+        
+        audio_transform = Compose([
+            AddGaussianNoise(min_amplitude=0.001, max_amplitude=0.02, p=0.6),
+            PitchShift(min_semitones=-4, max_semitones=4, p=0.6),
+            TimeStretch(min_rate=0.8, max_rate=1.2, p=0.5),
+            Shift(min_shift=-0.5, max_shift=0.5, p=0.5),
+        ])
+    else:
+        # Validation/test transforms (same as before for consistency)
+        video_transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Resize((224, 224)),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+        
+        audio_transform = None
+        
+    return video_transform, audio_transform
+
+
 def get_data_loaders(
     json_path, data_dir, batch_size=8, validation_split=0.2, test_split=0.1,
     shuffle=True, num_workers=4, max_samples=None, detect_faces=True,
-    compute_spectrograms=True, temporal_features=True
+    compute_spectrograms=True, temporal_features=True, enhanced_preprocessing=True,
+    enhanced_augmentation=False
 ):
     """
     Load data loaders with an option to restrict the maximum number of samples.
@@ -704,17 +1168,24 @@ def get_data_loaders(
         test_split (float): Fraction of the dataset to use for testing.
         shuffle (bool): Whether to shuffle the dataset.
         num_workers (int): Number of worker threads for loading data.
+        max_samples (int, optional): Maximum number of samples to load from the dataset
         max_samples (int, optional): Maximum number of samples to load from the dataset.
         detect_faces (bool): Whether to detect and extract facial features.
         compute_spectrograms (bool): Whether to compute audio spectrograms.
         temporal_features (bool): Whether to compute temporal consistency features.
+        enhanced_preprocessing (bool): Whether to enable enhanced preprocessing features.
+        enhanced_augmentation (bool): Whether to use enhanced data augmentation techniques.
     
     Returns:
-        tuple: Training, validation, and test data loaders.
+        tuple: Training, validation, and test data loaders, plus class weights.
     """
     # Get transforms for training and validation
-    train_video_transform, train_audio_transform = get_transforms('train')
-    val_video_transform, val_audio_transform = get_transforms('val')
+    if enhanced_augmentation:
+        train_video_transform, train_audio_transform = get_transforms_enhanced('train')
+        val_video_transform, val_audio_transform = get_transforms_enhanced('val')
+    else:
+        train_video_transform, train_audio_transform = get_transforms('train')
+        val_video_transform, val_audio_transform = get_transforms('val')
     
     # Create training dataset
     train_dataset = MultiModalDeepfakeDataset(
@@ -726,7 +1197,8 @@ def get_data_loaders(
         phase='train',
         detect_faces=detect_faces,
         compute_spectrograms=compute_spectrograms,
-        temporal_features=temporal_features
+        temporal_features=temporal_features,
+        enhanced_preprocessing=enhanced_preprocessing
     )
     
     # Create validation dataset
@@ -739,7 +1211,8 @@ def get_data_loaders(
         phase='val',
         detect_faces=detect_faces,
         compute_spectrograms=compute_spectrograms,
-        temporal_features=temporal_features
+        temporal_features=temporal_features,
+        enhanced_preprocessing=enhanced_preprocessing
     )
     
     # Create test dataset
@@ -752,7 +1225,8 @@ def get_data_loaders(
         phase='test',
         detect_faces=detect_faces,
         compute_spectrograms=compute_spectrograms,
-        temporal_features=temporal_features
+        temporal_features=temporal_features,
+        enhanced_preprocessing=enhanced_preprocessing
     )
     
     # Get total number of valid samples
@@ -852,7 +1326,8 @@ def collate_fn(batch):
             # Make sure we're stacking tensors, not ints
             values = [item[key] if isinstance(item[key], torch.Tensor) else torch.tensor(item[key]) for item in batch]
             result[key] = torch.stack(values)
-        elif key in ['video_frames', 'audio', 'audio_spectrogram', 'metadata_features', 'temporal_consistency']:
+        elif key in ['video_frames', 'audio', 'audio_spectrogram', 'metadata_features', 'temporal_consistency',
+                    'pulse_signal', 'head_pose', 'eye_blink_features']:
             # Stack tensors
             values = [item[key] for item in batch if item[key] is not None]
             if values:
@@ -868,7 +1343,8 @@ def collate_fn(batch):
                         result[key] = values
             else:
                 result[key] = None
-        elif key in ['original_video_frames', 'original_audio', 'ela_features', 'audio_visual_sync', 'face_embeddings']:
+        elif key in ['original_video_frames', 'original_audio', 'ela_features', 'audio_visual_sync', 'face_embeddings',
+                    'facial_landmarks', 'mfcc_features', 'skin_color_variations', 'frequency_features']:
             # Handle potentially missing data
             values = [item[key] for item in batch if item[key] is not None]
             if values and all(v is not None and isinstance(v, torch.Tensor) for v in values):
