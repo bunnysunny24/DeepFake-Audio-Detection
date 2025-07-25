@@ -133,3 +133,30 @@ conda create -n dlib_env python=3.10 -y
 conda activate dlib_env
 conda install -c conda-forge dlib
 pip install -r /home/srmist54/backend/Models/requirements.txt
+
+# new commands
+
+
+source /home/srmist54/backend/Models/enter/bin/activate
+cd /home/srmist54/backend/Models && wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
+chmod +x Miniconda3-latest-Linux-x86_64.sh.1
+bash Miniconda3-latest-Linux-x86_64.sh -b -p /home/srmist54/backend/Models/miniconda3
+export PATH="/home/srmist54/backend/Models/miniconda3/bin:$PATH" && conda create -n dlib_env python=3.10 -y
+export PATH="/home/srmist54/backend/Models/miniconda3/bin:$PATH" && conda activate dlib_env && conda install -c conda-forge dlib -y
+source /home/srmist54/backend/Models/miniconda3/bin/activate && conda activate /home/srmist54/backend/Models/enter/envs/dlib_env && conda install -c conda-forge dlib -y
+
+source /home/srmist54/backend/Models/miniconda3/bin/activate && conda activate /home/srmist54/backend/Models/enter/envs/dlib_env && pip install -r /home/srmist54/backend/Models/requirements.txt
+
+source /home/srmist54/backend/Models/miniconda3/bin/activate && conda activate /home/srmist54/backend/Models/enter/envs/dlib_env && pip install torch>=2.0.0 torchvision>=0.15.0 torchaudio>=2.0.0 transformers>=4.30.0 timm>=0.9.2 scikit-learn>=1.0.0
+
+source /home/srmist54/backend/Models/miniconda3/bin/activate && conda activate /home/srmist54/backend/Models/enter/envs/dlib_env && pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+
+source /home/srmist54/backend/Models/miniconda3/bin/activate && conda activate /home/srmist54/backend/Models/enter/envs/dlib_env && pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+
+source /home/srmist54/backend/Models/miniconda3/bin/activate && conda activate /home/srmist54/backend/Models/enter/envs/dlib_env && pip install pandas matplotlib seaborn tqdm pyyaml python-dotenv imageio imageio-ffmpeg moviepy grad-cam
+
+source /home/srmist54/backend/Models/miniconda3/bin/activate && conda activate /home/srmist54/backend/Models/enter/envs/dlib_env && pip install --upgrade protobuf mediapipe
+
+source /home/srmist54/backend/Models/miniconda3/bin/activate && conda activate /home/srmist54/backend/Models/enter/envs/dlib_env && pip install tensorboard ninja intel-openmp audiomentations
+
+python3 /home/srmist54/backend/Models/train_multimodal.py   --json_path "/home/srmist54/backend/combined_data/LAV-DF/metadata.json"   --data_dir "/home/srmist54/backend/combined_data/LAV-DF"   --output_dir "/home/srmist54/backend/Models/server_outputs"   --checkpoint_dir "/home/srmist54/backend/Models/server_checkpoints"   --batch_size 4   --num_epochs 30   --enable_face_mesh   --enable_explainability   --use_spectrogram   --detect_deepfake_type   --detect_faces   --compute_spectrograms   --temporal_features   --enhanced_preprocessing   --enhanced_augmentation   --use_weighted_loss   --optimizer adamw   --scheduler cosine   --warmup_epochs 1   --early_stopping_patience 10   --gradient_clip 1.0   --amp_enabled   --save_intermediate   --save_intermediate_interval 10
