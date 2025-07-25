@@ -14,11 +14,29 @@ import librosa
 import math
 import scipy
 from scipy import signal
+import gc
 try:
     import dlib
     from facenet_pytorch import InceptionResnetV1
 except ImportError:
     print("Warning: Some optional dependencies (dlib, facenet_pytorch) not found, some features may be limited")
+
+
+def clear_gpu_memory():
+    """Utility function to clear GPU memory and trigger garbage collection."""
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+    gc.collect()
+
+
+def get_gpu_memory_usage():
+    """Get current GPU memory usage in GB."""
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        reserved = torch.cuda.memory_reserved() / 1024**3
+        return allocated, reserved
+    return 0, 0
 
 
 class AttentionFusion(nn.Module):
@@ -2018,6 +2036,10 @@ class LightweightModelProcessor(nn.Module):
             nn.Linear(feature_dim*2, 2)  # Binary classification
         )
         
+        # Feature adapter for dimension mismatch handling
+        self.feature_adapter = None
+        self.expected_classifier_dim = feature_dim * 2  # Expected input dimension for classifier
+        
     def forward(self, x):
         """
         Args:
@@ -2041,7 +2063,7 @@ class MultiModalDeepfakeModel(nn.Module):
                  enable_explainability=True, fusion_type='attention', 
                  backbone_visual='efficientnet', backbone_audio='wav2vec2',
                  use_spectrogram=True, detect_deepfake_type=True, num_deepfake_types=7,
-                 debug=False):
+                 debug=False, enable_skin_color_analysis=True, enable_advanced_physiological=True):
                  
         super(MultiModalDeepfakeModel, self).__init__()
         self.debug = debug
@@ -2050,6 +2072,8 @@ class MultiModalDeepfakeModel(nn.Module):
         self.fusion_type = fusion_type
         self.use_spectrogram = use_spectrogram
         self.detect_deepfake_type = detect_deepfake_type
+        self.enable_skin_color_analysis = enable_skin_color_analysis  # Memory optimization parameter
+        self.enable_advanced_physiological = enable_advanced_physiological  # Advanced physiological analysis
         
         # Automatically adjust feature dimensions based on selected backbones
         if backbone_visual == 'efficientnet':
@@ -2069,14 +2093,31 @@ class MultiModalDeepfakeModel(nn.Module):
             self.visual_model = efficientnet_b0(weights=EfficientNet_B0_Weights.IMAGENET1K_V1)
             self.visual_model.classifier = nn.Identity()
             visual_out_dim = 1280
+            
+            # Freeze early layers to prevent gradient issues during initial training
+            for i, (name, param) in enumerate(self.visual_model.named_parameters()):
+                if i < 20:  # Freeze first 20 layers
+                    param.requires_grad = False
+                    
         elif backbone_visual == 'swin':
             self.visual_model = swin_v2_b(weights='IMAGENET1K_V1')
             self.visual_model.head = nn.Identity()
             visual_out_dim = 1024
+            
+            # Freeze early layers
+            for i, (name, param) in enumerate(self.visual_model.named_parameters()):
+                if i < 20:
+                    param.requires_grad = False
+                    
         else:  # Default to EfficientNet
             self.visual_model = efficientnet_b0(weights=EfficientNet_B0_Weights.IMAGENET1K_V1)
             self.visual_model.classifier = nn.Identity()
             visual_out_dim = 1280
+            
+            # Freeze early layers
+            for i, (name, param) in enumerate(self.visual_model.named_parameters()):
+                if i < 20:
+                    param.requires_grad = False
             
         self.video_projection = nn.Linear(visual_out_dim, self.actual_video_feature_dim)
         
@@ -2181,7 +2222,34 @@ class MultiModalDeepfakeModel(nn.Module):
         self.lip_audio_sync_analyzer = LipAudioSyncAnalyzer(lip_dim=40, audio_dim=self.actual_audio_feature_dim, hidden_dim=128)
         self.oculomotor_dynamics_analyzer = OculomotorDynamicsAnalyzer(hidden_dim=64)
         
-        # 2. Physiological Signal Analysis
+        # 2. Advanced Physiological Signal Analysis
+        # Import advanced physiological analyzers
+        if self.enable_advanced_physiological:
+            try:
+                from advanced_physiological_analysis import (
+                    AdvancedPhysiologicalAnalyzer,
+                    DigitalHeartbeatDetector,
+                    BloodFlowSkinAnalyzer,
+                    BreathingPatternDetector
+                )
+                
+                # Enable advanced physiological analysis if available
+                self.enable_advanced_physiology = True
+                self.advanced_physiological_analyzer = AdvancedPhysiologicalAnalyzer(feature_dim=128, fps=30)
+                self.digital_heartbeat_detector = DigitalHeartbeatDetector(feature_dim=64, fps=30)
+                self.blood_flow_analyzer = BloodFlowSkinAnalyzer(feature_dim=64)
+                self.breathing_pattern_detector = BreathingPatternDetector(feature_dim=64, fps=30)
+                
+                print("[INFO] Advanced physiological analysis enabled: Digital heartbeat, Blood flow, Breathing patterns")
+                
+            except ImportError as e:
+                print(f"[WARNING] Advanced physiological analysis not available: {e}")
+                self.enable_advanced_physiology = False
+        else:
+            print("[INFO] Advanced physiological analysis disabled (enable with --enable_advanced_physiological)")
+            self.enable_advanced_physiology = False
+            
+        # Fallback to basic physiological analysis
         self.physiological_analyzer = RemotePhysiologicalAnalyzer(feature_dim=32)
         self.skin_color_analyzer = SkinColorAnalyzer(feature_dim=32)
         
@@ -2256,6 +2324,10 @@ class MultiModalDeepfakeModel(nn.Module):
                 nn.Linear(256, num_deepfake_types)
             )
 
+        # Feature adapter for dimension mismatch handling
+        self.feature_adapter = None
+        self.expected_classifier_dim = combined_dim  # Expected input dimension for classifier
+
         # Learnable inconsistency threshold
         self.deepfake_threshold = nn.Parameter(torch.tensor(20.0), requires_grad=True)
         
@@ -2308,29 +2380,82 @@ class MultiModalDeepfakeModel(nn.Module):
 
     def _initialize_weights(self):
         """Initialize model weights with carefully chosen schemes."""
+        # Don't reinitialize pre-trained models (EfficientNet, Wav2Vec2, etc.)
+        pretrained_modules = [self.visual_model, self.audio_model]
+        
         for m in self.modules():
+            # Skip pre-trained models to preserve learned weights
+            if any(m is pretrained_mod or self._is_submodule(m, pretrained_mod) for pretrained_mod in pretrained_modules):
+                continue
+                
             if isinstance(m, nn.Conv2d):
-                # Kaiming/He initialization for ReLU-based CNN layers
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                # More conservative initialization for CNNs
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu', a=0.1)
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
             elif isinstance(m, nn.BatchNorm2d):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
             elif isinstance(m, nn.Linear):
-                # Xavier/Glorot initialization for fully connected layers
-                nn.init.xavier_uniform_(m.weight)
+                # More conservative initialization for linear layers
+                nn.init.xavier_uniform_(m.weight, gain=0.5)
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
             elif isinstance(m, nn.LSTM):
                 # Orthogonal initialization for recurrent layers
                 for name, param in m.named_parameters():
                     if 'weight_ih' in name:
-                        nn.init.xavier_uniform_(param.data)
+                        nn.init.xavier_uniform_(param.data, gain=0.5)
                     elif 'weight_hh' in name:
-                        nn.init.orthogonal_(param.data)
+                        nn.init.orthogonal_(param.data, gain=0.5)
                     elif 'bias' in name:
                         nn.init.constant_(param.data, 0)
+    
+    def _is_submodule(self, module, parent):
+        """Check if module is a submodule of parent."""
+        for name, child in parent.named_modules():
+            if child is module:
+                return True
+        return False
+    
+    def clip_gradients(self, max_norm=1.0):
+        """Clip gradients to prevent explosion."""
+        torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm)
+    
+    def check_for_nan_gradients(self):
+        """Check for NaN gradients and return True if found."""
+        for name, param in self.named_parameters():
+            if param.grad is not None and torch.isnan(param.grad).any():
+                if self.debug:
+                    print(f"[WARNING] NaN gradient detected in {name}")
+                return True
+        return False
+    
+    def unfreeze_visual_layers(self, epoch):
+        """Gradually unfreeze visual model layers as training progresses."""
+        if epoch >= 3:  # Start unfreezing after 3 epochs
+            layers_to_unfreeze = min(5 * (epoch - 2), 50)  # Unfreeze 5 more layers each epoch
+            for i, (name, param) in enumerate(self.visual_model.named_parameters()):
+                if i < layers_to_unfreeze:
+                    param.requires_grad = True
+                    if self.debug and epoch == 3:
+                        print(f"[INFO] Unfreezing visual layer: {name}")
+    
+    def stabilize_model(self):
+        """Apply stability measures to prevent gradient issues."""
+        # Check for extreme parameter values and clip them
+        with torch.no_grad():
+            for name, param in self.named_parameters():
+                if torch.isnan(param).any() or torch.isinf(param).any():
+                    if self.debug:
+                        print(f"[WARNING] Extreme values detected in {name}, resetting...")
+                    param.data = torch.clamp(param.data, -10.0, 10.0)
+                    # If still problematic, reinitialize
+                    if torch.isnan(param).any():
+                        if param.dim() >= 2:
+                            nn.init.xavier_uniform_(param, gain=0.1)
+                        else:
+                            nn.init.constant_(param, 0)
 
     def forward(self, inputs: Dict[str, Union[torch.Tensor, List, None]]) -> Tuple[torch.Tensor, Dict]:
         """
@@ -2357,6 +2482,17 @@ class MultiModalDeepfakeModel(nn.Module):
             tuple: (output logits, detailed results dict)
         """
         try:
+            # Initialize results dictionary early
+            results = {
+                'logits': None,
+                'deepfake_type': None,
+                'deepfake_check': None,
+                'explanation': None,
+                'component_weights': None,
+                'component_contributions': {},
+                'detailed_results': {}
+            }
+            
             # Extract inputs
             video_frames = inputs.get('video_frames')           # [B, T, C, H, W]
             audio = inputs.get('audio')                         # [B, L]
@@ -2384,10 +2520,28 @@ class MultiModalDeepfakeModel(nn.Module):
                 if audio_spectrogram is not None:
                     print(f"Audio spectrogram shape: {audio_spectrogram.shape}")
 
-            # Visual features extraction
+            # Visual features extraction with proper normalization
             video_frames_flat = video_frames.view(batch_size * num_frames, C, H, W)
-            visual_features = self.visual_model(video_frames_flat)
+            
+            # Ensure input is in [0, 1] range
+            video_frames_flat = torch.clamp(video_frames_flat, 0.0, 1.0)
+            
+            # Apply ImageNet normalization for pre-trained models
+            mean = torch.tensor([0.485, 0.456, 0.406], device=video_frames_flat.device).view(1, 3, 1, 1)
+            std = torch.tensor([0.229, 0.224, 0.225], device=video_frames_flat.device).view(1, 3, 1, 1)
+            video_frames_normalized = (video_frames_flat - mean) / std
+            
+            # Add small epsilon to prevent extreme values
+            video_frames_normalized = torch.clamp(video_frames_normalized, -10.0, 10.0)
+            
+            visual_features = self.visual_model(video_frames_normalized)
             visual_features = visual_features.view(batch_size, num_frames, -1)
+            
+            # Check for NaN in visual features and replace with zeros
+            if torch.isnan(visual_features).any():
+                if self.debug:
+                    print(f"[WARNING] NaN detected in visual features, replacing with zeros")
+                visual_features = torch.where(torch.isnan(visual_features), torch.zeros_like(visual_features), visual_features)
             
             # Apply temporal attention to analyze frame sequences
             temporal_visual_features = self.temporal_attention(visual_features)
@@ -2403,12 +2557,40 @@ class MultiModalDeepfakeModel(nn.Module):
             # Avoid division by zero
             max_vals = torch.clamp(max_vals, min=1e-6)
             audio = audio / max_vals
+            
+            # Add gradient stabilization for audio
+            audio = torch.clamp(audio, -1.0, 1.0)
+            
+            # Check for NaN in audio and replace with zeros
+            if torch.isnan(audio).any():
+                if self.debug:
+                    print(f"[WARNING] NaN detected in audio input, replacing with zeros")
+                audio = torch.where(torch.isnan(audio), torch.zeros_like(audio), audio)
 
-            # Extract audio features using pre-trained model
-            with torch.no_grad():  # Optional: freeze wav2vec2 during initial training
-                audio_features = self.audio_model(audio).last_hidden_state  # [B, T', 768]
-            audio_features = torch.mean(audio_features, dim=1)          # [B, 768]
-            audio_features = self.audio_projection(audio_features)      # [B, audio_feature_dim]
+            # Extract audio features using pre-trained model with gradient stabilization
+            try:
+                with torch.cuda.amp.autocast(enabled=False):  # Disable autocast for audio model to prevent NaN
+                    audio_output = self.audio_model(audio)
+                    audio_features = audio_output.last_hidden_state  # [B, T', 768]
+                    
+                    # Check for NaN in audio features
+                    if torch.isnan(audio_features).any():
+                        if self.debug:
+                            print(f"[WARNING] NaN detected in audio features, replacing with zeros")
+                        audio_features = torch.where(torch.isnan(audio_features), torch.zeros_like(audio_features), audio_features)
+                    
+                    audio_features = torch.mean(audio_features, dim=1)          # [B, 768]
+                    audio_features = self.audio_projection(audio_features)      # [B, audio_feature_dim]
+                    
+                    # Final audio feature stability check
+                    audio_features = torch.clamp(audio_features, -50.0, 50.0)
+                    
+            except Exception as e:
+                if self.debug:
+                    print(f"[WARNING] Error in audio model, using fallback: {e}")
+                # Create fallback audio features
+                audio_features = torch.zeros(batch_size, self.actual_audio_feature_dim, device=video_frames.device)
+                audio_features.requires_grad_(True)
             
             # Process spectrogram if available
             spec_features = None
@@ -2526,14 +2708,126 @@ class MultiModalDeepfakeModel(nn.Module):
             oculomotor_naturalness, _ = self.oculomotor_dynamics_analyzer(eye_landmarks)
             component_contributions['oculomotor'] = oculomotor_naturalness
             
-            # 2. Physiological Signal Analysis
-            physio_results = self.physiological_analyzer(video_frames)
-            component_contributions['physiological'] = physio_results['naturalness']
+            # 2. Advanced Physiological Signal Analysis
+            if hasattr(self, 'enable_advanced_physiology') and self.enable_advanced_physiology:
+                try:
+                    # Clear memory before intensive operation
+                    clear_gpu_memory()
+                    
+                    if self.debug:
+                        allocated_before, reserved_before = get_gpu_memory_usage()
+                        print(f"[MEMORY] Before advanced physiological analysis: {allocated_before:.2f}GB allocated, {reserved_before:.2f}GB reserved")
+                    
+                    # Optimize by using fewer frames for physiological analysis
+                    optimized_frames = video_frames[:, ::3] if video_frames.size(1) > 6 else video_frames
+                    
+                    # Run comprehensive advanced physiological analysis
+                    advanced_physio_results = self.advanced_physiological_analyzer(optimized_frames)
+                    
+                    # Extract individual component results
+                    heartbeat_results = advanced_physio_results['heartbeat']
+                    blood_flow_results = advanced_physio_results['blood_flow']
+                    breathing_results = advanced_physio_results['breathing']
+                    
+                    # Store component contributions
+                    component_contributions['digital_heartbeat'] = heartbeat_results['naturalness']
+                    component_contributions['heart_rate'] = heartbeat_results['heart_rate'] / 100  # Normalize for contribution
+                    component_contributions['hrv_score'] = heartbeat_results['hrv_score']
+                    
+                    component_contributions['blood_flow_patterns'] = blood_flow_results['naturalness']
+                    component_contributions['pulse_synchronization'] = blood_flow_results['pulse_sync_score']
+                    
+                    component_contributions['breathing_patterns'] = breathing_results['naturalness']
+                    component_contributions['breathing_rate'] = breathing_results['breathing_rate'] / 20  # Normalize for contribution
+                    component_contributions['breathing_regularity'] = breathing_results['regularity_score']
+                    
+                    component_contributions['physiological_coherence'] = advanced_physio_results['coherence_score']
+                    component_contributions['advanced_physiological'] = advanced_physio_results['naturalness']
+                    
+                    # Store detailed results for explainability (only during evaluation to preserve gradients)
+                    if not self.training:
+                        if 'detailed_results' not in results:
+                            results['detailed_results'] = {}
+                        
+                        results['detailed_results']['advanced_physiology'] = {
+                            'heart_rate_bpm': heartbeat_results['heart_rate'].detach().cpu().numpy() if heartbeat_results['heart_rate'].numel() > 0 else None,
+                            'breathing_rate_bpm': breathing_results['breathing_rate'].detach().cpu().numpy() if breathing_results['breathing_rate'].numel() > 0 else None,
+                            'hrv_score': heartbeat_results['hrv_score'].detach().cpu().numpy() if heartbeat_results['hrv_score'].numel() > 0 else None,
+                            'breathing_regularity': breathing_results['regularity_score'].detach().cpu().numpy() if breathing_results['regularity_score'].numel() > 0 else None,
+                            'coherence_score': advanced_physio_results['coherence_score'].detach().cpu().numpy() if advanced_physio_results['coherence_score'].numel() > 0 else None
+                        }
+                    
+                    if self.debug:
+                        print("[INFO] Advanced physiological analysis completed successfully")
+                        print(f"[PHYSIO] Heart rate: {torch.mean(heartbeat_results['heart_rate']):.1f} BPM")
+                        print(f"[PHYSIO] Breathing rate: {torch.mean(breathing_results['breathing_rate']):.1f} BPM")
+                        print(f"[PHYSIO] HRV score: {torch.mean(heartbeat_results['hrv_score']):.3f}")
+                        print(f"[PHYSIO] Coherence score: {torch.mean(advanced_physio_results['coherence_score']):.3f}")
+                    
+                    # Clear memory after operation
+                    del advanced_physio_results, heartbeat_results, blood_flow_results, breathing_results, optimized_frames
+                    clear_gpu_memory()
+                    
+                except RuntimeError as e:
+                    if "CUDA out of memory" in str(e):
+                        print(f"[WARNING] Skipping advanced physiological analysis due to memory constraints: {e}")
+                        # Fallback to basic analysis
+                        physio_results = self.physiological_analyzer(video_frames[:, ::2])  # Use fewer frames
+                        component_contributions['physiological'] = physio_results['naturalness']
+                        clear_gpu_memory()
+                    else:
+                        raise e
+                except Exception as e:
+                    print(f"[WARNING] Error in advanced physiological analysis, falling back to basic: {e}")
+                    # Fallback to basic analysis
+                    physio_results = self.physiological_analyzer(video_frames[:, ::2])  # Use fewer frames
+                    component_contributions['physiological'] = physio_results['naturalness']
+            else:
+                # Fallback to basic physiological analysis
+                physio_results = self.physiological_analyzer(video_frames[:, ::2])  # Use fewer frames for speed
+                component_contributions['physiological'] = physio_results['naturalness']
             
-            # Extract skin color from face regions for pulse analysis
-            skin_color_seq = self.extract_skin_color(video_frames)
-            skin_naturalness = self.skin_color_analyzer(skin_color_seq)
-            component_contributions['skin_color'] = skin_naturalness
+            # Extract skin color from face regions for pulse analysis (with memory management)
+            if self.enable_skin_color_analysis:
+                try:
+                    # Clear memory before intensive operation
+                    clear_gpu_memory()
+                    
+                    # Monitor memory before skin color extraction
+                    allocated_before, reserved_before = get_gpu_memory_usage()
+                    if self.debug:
+                        print(f"[MEMORY] Before skin color extraction: {allocated_before:.2f}GB allocated, {reserved_before:.2f}GB reserved")
+                    
+                    # Optimized skin color extraction - use every 2nd frame for speed
+                    optimized_frames = video_frames[:, ::2] if video_frames.size(1) > 4 else video_frames
+                    skin_color_seq = self.extract_skin_color(optimized_frames)
+                    skin_naturalness = self.skin_color_analyzer(skin_color_seq)
+                    component_contributions['skin_color'] = skin_naturalness
+                    
+                    if self.debug:
+                        print("[INFO] Skin color analysis completed successfully")
+                    
+                    # Clear memory after operation
+                    del skin_color_seq, optimized_frames
+                    clear_gpu_memory()
+                    
+                    allocated_after, reserved_after = get_gpu_memory_usage()
+                    if self.debug:
+                        print(f"[MEMORY] After skin color extraction: {allocated_after:.2f}GB allocated, {reserved_after:.2f}GB reserved")
+                        
+                except RuntimeError as e:
+                    if "CUDA out of memory" in str(e):
+                        print(f"[WARNING] Skipping skin color analysis due to memory constraints: {e}")
+                        # Skip skin color analysis to preserve memory
+                        component_contributions['skin_color'] = torch.zeros((video_frames.size(0), 1), device=video_frames.device)
+                        clear_gpu_memory()
+                    else:
+                        raise e
+            else:
+                # Skin color analysis disabled
+                if self.debug:
+                    print("[INFO] Skin color analysis disabled in model configuration")
+                component_contributions['skin_color'] = torch.zeros((video_frames.size(0), 1), device=video_frames.device)
             
             # 3. Visual Artifact Analysis
             # Lighting consistency
@@ -2608,14 +2902,76 @@ class MultiModalDeepfakeModel(nn.Module):
             # Process through transformer
             transformer_output = self.transformer(combined_features.unsqueeze(1)).squeeze(1)
             
+            # Validate and fix component contributions batch sizes before processing
+            if self.enable_explainability:
+                device = next(self.parameters()).device
+                
+                # Fix component contributions
+                for key, value in component_contributions.items():
+                    if value is not None and isinstance(value, torch.Tensor):
+                        current_batch_size = value.shape[0]
+                        if current_batch_size != batch_size:
+                            if self.debug:
+                                print(f"[DEBUG] Fixing batch size for {key}: {current_batch_size} -> {batch_size}")
+                            
+                            if current_batch_size == 1:
+                                # Expand single sample to full batch
+                                if value.dim() == 1:
+                                    value = value.unsqueeze(0).expand(batch_size, -1)
+                                else:
+                                    value = value.expand(batch_size, *value.shape[1:])
+                            elif current_batch_size > batch_size:
+                                # Truncate to expected batch size
+                                value = value[:batch_size]
+                            else:
+                                # Pad with zeros for missing samples
+                                missing_samples = batch_size - current_batch_size
+                                if value.dim() == 1:
+                                    padding_shape = (missing_samples,)
+                                else:
+                                    padding_shape = (missing_samples, *value.shape[1:])
+                                padding = torch.zeros(padding_shape, device=device, dtype=value.dtype)
+                                value = torch.cat([value, padding], dim=0)
+                            
+                            component_contributions[key] = value
+                
+                # Fix explainability features list
+                for i, feature in enumerate(explainability_features):
+                    if feature is not None and isinstance(feature, torch.Tensor):
+                        current_batch_size = feature.shape[0]
+                        if current_batch_size != batch_size:
+                            if self.debug:
+                                print(f"[DEBUG] Fixing batch size for explainability feature {i}: {current_batch_size} -> {batch_size}")
+                            
+                            if current_batch_size == 1:
+                                # Expand single sample to full batch
+                                if feature.dim() == 1:
+                                    feature = feature.unsqueeze(0).expand(batch_size, -1)
+                                else:
+                                    feature = feature.expand(batch_size, *feature.shape[1:])
+                            elif current_batch_size > batch_size:
+                                # Truncate to expected batch size
+                                feature = feature[:batch_size]
+                            else:
+                                # Pad with zeros for missing samples
+                                missing_samples = batch_size - current_batch_size
+                                if feature.dim() == 1:
+                                    padding_shape = (missing_samples,)
+                                else:
+                                    padding_shape = (missing_samples, *feature.shape[1:])
+                                padding = torch.zeros(padding_shape, device=device, dtype=feature.dtype)
+                                feature = torch.cat([feature, padding], dim=0)
+                            
+                            explainability_features[i] = feature
+            
             # Combine transformer output with explainability features if enabled
             if self.enable_explainability:
                 # Concatenate all explainability features
                 # Normalize explainability features to ensure consistent dimensions
                 normalized_features = []
-                batch_size = inputs['video_frames'].shape[0] if 'video_frames' in inputs else 1
-                target_dim = 4  # Set this to match your expected dimension
+                # Use batch_size from the initial video_frames tensor to maintain consistency
                 device = next(self.parameters()).device
+                target_dim = 4  # Set this to match your expected dimension
 
                 for feature in explainability_features:
                     if feature is None:
@@ -2633,19 +2989,30 @@ class MultiModalDeepfakeModel(nn.Module):
                     # Ensure it has batch dimension
                     if feature.dim() == 1:
                         feature = feature.unsqueeze(0)
+                    elif feature.dim() == 0:
+                        feature = feature.unsqueeze(0).unsqueeze(0)
                     
-                    # Ensure correct batch size
-                    if feature.shape[0] != batch_size:
-                        if feature.shape[0] == 1:
+                    # Handle batch size mismatches more robustly
+                    current_batch_size = feature.shape[0]
+                    if current_batch_size != batch_size:
+                        if current_batch_size == 1:
+                            # Expand single sample to full batch
                             feature = feature.expand(batch_size, -1)
-                        else:
+                        elif current_batch_size > batch_size:
+                            # Truncate to expected batch size
                             feature = feature[:batch_size]
+                        else:
+                            # Pad with zeros for missing samples
+                            missing_samples = batch_size - current_batch_size
+                            feat_dim = feature.shape[1] if feature.dim() > 1 else 1
+                            padding = torch.zeros(missing_samples, feat_dim, device=device, dtype=feature.dtype)
+                            feature = torch.cat([feature, padding], dim=0)
                     
                     # Normalize feature dimension
                     feat_dim = feature.shape[1] if feature.dim() > 1 else 1
                     if feat_dim < target_dim:
                         # Pad with zeros
-                        padding = torch.zeros(batch_size, target_dim - feat_dim, device=device)
+                        padding = torch.zeros(batch_size, target_dim - feat_dim, device=device, dtype=feature.dtype)
                         feature = torch.cat([feature, padding], dim=1)
                     elif feat_dim > target_dim:
                         # Truncate
@@ -2657,8 +3024,9 @@ class MultiModalDeepfakeModel(nn.Module):
                     all_explainability = torch.cat(normalized_features, dim=-1)
                 except Exception as e:
                     print(f"[WARNING] Error concatenating explainability features: {e}")
+                    print(f"[DEBUG] Batch size: {batch_size}, Feature shapes: {[f.shape for f in normalized_features]}")
                     # Return a zero tensor as fallback
-                    total_dim = sum(f.shape[1] for f in normalized_features if hasattr(f, 'shape'))
+                    total_dim = len(normalized_features) * target_dim
                     all_explainability = torch.zeros(batch_size, total_dim, device=device)
                 
                 # Weight each explainability component by learned weights
@@ -2683,23 +3051,32 @@ class MultiModalDeepfakeModel(nn.Module):
                 
                 # Normalize dimensions for concatenation
                 normalized_tensors = []
-                batch_size = inputs['video_frames'].shape[0] if 'video_frames' in inputs else 1
+                # Use the same batch_size from initial video_frames tensor
                 target_dim = 4  # Set this to match your expected dimension
                 device = next(self.parameters()).device
                 
                 for tensor in tensors_to_concatenate:
-                    # Ensure correct batch size
-                    if tensor.shape[0] != batch_size:
-                        if tensor.shape[0] == 1:
+                    # Handle batch size mismatches more robustly
+                    current_batch_size = tensor.shape[0]
+                    if current_batch_size != batch_size:
+                        if current_batch_size == 1:
+                            # Expand single sample to full batch
                             tensor = tensor.expand(batch_size, -1)
-                        else:
+                        elif current_batch_size > batch_size:
+                            # Truncate to expected batch size
                             tensor = tensor[:batch_size]
+                        else:
+                            # Pad with zeros for missing samples
+                            missing_samples = batch_size - current_batch_size
+                            feat_dim = tensor.shape[1] if tensor.dim() > 1 else 1
+                            padding = torch.zeros(missing_samples, feat_dim, device=device, dtype=tensor.dtype)
+                            tensor = torch.cat([tensor, padding], dim=0)
                     
                     # Normalize feature dimension
                     feat_dim = tensor.shape[1] if tensor.dim() > 1 else 1
                     if feat_dim < target_dim:
                         # Pad with zeros
-                        padding = torch.zeros(batch_size, target_dim - feat_dim, device=device)
+                        padding = torch.zeros(batch_size, target_dim - feat_dim, device=device, dtype=tensor.dtype)
                         tensor = torch.cat([tensor, padding], dim=1)
                     elif feat_dim > target_dim:
                         # Truncate
@@ -2711,8 +3088,10 @@ class MultiModalDeepfakeModel(nn.Module):
                     explainability_vector = torch.cat(normalized_tensors, dim=-1)
                 except Exception as e:
                     print(f"[WARNING] Error concatenating explainability vector: {e}")
+                    print(f"[DEBUG] Batch size: {batch_size}, Tensor shapes: {[t.shape for t in normalized_tensors]}")
                     # Create a fallback vector with a reasonable dimension
-                    explainability_vector = torch.zeros(batch_size, target_dim * len(normalized_tensors), device=device)
+                    fallback_dim = len(normalized_tensors) * target_dim if normalized_tensors else target_dim
+                    explainability_vector = torch.zeros(batch_size, fallback_dim, device=device)
                 
                 # Ensure consistent dimensionality
                 explainability_vector = explainability_vector.view(batch_size, -1)
@@ -2723,26 +3102,65 @@ class MultiModalDeepfakeModel(nn.Module):
                 final_features = transformer_output
             
             # Add feature adapter for classifier
-            expected_classifier_dim = 1792  # Set this to match your classifier's expected input dimension
-            if final_features.shape[-1] != expected_classifier_dim:
-                print(f"[INFO] Adjusting feature dimensions from {final_features.shape[-1]} to {expected_classifier_dim}")
-                
-                # Create a temporary adapter
-                temp_adapter = nn.Linear(final_features.shape[-1], expected_classifier_dim).to(device)
-                
-                # Initialize with reasonable values (identity-like mapping where possible)
-                with torch.no_grad():
-                    temp_adapter.weight.zero_()
-                    min_dim = min(final_features.shape[-1], expected_classifier_dim)
-                    for i in range(min_dim):
-                        temp_adapter.weight[i, i] = 1.0
-                    temp_adapter.bias.zero_()
+            if final_features.shape[-1] != self.expected_classifier_dim:
+                if self.feature_adapter is None:
+                    print(f"[INFO] Initializing feature adapter: {final_features.shape[-1]} -> {self.expected_classifier_dim}")
+                    # Create and register the adapter properly
+                    adapter = nn.Linear(final_features.shape[-1], self.expected_classifier_dim)
+                    
+                    # Initialize with reasonable values (identity-like mapping where possible)
+                    with torch.no_grad():
+                        adapter.weight.zero_()
+                        min_dim = min(final_features.shape[-1], self.expected_classifier_dim)
+                        for i in range(min_dim):
+                            adapter.weight[i, i] = 1.0
+                        adapter.bias.zero_()
+                    
+                    # Move to correct device and register as submodule
+                    self.feature_adapter = adapter.to(device)
+                    self.add_module('feature_adapter', self.feature_adapter)
                 
                 # Apply the adapter
-                final_features = temp_adapter(final_features)
+                final_features = self.feature_adapter(final_features)
+            
+            # Stability checks before classification
+            if torch.isnan(final_features).any() or torch.isinf(final_features).any():
+                if self.debug:
+                    print(f"[WARNING] Unstable final_features detected, clamping values")
+                final_features = torch.clamp(final_features, -50.0, 50.0)
+                final_features = torch.where(torch.isnan(final_features), torch.zeros_like(final_features), final_features)
             
             # Main classification
             output = self.classifier(final_features)
+            
+            # Ensure gradients are maintained during training
+            if self.training:
+                # Check if output requires gradients
+                if not output.requires_grad:
+                    if self.debug:
+                        print(f"[WARNING] Output tensor does not require gradients! Adding gradient path...")
+                    # Create a learnable parameter to maintain gradient flow
+                    if not hasattr(self, '_gradient_enabler'):
+                        self._gradient_enabler = nn.Parameter(torch.zeros(1, device=output.device), requires_grad=True)
+                    # Add a tiny learnable component to maintain gradients
+                    output = output + self._gradient_enabler * 1e-8
+                
+                # Verify the output still requires gradients
+                if not output.requires_grad:
+                    if self.debug:
+                        print(f"[ERROR] Failed to maintain gradients in output tensor")
+                    # Force gradient requirement
+                    output.requires_grad_(True)
+            
+            # Additional output stability check
+            if torch.isnan(output).any() or torch.isinf(output).any():
+                if self.debug:
+                    print(f"[WARNING] Unstable output detected, applying emergency stabilization")
+                output = torch.clamp(output, -50.0, 50.0)
+                output = torch.where(torch.isnan(output), torch.zeros_like(output), output)
+                # Ensure gradients are maintained after stabilization
+                if self.training and not output.requires_grad:
+                    output.requires_grad_(True)
             
             # Deepfake type classification (optional)
             deepfake_type_output = None
@@ -2769,15 +3187,15 @@ class MultiModalDeepfakeModel(nn.Module):
                     component_contributions=component_contributions
                 )
 
-            # Create results dictionary
-            results = {
+            # Update results dictionary
+            results.update({
                 'logits': output,
                 'deepfake_type': deepfake_type_output,
                 'deepfake_check': deepfake_check_results,
                 'explanation': explanation_data,
                 'component_weights': F.softmax(self.component_weights, dim=0) if self.enable_explainability else None,
                 'component_contributions': component_contributions
-            }
+            })
 
             return output, results
             
@@ -2967,49 +3385,92 @@ class MultiModalDeepfakeModel(nn.Module):
             return torch.zeros((batch_size, num_frames, 40), device=facial_landmarks.device)
 
     def extract_skin_color(self, video_frames):
-        """Extract average skin color from face regions for pulse analysis."""
+        """Extract average skin color from face regions for pulse analysis - Memory Optimized."""
         batch_size, num_frames, C, H, W = video_frames.shape
         
         try:
-            skin_colors = []
+            # Memory-optimized approach: Process in smaller chunks and use GPU operations
+            chunk_size = min(4, num_frames)  # Process 4 frames at a time max
+            device = video_frames.device
+            
+            # Pre-allocate result tensor
+            skin_colors = torch.zeros((batch_size, num_frames, 3), device=device, dtype=torch.float32)
             
             for b in range(batch_size):
-                frame_colors = []
-                
-                for t in range(num_frames):
-                    frame = video_frames[b, t].permute(1, 2, 0).cpu().numpy()
+                for chunk_start in range(0, num_frames, chunk_size):
+                    chunk_end = min(chunk_start + chunk_size, num_frames)
                     
-                    # Simple skin detection using RGB values
-                    # This is a basic approach - more sophisticated methods exist
-                    r, g, b = frame[:, :, 0], frame[:, :, 1], frame[:, :, 2]
+                    # Process chunk of frames
+                    frame_chunk = video_frames[b, chunk_start:chunk_end]  # [chunk_size, C, H, W]
                     
-                    # Simple skin color range in RGB
-                    skin_mask = (r > 0.4) & (g > 0.28) & (b > 0.2) & \
-                               (r > g) & (r > b) & \
-                               (r - g > 0.1) & \
-                               (abs(r - g) > 0.15)
+                    # Downsample frames for skin detection to save memory (224x224 -> 56x56)
+                    small_frames = torch.nn.functional.interpolate(
+                        frame_chunk, size=(56, 56), mode='bilinear', align_corners=False
+                    )  # [chunk_size, 3, 56, 56]
                     
-                    # Extract average color of skin regions
-                    if np.any(skin_mask):
-                        avg_r = np.mean(r[skin_mask])
-                        avg_g = np.mean(g[skin_mask])
-                        avg_b = np.mean(b[skin_mask])
-                        frame_colors.append([avg_r, avg_g, avg_b])
-                    else:
-                        # No skin detected, use default values
-                        frame_colors.append([0.5, 0.4, 0.35])  # Average skin tone
-                
-                skin_colors.append(torch.tensor(
-                    frame_colors,
-                    dtype=torch.float32,
-                    device=video_frames.device
-                ))
+                    # Simple skin detection using RGB values on GPU
+                    r = small_frames[:, 0].float()  # [chunk_size, 56, 56] - ensure float type
+                    g = small_frames[:, 1].float()
+                    b = small_frames[:, 2].float()
+                    
+                    # Vectorized skin detection - ensure boolean tensor
+                    skin_mask = ((r > 0.4) & (g > 0.28) & (b > 0.2) & 
+                                (r > g) & (r > b) & 
+                                ((r - g) > 0.1) & (torch.abs(r - g) > 0.15)).bool()
+                    
+                    # Extract average colors for each frame in chunk
+                    for i, t in enumerate(range(chunk_start, chunk_end)):
+                        mask = skin_mask[i]
+                        if not mask.dtype == torch.bool:
+                            mask = mask.bool()
+                        idx = int(i) if not isinstance(i, int) else i
+                        if self.debug:
+                            print(f"[SKIN] i type: {type(i)}, idx type: {type(idx)}, r type: {type(r)}, r shape: {getattr(r, 'shape', None)}")
+                                # Defensive: check shapes and types
+                        if not (isinstance(r, torch.Tensor) and r.shape[0] > idx and r.shape[1:] == (56, 56)):
+                            skin_colors[b, t] = torch.tensor([0.5, 0.4, 0.35], device=device, dtype=torch.float32)
+                            continue
+                        if self.debug:
+                            print(f"[SKIN] i type: {type(i)}, r shape: {r.shape}, idx: {idx}")
+                        if mask.any():
+                            try:
+                                r_frame = r[idx] if isinstance(idx, int) else r[int(idx)]
+                                g_frame = g[idx] if isinstance(idx, int) else g[int(idx)]
+                                b_frame = b[idx] if isinstance(idx, int) else b[int(idx)]
+                                mask_float = mask.float()
+                                r_masked = r_frame * mask_float
+                                g_masked = g_frame * mask_float
+                                b_masked = b_frame * mask_float
+                                mask_sum = mask_float.sum()
+                                if mask_sum > 0:
+                                    avg_r = r_masked.sum() / mask_sum
+                                    avg_g = g_masked.sum() / mask_sum
+                                    avg_b = b_masked.sum() / mask_sum
+                                    skin_colors[b, t] = torch.stack([avg_r, avg_g, avg_b])
+                                else:
+                                    skin_colors[b, t] = torch.tensor([0.5, 0.4, 0.35], device=device, dtype=torch.float32)
+                            except Exception as mask_error:
+                                if self.debug:
+                                    print(f"Error in skin color calculation: {mask_error}")
+                                skin_colors[b, t] = torch.tensor([0.5, 0.4, 0.35], device=device, dtype=torch.float32)
+                        else:
+                            skin_colors[b, t] = torch.tensor([0.5, 0.4, 0.35], device=device, dtype=torch.float32)
+                    
+                    # Clear intermediate tensors to free memory
+                    del frame_chunk, small_frames, r, g, b, skin_mask
+                    
+                    # Force garbage collection if needed
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
             
-            return torch.stack(skin_colors, dim=0)
+            return skin_colors
         
         except Exception as e:
             if self.debug:
                 print(f"Error extracting skin colors: {e}")
+            # Clear any GPU memory that might be held
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             # Return zeros with shape [batch_size, num_frames, 3] (RGB values)
             return torch.zeros((batch_size, num_frames, 3), device=video_frames.device)
 
@@ -3283,7 +3744,91 @@ class MultiModalDeepfakeModel(nn.Module):
                         explanation['issues_found'].append(f"Poor lip synchronization with audio detected (score: {score:.2f})")
                     explanation['detection_scores']['lip_sync_score'] = 1.0 - score
                 
-                # 2. Physiological signal checks
+                # 2. Advanced Physiological signal checks
+                if 'advanced_physiological' in component_contributions:
+                    score = self._extract_score(component_contributions['advanced_physiological'])
+                    if score < 0.5:
+                        inconsistencies['physiological'] += 1
+                        explanation['issues_found'].append(f"Advanced physiological analysis detected anomalies (score: {score:.2f})")
+                    explanation['detection_scores']['advanced_physiological_score'] = 1.0 - score
+                
+                # Digital heartbeat analysis
+                if 'digital_heartbeat' in component_contributions:
+                    score = self._extract_score(component_contributions['digital_heartbeat'])
+                    if score < 0.5:
+                        inconsistencies['physiological'] += 1
+                        explanation['issues_found'].append(f"Unnatural digital heartbeat patterns detected (score: {score:.2f})")
+                    explanation['detection_scores']['digital_heartbeat_score'] = 1.0 - score
+                
+                # Heart rate analysis
+                if 'heart_rate' in component_contributions:
+                    hr_score = self._extract_score(component_contributions['heart_rate'])
+                    # Convert normalized score back to BPM for interpretation
+                    hr_bpm = hr_score * 100
+                    if hr_bpm < 50 or hr_bpm > 180:
+                        inconsistencies['physiological'] += 1
+                        explanation['issues_found'].append(f"Abnormal heart rate detected: {hr_bpm:.1f} BPM")
+                    explanation['detection_scores']['heart_rate_bpm'] = hr_bpm
+                
+                # Heart rate variability
+                if 'hrv_score' in component_contributions:
+                    hrv_score = self._extract_score(component_contributions['hrv_score'])
+                    if hrv_score < 0.3:
+                        inconsistencies['physiological'] += 1
+                        explanation['issues_found'].append(f"Abnormal heart rate variability detected (score: {hrv_score:.2f})")
+                    explanation['detection_scores']['hrv_score'] = hrv_score
+                
+                # Blood flow pattern analysis
+                if 'blood_flow_patterns' in component_contributions:
+                    score = self._extract_score(component_contributions['blood_flow_patterns'])
+                    if score < 0.5:
+                        inconsistencies['physiological'] += 1
+                        explanation['issues_found'].append(f"Unnatural blood flow patterns detected (score: {score:.2f})")
+                    explanation['detection_scores']['blood_flow_score'] = 1.0 - score
+                
+                # Pulse synchronization
+                if 'pulse_synchronization' in component_contributions:
+                    score = self._extract_score(component_contributions['pulse_synchronization'])
+                    if score < 0.5:
+                        inconsistencies['physiological'] += 1
+                        explanation['issues_found'].append(f"Poor pulse synchronization across skin regions (score: {score:.2f})")
+                    explanation['detection_scores']['pulse_sync_score'] = 1.0 - score
+                
+                # Breathing pattern analysis
+                if 'breathing_patterns' in component_contributions:
+                    score = self._extract_score(component_contributions['breathing_patterns'])
+                    if score < 0.5:
+                        inconsistencies['physiological'] += 1
+                        explanation['issues_found'].append(f"Unnatural breathing patterns detected (score: {score:.2f})")
+                    explanation['detection_scores']['breathing_pattern_score'] = 1.0 - score
+                
+                # Breathing rate analysis
+                if 'breathing_rate' in component_contributions:
+                    br_score = self._extract_score(component_contributions['breathing_rate'])
+                    # Convert normalized score back to BPM for interpretation
+                    br_bpm = br_score * 20
+                    if br_bpm < 10 or br_bpm > 30:
+                        inconsistencies['physiological'] += 1
+                        explanation['issues_found'].append(f"Abnormal breathing rate detected: {br_bpm:.1f} breaths/min")
+                    explanation['detection_scores']['breathing_rate_bpm'] = br_bpm
+                
+                # Breathing regularity
+                if 'breathing_regularity' in component_contributions:
+                    score = self._extract_score(component_contributions['breathing_regularity'])
+                    if score < 0.4:
+                        inconsistencies['physiological'] += 1
+                        explanation['issues_found'].append(f"Irregular breathing pattern detected (regularity: {score:.2f})")
+                    explanation['detection_scores']['breathing_regularity_score'] = score
+                
+                # Physiological coherence
+                if 'physiological_coherence' in component_contributions:
+                    score = self._extract_score(component_contributions['physiological_coherence'])
+                    if score < 0.5:
+                        inconsistencies['physiological'] += 1
+                        explanation['issues_found'].append(f"Poor physiological coherence between signals (score: {score:.2f})")
+                    explanation['detection_scores']['physiological_coherence_score'] = 1.0 - score
+                
+                # Fallback: Basic physiological analysis
                 if 'physiological' in component_contributions:
                     score = self._extract_score(component_contributions['physiological'])
                     if score < 0.5:
@@ -3449,11 +3994,24 @@ class MultiModalDeepfakeModel(nn.Module):
                     
                     # Generate CAM
                     cam = self.cam_extractor(input_tensor=frame, targets=targets)  # [1, H, W]
+                    
+                    # Ensure cam is a tensor with proper dtype and device
+                    if not isinstance(cam, torch.Tensor):
+                        cam = torch.tensor(cam, dtype=torch.float32, device=video_frames.device)
+                    else:
+                        cam = cam.to(dtype=torch.float32, device=video_frames.device)
+                    
                     attention_maps.append(cam)
             
-            # Stack and reshape
-            attention_maps = torch.stack(attention_maps)
-            attention_maps = attention_maps.view(batch_size, -1, 2, attention_maps.shape[-2], attention_maps.shape[-1])
+            # Stack and reshape with proper error handling
+            try:
+                attention_maps = torch.stack(attention_maps)
+                attention_maps = attention_maps.view(batch_size, -1, 2, attention_maps.shape[-2], attention_maps.shape[-1])
+            except Exception as stack_error:
+                if self.debug:
+                    print(f"Error stacking attention maps: {stack_error}")
+                # Return None if stacking fails
+                return None
             
             return attention_maps
         
