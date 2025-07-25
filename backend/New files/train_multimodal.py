@@ -23,6 +23,15 @@ import argparse
 from datetime import datetime
 import shutil
 import torch.multiprocessing as mp
+import traceback
+
+# Configure memory management for CUDA
+if torch.cuda.is_available():
+    # Set memory fraction to prevent allocating all GPU memory at once
+    torch.cuda.set_per_process_memory_fraction(0.9)
+    # Enable memory growth instead of pre-allocating all memory
+    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+
 mp.set_start_method('spawn', force=True)
 
 
@@ -362,12 +371,65 @@ def save_visualizations(inputs, outputs, results, epoch, sample_idx, viz_dir):
         print(f"Error saving visualizations: {e}")
 
 
-def move_batch_to_device(batch, device):
+def clear_gpu_cache():
+    """Clear GPU cache to free up memory."""
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+def get_gpu_memory_usage():
+    """Get current GPU memory usage."""
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1024**3  # GB
+        reserved = torch.cuda.memory_reserved() / 1024**3   # GB
+        return allocated, reserved
+    return 0, 0
+
+def check_memory_and_reduce_batch_size(batch, max_retries=3, trainer=None):
+    """Check memory usage and reduce batch size if needed."""
+    current_batch_size = len(batch['label']) if 'label' in batch else 1
+    
+    for retry in range(max_retries):
+        try:
+            allocated, reserved = get_gpu_memory_usage()
+            if allocated > 35.0:  # If using more than 35GB, reduce batch size
+                new_batch_size = max(1, current_batch_size // 2)
+                print(f"[MEMORY] Reducing batch size from {current_batch_size} to {new_batch_size} (allocated: {allocated:.2f}GB)")
+                
+                # Track memory warnings
+                if trainer is not None:
+                    trainer.memory_warnings += 1
+                
+                # Create smaller batch
+                reduced_batch = {}
+                for key, value in batch.items():
+                    if isinstance(value, torch.Tensor) and len(value) > new_batch_size:
+                        reduced_batch[key] = value[:new_batch_size]
+                    elif isinstance(value, list) and len(value) > new_batch_size:
+                        reduced_batch[key] = value[:new_batch_size]
+                    else:
+                        reduced_batch[key] = value
+                
+                batch = reduced_batch
+                current_batch_size = new_batch_size
+                clear_gpu_cache()
+            else:
+                break
+        except Exception as e:
+            print(f"[MEMORY] Error checking memory usage: {e}")
+            break
+    
+    return batch
+
+def move_batch_to_device(batch, device, trainer=None):
     """Safely move batch items to device, handling non-tensor items properly."""
+    # Check and optimize memory before moving to device
+    batch = check_memory_and_reduce_batch_size(batch, trainer=trainer)
+    
     device_batch = {}
     for key, value in batch.items():
         if isinstance(value, torch.Tensor):
-            device_batch[key] = value.to(device)
+            device_batch[key] = value.to(device, non_blocking=True)
         elif value is None:
             device_batch[key] = None
         elif isinstance(value, list):
@@ -427,6 +489,14 @@ class DeepfakeTrainer:
             'train_auc_scores': [],
             'val_auc_scores': []
         }
+        
+        # Initialize numerical stability tracking
+        self.nan_count = 0
+        self.total_batches = 0
+        
+        # Initialize memory management tracking
+        self.memory_warnings = 0
+        self.oom_errors = 0
         
         # Initialize best model tracking
         self.best_val_accuracy = 0.0
@@ -620,7 +690,9 @@ class DeepfakeTrainer:
             use_spectrogram=self.config.use_spectrogram,
             detect_deepfake_type=self.config.detect_deepfake_type,
             num_deepfake_types=self.config.num_deepfake_types,
-            debug=self.config.debug
+            debug=self.config.debug,
+            enable_skin_color_analysis=getattr(self.config, 'enable_skin_color_analysis', False),
+            enable_advanced_physiological=getattr(self.config, 'enable_advanced_physiological', False)
         )
         
         # Load pretrained weights if specified
@@ -720,6 +792,15 @@ class DeepfakeTrainer:
     def train_epoch(self, epoch):
         """Train the model for one epoch."""
         self.model.train()
+        
+        # Apply model stabilization measures
+        if hasattr(self.model, 'stabilize_model'):
+            self.model.stabilize_model()
+        
+        # Gradually unfreeze visual layers
+        if hasattr(self.model, 'unfreeze_visual_layers'):
+            self.model.unfreeze_visual_layers(epoch)
+        
         epoch_loss = 0
         y_true, y_pred, y_probs = [], [], []
         
@@ -728,8 +809,18 @@ class DeepfakeTrainer:
         
         for batch_idx, batch in enumerate(train_progress):
             try:
+                # Clear GPU cache periodically to prevent memory buildup
+                if batch_idx % 10 == 0:
+                    clear_gpu_cache()
+                
+                # Check memory usage before processing
+                allocated, reserved = get_gpu_memory_usage()
+                if allocated > 30.0:  # If memory usage is high, force cleanup
+                    print(f"[MEMORY] High memory usage detected: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
+                    clear_gpu_cache()
+                
                 # Move batch to device
-                batch = move_batch_to_device(batch, self.device)
+                batch = move_batch_to_device(batch, self.device, trainer=self)
                 
                 # Get labels
                 labels = batch['label']
@@ -737,41 +828,119 @@ class DeepfakeTrainer:
                 # Forward pass with mixed precision
                 self.optimizer.zero_grad()
                 
+                # Count successful vs failed samples for debugging
+                success_count = 0
+                total_samples = len(labels)
+                
                 if self.amp_enabled:
                     with autocast():
                         outputs, results = self.model(batch)
+                        
+                        # Check for NaN in outputs
+                        if torch.isnan(outputs).any():
+                            print(f"[ERROR] NaN detected in model outputs at batch {batch_idx}")
+                            print(f"[DEBUG] Output shape: {outputs.shape}")
+                            print(f"[DEBUG] Output stats - min: {outputs.min()}, max: {outputs.max()}, mean: {outputs.mean()}")
+                            # Reset optimizer state and skip this batch
+                            self.optimizer.zero_grad()
+                            self.nan_count += 1
+                            continue
+                        
+                        # Add numerical stability to outputs
+                        outputs = torch.clamp(outputs, min=-50, max=50)  # Prevent extreme values
+                        
                         loss = self.criterion(outputs, labels)
+                        
+                        # Check for NaN in loss
+                        if torch.isnan(loss):
+                            print(f"[ERROR] NaN loss detected at batch {batch_idx}")
+                            print(f"[DEBUG] Labels: {labels}")
+                            print(f"[DEBUG] Outputs: {outputs}")
+                            continue
                         
                         # Add regularization for deepfake type if enabled
                         if self.config.detect_deepfake_type and 'deepfake_type' in results and results['deepfake_type'] is not None:
                             if 'deepfake_type' in batch and batch['deepfake_type'] is not None:
                                 deepfake_type_loss = nn.CrossEntropyLoss()(results['deepfake_type'], batch['deepfake_type'])
-                                loss += self.config.deepfake_type_weight * deepfake_type_loss
+                                if not torch.isnan(deepfake_type_loss):
+                                    loss += self.config.deepfake_type_weight * deepfake_type_loss
                     
                     # Backward pass with scaler
                     self.scaler.scale(loss).backward()
                     
-                    # Gradient clipping
-                    if self.config.gradient_clip > 0:
+                    # Check for NaN in gradients using model method
+                    if hasattr(self.model, 'check_for_nan_gradients') and self.model.check_for_nan_gradients():
+                        print(f"[ERROR] Skipping backward pass due to NaN gradients at batch {batch_idx}")
+                        self.optimizer.zero_grad()
+                        
+                        # Apply model stabilization
+                        if hasattr(self.model, 'stabilize_model'):
+                            self.model.stabilize_model()
+                        
+                        # Skip this batch but continue training
+                        continue
+                    
+                    # Apply model's gradient clipping
+                    if hasattr(self.model, 'clip_gradients'):
                         self.scaler.unscale_(self.optimizer)
+                        self.model.clip_gradients(max_norm=self.config.gradient_clip)
+                    
+                    # Additional gradient clipping if configured
+                    if self.config.gradient_clip > 0:
+                        if not hasattr(self.model, 'clip_gradients'):  # Only if not already done
+                            self.scaler.unscale_(self.optimizer)
                         nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clip)
                     
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
                 else:
                     outputs, results = self.model(batch)
+                    
+                    # Check for NaN in outputs
+                    if torch.isnan(outputs).any():
+                        print(f"[ERROR] NaN detected in model outputs at batch {batch_idx}")
+                        print(f"[DEBUG] Output shape: {outputs.shape}")
+                        print(f"[DEBUG] Output stats - min: {outputs.min()}, max: {outputs.max()}, mean: {outputs.mean()}")
+                        # Reset optimizer state and skip this batch
+                        self.optimizer.zero_grad()
+                        self.nan_count += 1
+                        continue
+                    
+                    # Add numerical stability to outputs
+                    outputs = torch.clamp(outputs, min=-50, max=50)  # Prevent extreme values
+                    
                     loss = self.criterion(outputs, labels)
+                    
+                    # Check for NaN in loss
+                    if torch.isnan(loss):
+                        print(f"[ERROR] NaN loss detected at batch {batch_idx}")
+                        print(f"[DEBUG] Labels: {labels}")
+                        print(f"[DEBUG] Outputs: {outputs}")
+                        continue
                     
                     # Add regularization for deepfake type if enabled
                     if self.config.detect_deepfake_type and 'deepfake_type' in results and results['deepfake_type'] is not None:
                         if 'deepfake_type' in batch and batch['deepfake_type'] is not None:
                             deepfake_type_loss = nn.CrossEntropyLoss()(results['deepfake_type'], batch['deepfake_type'])
-                            loss += self.config.deepfake_type_weight * deepfake_type_loss
+                            if not torch.isnan(deepfake_type_loss):
+                                loss += self.config.deepfake_type_weight * deepfake_type_loss
                     
                     # Backward pass
                     loss.backward()
                     
-                    # Gradient clipping
+                    # Check for NaN in gradients using model method
+                    if hasattr(self.model, 'check_for_nan_gradients') and self.model.check_for_nan_gradients():
+                        print(f"[ERROR] Skipping backward pass due to NaN gradients at batch {batch_idx}")
+                        self.optimizer.zero_grad()
+                        continue
+                    
+                    # Apply model's gradient clipping
+                    if hasattr(self.model, 'clip_gradients'):
+                        self.model.clip_gradients(max_norm=1.0)
+                    
+                    # Additional gradient clipping if configured
+                    if self.config.gradient_clip > 0:
+                        nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clip)
                     if self.config.gradient_clip > 0:
                         nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clip)
                     
@@ -781,11 +950,25 @@ class DeepfakeTrainer:
                 if self.warmup_scheduler is not None and epoch < self.config.warmup_epochs:
                     self.warmup_scheduler.step()
                 
-                # Update progress bar
-                train_progress.set_postfix(loss=f"{loss.item():.4f}", lr=f"{get_lr(self.optimizer):.6f}")
+                # Track total batches and check for excessive NaN occurrence
+                self.total_batches += 1
+                if self.total_batches > 0 and self.nan_count / self.total_batches > 0.1:  # If more than 10% NaN
+                    print(f"[WARNING] High NaN rate detected ({self.nan_count}/{self.total_batches}). Reducing learning rate.")
+                    for param_group in self.optimizer.param_groups:
+                        param_group['lr'] *= 0.5
+                    self.nan_count = 0  # Reset counter after adjustment
+                    self.total_batches = 0
                 
-                # Accumulate loss
-                epoch_loss += loss.item()
+                # Update progress bar
+                loss_display = loss.item() if not torch.isnan(loss) else "nan"
+                train_progress.set_postfix(loss=f"{loss_display:.4f}" if isinstance(loss_display, float) else loss_display, 
+                                         lr=f"{get_lr(self.optimizer):.6f}")
+                
+                # Accumulate loss only if it's not NaN
+                if not torch.isnan(loss):
+                    epoch_loss += loss.item()
+                else:
+                    print(f"[WARNING] Skipping NaN loss in accumulation at batch {batch_idx}")
                 
                 # Accumulate predictions and labels for metrics calculation
                 y_true.extend(labels.cpu().numpy())
@@ -824,10 +1007,28 @@ class DeepfakeTrainer:
                 if self.is_main_process:
                     self.save_intermediate_checkpoint(epoch, batch_idx)
                 
+            except torch.cuda.OutOfMemoryError as oom_error:
+                print(f"[CUDA OOM] Out of memory error in training batch {batch_idx}: {oom_error}")
+                print(f"[CUDA OOM] Attempting to recover by clearing cache and reducing batch size...")
+                
+                # Track OOM errors
+                self.oom_errors += 1
+                
+                # Clear GPU cache
+                clear_gpu_cache()
+                
+                # Skip this batch and continue
+                self.optimizer.zero_grad()
+                continue
+                
             except Exception as e:
                 print(f"Error in training batch {batch_idx}: {e}")
                 import traceback
                 traceback.print_exc()
+                
+                # Clear GPU cache on any error to prevent memory leaks
+                clear_gpu_cache()
+                self.optimizer.zero_grad()
                 continue
         
         # Calculate average loss and metrics
@@ -858,8 +1059,12 @@ class DeepfakeTrainer:
         with torch.no_grad():
             for batch_idx, batch in enumerate(val_progress):
                 try:
+                    # Clear GPU cache periodically during validation
+                    if batch_idx % 20 == 0:
+                        clear_gpu_cache()
+                    
                     # Move batch to device
-                    batch = move_batch_to_device(batch, self.device)
+                    batch = move_batch_to_device(batch, self.device, trainer=self)
                     
                     # Get labels
                     labels = batch['label']
@@ -913,8 +1118,19 @@ class DeepfakeTrainer:
                             elif isinstance(value, (int, float)):
                                 all_component_contributions[key].append(value)
                     
+                except torch.cuda.OutOfMemoryError as oom_error:
+                    print(f"[CUDA OOM] Out of memory error in validation batch {batch_idx}: {oom_error}")
+                    print(f"[CUDA OOM] Clearing cache and continuing...")
+                    
+                    # Track OOM errors
+                    self.oom_errors += 1
+                    
+                    clear_gpu_cache()
+                    continue
+                    
                 except Exception as e:
                     print(f"Error in validation batch {batch_idx}: {e}")
+                    clear_gpu_cache()
                     continue
         
         # Calculate average loss and metrics
@@ -995,7 +1211,7 @@ class DeepfakeTrainer:
             for batch_idx, batch in enumerate(test_progress):
                 try:
                     # Move batch to device
-                    batch = move_batch_to_device(batch, self.device)
+                    batch = move_batch_to_device(batch, self.device, trainer=self)
                     
                     # Get labels and file paths
                     labels = batch['label']
@@ -1378,8 +1594,20 @@ class DeepfakeTrainer:
         # Record start time
         self.training_start_time = time.time()
         
+        # Print initial memory status
+        if torch.cuda.is_available():
+            allocated, reserved = get_gpu_memory_usage()
+            print(f"[MEMORY] Initial GPU memory - Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB")
+        
         # Train and validate
         self.train_and_validate()
+        
+        # Print final memory statistics
+        if self.is_main_process:
+            print(f"\n[MEMORY] Training completed with {self.oom_errors} out-of-memory errors and {self.memory_warnings} memory warnings")
+            if torch.cuda.is_available():
+                allocated, reserved = get_gpu_memory_usage()
+                print(f"[MEMORY] Final GPU memory - Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB")
         
         # Finalize experiment on WandB
         if self.config.use_wandb and self.is_main_process:
@@ -1388,6 +1616,9 @@ class DeepfakeTrainer:
         # Clean up distributed training resources
         if self.distributed:
             dist.destroy_process_group()
+        
+        # Final GPU cache cleanup
+        clear_gpu_cache()
 
 
 def parse_args():
@@ -1420,14 +1651,17 @@ def parse_args():
     parser.add_argument('--temporal_features', action='store_true', help='Compute temporal consistency features')
     parser.add_argument('--enhanced_preprocessing', action='store_true', help='Enable enhanced preprocessing features (physiological, etc.)')
     parser.add_argument('--enhanced_augmentation', action='store_true', help='Enable enhanced data augmentation')
+    parser.add_argument('--enable_skin_color_analysis', action='store_true', help='Enable skin color analysis (memory intensive)')
+    parser.add_argument('--enable_advanced_physiological', action='store_true', help='Enable advanced physiological analysis (heartbeat, blood flow, breathing)')
+    parser.add_argument('--physiological_fps', type=int, default=30, help='Frame rate for physiological signal analysis')
     parser.add_argument('--resume_checkpoint', type=str, default=None, help='Path to checkpoint file to resume training from')
     # Training parameters
     parser.add_argument('--batch_size', type=int, default=8, help='Batch size')
     parser.add_argument('--num_epochs', type=int, default=30, help='Number of training epochs')
     parser.add_argument('--learning_rate', type=float, default=1e-4, help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=1e-5, help='Weight decay')
-    parser.add_argument('--max_samples', type=int, default=None, help='Maximum number of samples to use')
-    parser.add_argument('--num_workers', type=int, default=4, help='Number of data loader workers')
+    parser.add_argument('--max_samples', type=int, default=1000, help='Maximum number of samples to use')
+    parser.add_argument('--num_workers', type=int, default=2, help='Number of data loader workers')
     parser.add_argument('--validation_split', type=float, default=0.2, help='Validation split ratio')
     parser.add_argument('--test_split', type=float, default=0.1, help='Test split ratio')
     parser.add_argument('--use_weighted_loss', action='store_true', help='Use class-weighted loss function')
@@ -1438,7 +1672,7 @@ def parse_args():
     parser.add_argument('--scheduler_patience', type=int, default=5, help='Patience for ReduceLROnPlateau scheduler')
     parser.add_argument('--warmup_epochs', type=int, default=2, help='Number of warmup epochs')
     parser.add_argument('--early_stopping_patience', type=int, default=10, help='Patience for early stopping')
-    parser.add_argument('--gradient_clip', type=float, default=1.0, help='Gradient clipping value')
+    parser.add_argument('--gradient_clip', type=float, default=0.5, help='Gradient clipping value')  # Reduced for stability
     
     # Distributed training parameters
     parser.add_argument('--distributed', action='store_true', help='Enable distributed training')
