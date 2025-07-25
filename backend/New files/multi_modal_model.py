@@ -2165,7 +2165,7 @@ class MultiModalDeepfakeModel(nn.Module):
         
         # Face embedding processor
         self.face_embedding_processor = nn.Sequential(
-            nn.Linear(32, 256),
+            nn.Linear(256, 256),
             nn.ReLU(),
             nn.Linear(256, 128)
         )
@@ -2285,7 +2285,10 @@ class MultiModalDeepfakeModel(nn.Module):
                 # Try to initialize facial landmark detector from dlib if available
                 try:
                     import dlib
-                    model_path = "shape_predictor_68_face_landmarks.dat"
+                    import os
+                    model_path = "/home/srmist54/backend/Models/shape_predictor_68_face_landmarks.dat"
+                    if not os.path.exists(model_path):
+                        model_path = "shape_predictor_68_face_landmarks.dat"  # Fallback to relative path
                     self.face_detector = dlib.get_frontal_face_detector()
                     try:
                         self.facial_landmark_predictor = dlib.shape_predictor(model_path)
