@@ -160,3 +160,34 @@ source /home/srmist54/backend/Models/miniconda3/bin/activate && conda activate /
 source /home/srmist54/backend/Models/miniconda3/bin/activate && conda activate /home/srmist54/backend/Models/enter/envs/dlib_env && pip install tensorboard ninja intel-openmp audiomentations
 
 cd /home/srmist54/backend/Models && python3 train_multimodal.py --json_path "/home/srmist54/backend/combined_data/LAV-DF/metadata.json" --data_dir "/home/srmist54/backend/combined_data/LAV-DF" --output_dir "/home/srmist54/backend/Models/server_outputs" --checkpoint_dir "/home/srmist54/backend/Models/server_checkpoints" --batch_size 4 --num_epochs 30 --learning_rate 1e-5 --enable_face_mesh --enable_explainability --use_spectrogram --detect_deepfake_type --detect_faces --compute_spectrograms --temporal_features --enhanced_preprocessing --enhanced_augmentation --use_weighted_loss --optimizer adamw --scheduler cosine --warmup_epochs 1 --early_stopping_patience 10 --gradient_clip 1.0 --amp_enabled --save_intermediate --save_intermediate_interval 10 --debug
+
+
+cd /home/srmist54/backend/Models && python3 train_multimodal.py \
+    --json_path "/home/srmist54/backend/combined_data/LAV-DF/metadata.json" \
+    --data_dir "/home/srmist54/backend/combined_data/LAV-DF" \
+    --output_dir "/home/srmist54/backend/Models/server_outputs" \
+    --checkpoint_dir "/home/srmist54/backend/Models/server_checkpoints" \
+    --batch_size 4 \
+    --num_epochs 30 \
+    --learning_rate 1e-5 \
+    --enable_face_mesh \
+    --enable_explainability \
+    --use_spectrogram \
+    --detect_deepfake_type \
+    --detect_faces \
+    --compute_spectrograms \
+    --temporal_features \
+    --enhanced_preprocessing \
+    --enhanced_augmentation \
+    --enable_advanced_physiological \
+    --physiological_fps 30 \
+    --use_weighted_loss \
+    --optimizer adamw \
+    --scheduler cosine \
+    --warmup_epochs 1 \
+    --early_stopping_patience 10 \
+    --gradient_clip 1.0 \
+    --amp_enabled \
+    --save_intermediate \
+    --save_intermediate_interval 10 \
+    --debug
