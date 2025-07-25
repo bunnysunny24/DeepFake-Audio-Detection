@@ -10,6 +10,11 @@ from torchvision import transforms
 import torchaudio
 import cv2
 import warnings
+import traceback
+import random
+import math
+import uuid
+import dlib
 from audiomentations import Compose, AddGaussianNoise, PitchShift, TimeStretch, Shift
 import albumentations as A
 try:
@@ -19,19 +24,49 @@ except ImportError:
 from scipy.signal import spectrogram
 import librosa
 from PIL import Image
+from PIL import Image
 import random
 import math
 import scipy.ndimage as ndimage
-
+import traceback
+import uuid
 
 class MultiModalDeepfakeDataset(Dataset):
-    def __init__(self, json_path, data_dir, max_frames=32, audio_length=16000, transform=None, audio_transform=None, 
+    def __init__(self, json_path, data_dir, max_frames=16, audio_length=8000, transform=None, audio_transform=None, 
                  logging=False, phase='train', detect_faces=True, compute_spectrograms=True, temporal_features=True,
                  enhanced_preprocessing=True):
         if not os.path.exists(json_path):
             raise FileNotFoundError(f"JSON file not found at: {json_path}")
-        with open(json_path, 'r', encoding='utf-8') as f:
-            self.data = json.load(f)
+        
+        # Load JSON with robust error handling
+        try:
+            with open(json_path, 'r', encoding='utf-8') as f:
+                self.data = json.load(f)
+            print(f"✅ Successfully loaded JSON with {len(self.data)} entries")
+        except json.JSONDecodeError as e:
+            print(f"❌ JSON decode error: {e}")
+            print("🔧 Attempting to repair JSON file...")
+            
+            # Try to load partial JSON by reading line by line
+            self.data = []
+            try:
+                with open(json_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                    
+                # Try to find complete JSON objects
+                if content.startswith('[') and not content.endswith(']'):
+                    # Likely truncated array, try to add closing bracket
+                    content = content.rstrip().rstrip(',') + ']'
+                    self.data = json.loads(content)
+                    print(f"✅ Repaired JSON, loaded {len(self.data)} entries")
+                else:
+                    raise ValueError("Unable to repair JSON automatically")
+                    
+            except Exception as repair_error:
+                print(f"❌ Failed to repair JSON: {repair_error}")
+                raise ValueError(f"JSON file is corrupted and cannot be repaired: {json_path}")
+        except Exception as e:
+            raise ValueError(f"Error loading JSON file {json_path}: {e}")
 
         self.data_dir = data_dir
         self.max_frames = max_frames
@@ -44,6 +79,10 @@ class MultiModalDeepfakeDataset(Dataset):
         self.compute_spectrograms = compute_spectrograms
         self.temporal_features = temporal_features
         self.enhanced_preprocessing = enhanced_preprocessing
+        
+        # Initialize error counters early
+        self.face_detection_error_count = 0
+        self.max_face_detection_errors_to_print = 5  # Reduce error messages for cleaner output
         
         # Optional face detector for more focused analysis
         if self.detect_faces:
@@ -70,10 +109,16 @@ class MultiModalDeepfakeDataset(Dataset):
                 import dlib
                 # Try to load dlib's face detector and landmark predictor
                 self.dlib_detector = dlib.get_frontal_face_detector()
-                model_path = "shape_predictor_68_face_landmarks.dat"
+                
+                # Use absolute path to ensure file is found regardless of working directory
+                model_path = "/home/srmist54/backend/Models/shape_predictor_68_face_landmarks.dat"
+                if not os.path.exists(model_path):
+                    # Fallback to relative path
+                    model_path = "shape_predictor_68_face_landmarks.dat"
+                    
                 if os.path.exists(model_path):
                     self.landmark_predictor = dlib.shape_predictor(model_path)
-                    print("Facial landmark predictor initialized successfully")
+                    print("✅ Facial landmark predictor initialized successfully")
                 else:
                     print(f"Warning: Facial landmark model not found at {model_path}")
                     self.landmark_predictor = None
@@ -88,17 +133,10 @@ class MultiModalDeepfakeDataset(Dataset):
     def _validate_dataset(self):
         """Pre-validate all samples in the dataset to identify valid ones."""
         print("Starting dataset validation...")
-        print("⚠️ LIMITING VALIDATION TO FIRST 100 SAMPLES ONLY")
         
-        # Limit to first 100 samples for faster processing
-        max_samples = 100
-        # max_to_validate = min(max_samples, len(self.data))
-        # print(f"Using first {max_to_validate} samples out of {len(self.data)} total.")
-        max_to_validate = min(max_samples, len(self.data))
-
-        # To this:
-        print("Validating all samples...")
+        # Use the entire dataset for production
         max_to_validate = len(self.data)
+        print(f"✅ VALIDATING ALL {max_to_validate} SAMPLES IN THE DATASET")
         
         valid_indices = []
         
@@ -294,20 +332,20 @@ class MultiModalDeepfakeDataset(Dataset):
         
     def _get_placeholder_sample(self):
         """Generate a placeholder sample when an error occurs."""
-        # Create a blank tensor with appropriate dimensions
+        # Create a blank tensor with appropriate dimensions (reduced for memory efficiency)
         video_frames = torch.zeros((self.max_frames, 3, 224, 224))
         audio_tensor = torch.zeros(self.audio_length)
-        audio_spectrogram = torch.zeros((1, 128, 128))
+        audio_spectrogram = torch.zeros((1, 64, 64))  # Reduced from 128x128
         label = torch.tensor(0, dtype=torch.long)  # Assume real by default
         facial_landmarks = torch.zeros((self.max_frames, 136))  # 68 landmarks with x,y coordinates
         
-        # Additional placeholder features
-        mfcc_features = torch.zeros((40, 100))  # Placeholder MFCC shape
+        # Additional placeholder features (reduced sizes)
+        mfcc_features = torch.zeros((20, 50))  # Reduced from (40, 100)
         pulse_signal = torch.zeros(self.max_frames)
         skin_color_variations = torch.zeros((self.max_frames, 3))
         head_pose_features = torch.zeros((self.max_frames, 3))  # pitch, yaw, roll
         eye_blink_features = torch.zeros(self.max_frames)
-        frequency_features = torch.zeros((1, 32, 32))
+        frequency_features = torch.zeros((1, 16, 16))  # Reduced from (1, 32, 32)
         
         return {
             'video_frames': video_frames,
@@ -321,10 +359,10 @@ class MultiModalDeepfakeDataset(Dataset):
             'timestamps': [],
             'transcript': '',
             'fake_mask': torch.zeros(1),
-            'face_embeddings': torch.zeros((1, 512)),
+            'face_embeddings': torch.zeros((1, 256)),  # Reduced from 512
             'temporal_consistency': torch.tensor(1.0),
             'metadata_features': torch.zeros(10),
-            'ela_features': torch.zeros((224, 224)),
+            'ela_features': torch.zeros((112, 112)),  # Reduced from (224, 224)
             'audio_visual_sync': torch.zeros(5),
             'file_path': 'placeholder',
             'facial_landmarks': facial_landmarks,
@@ -385,21 +423,78 @@ class MultiModalDeepfakeDataset(Dataset):
                         warnings.warn(f"⚠️ Failed to read frame {frame_idx} from {path}")
                     continue
                 
-                # Convert to RGB
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                # Validate frame before processing
+                if frame is None or frame.size == 0:
+                    if self.logging:
+                        warnings.warn(f"⚠️ Empty frame at index {frame_idx}")
+                    continue
                 
-                # Apply face detection if enabled
+                # Convert to RGB with error handling
+                try:
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    
+                    # Validate converted frame
+                    if frame_rgb is None or frame_rgb.size == 0 or len(frame_rgb.shape) != 3 or frame_rgb.shape[2] != 3:
+                        if self.logging:
+                            warnings.warn(f"⚠️ Invalid RGB conversion for frame {frame_idx}")
+                        continue
+                        
+                except Exception as e:
+                    if self.logging:
+                        warnings.warn(f"⚠️ Color conversion error for frame {frame_idx}: {e}")
+                    continue
+                
+                # Apply face detection if enabled and not too many errors
                 face_crop = None
                 face_detected = False
                 consistency_score = 1.0  # Default - perfect consistency
                 landmarks = []
                 
-                if self.detect_faces:
+                # Skip face detection if too many errors have occurred
+                if self.detect_faces and self.face_detection_error_count < 50:
                     try:
-                        # Convert to PIL for face detector
-                        # Convert to PIL for face detector - ensure it's 8-bit RGB
-                        frame_rgb_8bit = (frame_rgb * 255).astype(np.uint8) if frame_rgb.dtype != np.uint8 else frame_rgb
-                        pil_img = Image.fromarray(frame_rgb_8bit)
+                        # Skip face detection if frame has invalid dimensions or values
+                        if frame_rgb.shape[2] != 3 or np.isnan(frame_rgb).any() or frame_rgb.size == 0:
+                            raise ValueError("Invalid frame format - skipping face detection")
+                        
+                        # Convert to 8-bit RGB with robust error handling
+                        try:
+                            # Ensure frame is properly formatted before conversion
+                            if frame_rgb.dtype != np.uint8:
+                                # Check if values are in 0-1 range
+                                if frame_rgb.max() <= 1.0 and frame_rgb.min() >= 0.0:
+                                    frame_rgb_8bit = (frame_rgb * 255.0).astype(np.uint8)
+                                else:
+                                    # Values might be in 0-255 range but wrong dtype
+                                    frame_rgb_8bit = np.clip(frame_rgb, 0, 255).astype(np.uint8)
+                            else:
+                                frame_rgb_8bit = frame_rgb.copy()
+                            
+                            # Ensure values are in valid range and correct shape
+                            frame_rgb_8bit = np.clip(frame_rgb_8bit, 0, 255).astype(np.uint8)
+                            
+                            # Verify shape and data integrity
+                            if len(frame_rgb_8bit.shape) != 3 or frame_rgb_8bit.shape[2] != 3 or frame_rgb_8bit.size == 0:
+                                raise ValueError(f"Invalid image shape: {frame_rgb_8bit.shape}")
+                            
+                            # Additional validation - check for corrupted data
+                            if np.any(np.isnan(frame_rgb_8bit)) or np.any(np.isinf(frame_rgb_8bit)):
+                                raise ValueError("Frame contains NaN or inf values")
+                            
+                            # Ensure minimum size for face detection
+                            if frame_rgb_8bit.shape[0] < 20 or frame_rgb_8bit.shape[1] < 20:
+                                raise ValueError("Frame too small for face detection")
+                            
+                            # Convert to PIL with explicit mode and additional error handling
+                            pil_img = Image.fromarray(frame_rgb_8bit, mode='RGB')
+                            
+                            # Verify PIL image was created successfully
+                            if pil_img.size[0] == 0 or pil_img.size[1] == 0:
+                                raise ValueError("PIL image has zero dimensions")
+                                
+                        except Exception as conversion_error:
+                            raise ValueError(f"Frame conversion failed: {conversion_error}")
+                            
                         
                         # Detect faces
                         boxes, probs = self.face_detector.detect(pil_img)
@@ -432,26 +527,66 @@ class MultiModalDeepfakeDataset(Dataset):
                                 
                             # Extract facial landmarks if enhanced preprocessing is enabled
                             if self.enhanced_preprocessing and hasattr(self, 'dlib_detector') and self.dlib_detector is not None:
-                                # Convert to grayscale for dlib
-                                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                                
-                                # Detect faces
-                                dlib_faces = self.dlib_detector(gray)
-                                
-                                if dlib_faces and hasattr(self, 'landmark_predictor') and self.landmark_predictor is not None:
-                                    # Get facial landmarks
-                                    shape = self.landmark_predictor(gray, dlib_faces[0])
+                                try:
+                                    # Ensure we have the original frame in the right format for dlib
+                                    # Use the original frame_rgb before any processing
+                                    dlib_frame = frame_rgb.copy()
                                     
-                                    # Convert landmarks to list of (x, y) coordinates
-                                    landmarks = []
-                                    for i in range(68):
-                                        x = shape.part(i).x
-                                        y = shape.part(i).y
-                                        landmarks.extend([x, y])  # Flatten to [x1, y1, x2, y2, ...]
+                                    # Ensure frame is in proper format and range
+                                    if dlib_frame.dtype != np.uint8:
+                                        if dlib_frame.max() <= 1.0:
+                                            dlib_frame = (dlib_frame * 255).astype(np.uint8)
+                                        else:
+                                            dlib_frame = np.clip(dlib_frame, 0, 255).astype(np.uint8)
+                                    
+                                    # Ensure values are in valid range
+                                    dlib_frame = np.clip(dlib_frame, 0, 255).astype(np.uint8)
+                                    
+                                    # Convert RGB to grayscale for dlib
+                                    gray = cv2.cvtColor(dlib_frame, cv2.COLOR_RGB2GRAY)
+                                    
+                                    # Ensure gray image is 8-bit
+                                    gray = gray.astype(np.uint8)
+                                    
+                                    # Detect faces with dlib
+                                    dlib_faces = self.dlib_detector(gray)
+                                    
+                                    if dlib_faces and hasattr(self, 'landmark_predictor') and self.landmark_predictor is not None:
+                                        # Get facial landmarks
+                                        shape = self.landmark_predictor(gray, dlib_faces[0])
+                                        
+                                        # Convert landmarks to list of (x, y) coordinates
+                                        landmarks = []
+                                        for i in range(68):
+                                            x = shape.part(i).x
+                                            y = shape.part(i).y
+                                            landmarks.extend([x, y])  # Flatten to [x1, y1, x2, y2, ...]
                                 
+                                except Exception as e:
+                                    if self.logging and self.face_detection_error_count < self.max_face_detection_errors_to_print:
+                                        print(f"Face detection error on frame {frame_idx}: {e}")
+                                        self.face_detection_error_count += 1
+                                    elif self.face_detection_error_count == self.max_face_detection_errors_to_print:
+                                        print("Face detection error limit reached. Suppressing further error messages.")
+                                        self.face_detection_error_count += 1
+                                    landmarks = []  # Reset landmarks on error
+                                    
                     except Exception as e:
-                        if self.logging:
+                        # Handle MTCNN face detection errors
+                        if self.logging and self.face_detection_error_count < self.max_face_detection_errors_to_print:
                             print(f"Face detection error on frame {frame_idx}: {e}")
+                            self.face_detection_error_count += 1
+                        elif self.face_detection_error_count == self.max_face_detection_errors_to_print:
+                            print("Face detection error limit reached. Suppressing further error messages.")
+                            self.face_detection_error_count += 1
+                        else:
+                            # Silent increment after limit reached
+                            self.face_detection_error_count += 1
+                            
+                        # Disable face detection if too many consecutive errors
+                        if self.face_detection_error_count > 50:
+                            print("⚠️ Too many face detection errors. Disabling face detection for this video.")
+                            self.detect_faces = False
                 
                 # Extract facial landmarks even if no face was detected (for consistency)
                 all_landmarks.append(landmarks if landmarks else [0] * 136)  # 68 landmarks * 2 coordinates
@@ -461,13 +596,58 @@ class MultiModalDeepfakeDataset(Dataset):
                 
                 # Apply transformations
                 if self.transform:
-                    if self.phase == 'train':  # Apply augmentation only during training
-                        frame_rgb = self.transform(frame_rgb)
-                    else:
-                        # Just normalize for validation/testing
-                        frame_rgb = self.transform(frame_rgb)
+                    try:
+                        if self.phase == 'train':  # Apply augmentation only during training
+                            frame_rgb = self.transform(frame_rgb)
+                        else:
+                            # Just normalize for validation/testing
+                            frame_rgb = self.transform(frame_rgb)
+                        
+                        # Ensure result is a tensor
+                        if not isinstance(frame_rgb, torch.Tensor):
+                            frame_rgb = torch.tensor(frame_rgb).float()
+                            
+                        # Ensure proper shape [C, H, W]
+                        if len(frame_rgb.shape) == 3 and frame_rgb.shape[0] not in [1, 3]:
+                            frame_rgb = frame_rgb.permute(2, 0, 1)
+                            
+                    except Exception as transform_error:
+                        if self.logging:
+                            warnings.warn(f"⚠️ Transform error on frame {frame_idx}: {transform_error}")
+                        # Fallback to manual conversion
+                        try:
+                            if frame_rgb.shape != (224, 224, 3):
+                                if self.logging:
+                                    warnings.warn(f"⚠️ Unexpected frame shape in fallback {frame_rgb.shape}, skipping frame {frame_idx}")
+                                continue
+                            frame_rgb = torch.tensor(frame_rgb, dtype=torch.float32).permute(2, 0, 1) / 255.0
+                        except Exception as fallback_error:
+                            if self.logging:
+                                warnings.warn(f"⚠️ Fallback conversion failed on frame {frame_idx}: {fallback_error}")
+                            continue
                 else:
-                    frame_rgb = torch.tensor(frame_rgb).permute(2, 0, 1).float() / 255.0
+                    # Manual conversion without transforms
+                    try:
+                        # Validate frame dimensions before permute
+                        if frame_rgb.shape != (224, 224, 3):
+                            if self.logging:
+                                warnings.warn(f"⚠️ Unexpected frame shape {frame_rgb.shape}, skipping frame {frame_idx}")
+                            continue
+                            
+                        frame_rgb = torch.tensor(frame_rgb, dtype=torch.float32)
+                        
+                        # Safe permute operation
+                        if len(frame_rgb.shape) == 3:
+                            frame_rgb = frame_rgb.permute(2, 0, 1) / 255.0
+                        else:
+                            if self.logging:
+                                warnings.warn(f"⚠️ Invalid frame shape for permute: {frame_rgb.shape}")
+                            continue
+                            
+                    except Exception as manual_error:
+                        if self.logging:
+                            warnings.warn(f"⚠️ Manual conversion error on frame {frame_idx}: {manual_error}")
+                        continue  # Skip this frame
                 
                 video_frames.append(frame_rgb)
             cap.release()
@@ -483,18 +663,80 @@ class MultiModalDeepfakeDataset(Dataset):
             # Process face crops if available
             face_embeddings = None
             if face_crops:
-                # Stack face crops
-                face_crops_tensor = torch.stack([
-                    torch.tensor(crop).permute(2, 0, 1).float() / 255.0
-                    for crop in face_crops
-                ])
-                
-                # Create simple face embeddings (in a real model, you would use a face recognition network here)
-                # This is just a placeholder - in practice use a pre-trained face embedding network
-                face_embeddings = torch.mean(face_crops_tensor.reshape(face_crops_tensor.size(0), -1), dim=1)
+                try:
+                    # Stack face crops with error handling for different tensor shapes
+                    face_crops_tensors = []
+                    for crop in face_crops:
+                        try:
+                            if len(crop.shape) == 3 and crop.shape[2] == 3:
+                                # Convert HWC to CHW format
+                                crop_tensor = torch.tensor(crop).permute(2, 0, 1).float() / 255.0
+                            elif len(crop.shape) == 3 and crop.shape[0] == 3:
+                                # Already in CHW format
+                                crop_tensor = torch.tensor(crop).float() / 255.0
+                            else:
+                                # Handle unexpected formats
+                                crop_tensor = torch.tensor(crop).float()
+                                if crop_tensor.max() > 1.0:
+                                    crop_tensor = crop_tensor / 255.0
+                                # Ensure it has 3 channels and proper shape
+                                if len(crop_tensor.shape) == 2:
+                                    crop_tensor = crop_tensor.unsqueeze(0).repeat(3, 1, 1)
+                                elif len(crop_tensor.shape) == 3 and crop_tensor.shape[0] == 1:
+                                    crop_tensor = crop_tensor.repeat(3, 1, 1)
+                                elif len(crop_tensor.shape) == 3 and crop_tensor.shape[0] != 3:
+                                    crop_tensor = crop_tensor.permute(2, 0, 1)
+                            
+                            face_crops_tensors.append(crop_tensor)
+                        except Exception as crop_error:
+                            if self.logging:
+                                warnings.warn(f"⚠️ Error processing face crop: {crop_error}")
+                            continue
+                    
+                    if face_crops_tensors:
+                        face_crops_tensor = torch.stack(face_crops_tensors)
+                        
+                        # Create simple face embeddings (in a real model, you would use a face recognition network here)
+                        # This is just a placeholder - in practice use a pre-trained face embedding network
+                        
+                        # Flatten each face crop to create embeddings
+                        batch_size, channels, height, width = face_crops_tensor.shape
+                        flattened_crops = face_crops_tensor.view(batch_size, -1)
+                        
+                        # Take mean across all face crops to get a single embedding per sample
+                        if batch_size > 1:
+                            # Average multiple face detections to get single embedding
+                            raw_embedding = torch.mean(flattened_crops, dim=0, keepdim=True)
+                        else:
+                            raw_embedding = flattened_crops
+                        
+                        # Ensure consistent dimensions: resize to fixed 256-dimensional embeddings
+                        embedding_dim = raw_embedding.size(1)
+                        if embedding_dim != 256:
+                            # Create a simple projection to 256 dimensions
+                            if embedding_dim > 256:
+                                # Simple downsampling by taking every nth element
+                                step = embedding_dim // 256
+                                face_embeddings = raw_embedding[:, ::step][:, :256]
+                            else:
+                                # Pad with zeros
+                                padding = torch.zeros(raw_embedding.size(0), 256 - embedding_dim)
+                                face_embeddings = torch.cat([raw_embedding, padding], dim=1)
+                        else:
+                            face_embeddings = raw_embedding
+                            
+                        # Ensure we always have exactly one embedding per sample
+                        if face_embeddings.size(0) != 1:
+                            face_embeddings = face_embeddings[0:1]  # Take only first
+                    else:
+                        face_embeddings = torch.zeros((1, 256))
+                except Exception as face_error:
+                    if self.logging:
+                        warnings.warn(f"⚠️ Error processing face embeddings: {face_error}")
+                    face_embeddings = torch.zeros((1, 256))
             else:
                 # No faces detected, use zeros as placeholder
-                face_embeddings = torch.zeros((1, 512))
+                face_embeddings = torch.zeros((1, 256))  # Match placeholder size
                 
             # Temporal consistency feature
             temporal_consistency = torch.tensor(consistency_score).float()
@@ -549,7 +791,7 @@ class MultiModalDeepfakeDataset(Dataset):
                     mel_spec = librosa.feature.melspectrogram(
                         y=audio, 
                         sr=sample_rate,
-                        n_mels=128,
+                        n_mels=64,  # Reduced from 128
                         hop_length=512,
                         n_fft=2048
                     )
@@ -557,8 +799,8 @@ class MultiModalDeepfakeDataset(Dataset):
                     # Convert to dB scale
                     mel_spec = librosa.power_to_db(mel_spec, ref=np.max)
                     
-                    # Resize to 128x128
-                    mel_spec = cv2.resize(mel_spec, (128, 128))
+                    # Resize to 64x64 (reduced from 128x128)
+                    mel_spec = cv2.resize(mel_spec, (64, 64))
                     
                     # Normalize
                     mel_spec = (mel_spec - mel_spec.min()) / (mel_spec.max() - mel_spec.min() + 1e-8)
@@ -567,9 +809,9 @@ class MultiModalDeepfakeDataset(Dataset):
                 except Exception as e:
                     if self.logging:
                         warnings.warn(f"⚠️ Error computing spectrogram: {e}")
-                    audio_spec = torch.zeros((1, 128, 128), dtype=torch.float32)
+                    audio_spec = torch.zeros((1, 64, 64), dtype=torch.float32)  # Updated to match new size
             else:
-                audio_spec = torch.zeros((1, 128, 128), dtype=torch.float32)
+                audio_spec = torch.zeros((1, 64, 64), dtype=torch.float32)  # Updated to match new size
             
             # NEW: Extract MFCC features
             mfcc_features = None
@@ -578,7 +820,7 @@ class MultiModalDeepfakeDataset(Dataset):
                 mfccs = librosa.feature.mfcc(
                     y=audio, 
                     sr=sample_rate, 
-                    n_mfcc=40,  # Number of MFCC coefficients
+                    n_mfcc=20,  # Reduced from 40
                     hop_length=512,
                     n_fft=2048
                 )
@@ -588,7 +830,7 @@ class MultiModalDeepfakeDataset(Dataset):
             except Exception as e:
                 if self.logging:
                     warnings.warn(f"⚠️ Error computing MFCC features: {e}")
-                mfcc_features = torch.zeros((40, 100), dtype=torch.float32)  # Default shape
+                mfcc_features = torch.zeros((20, 50), dtype=torch.float32)  # Reduced default shape
 
             return torch.tensor(audio, dtype=torch.float32), audio_spec, mfcc_features
             
@@ -669,10 +911,26 @@ class MultiModalDeepfakeDataset(Dataset):
         """Extract Error Level Analysis features for the first frame."""
         try:
             if video_frames is None or len(video_frames) == 0:
-                return torch.zeros((224, 224), dtype=torch.float32)
+                return torch.zeros((112, 112), dtype=torch.float32)
                 
             # Use first frame for ELA
-            first_frame = video_frames[0].permute(1, 2, 0).cpu().numpy()
+            first_frame = video_frames[0]
+            
+            # Ensure frame has correct dimensions for permute
+            if len(first_frame.shape) == 3 and first_frame.shape[0] == 3:
+                first_frame = first_frame.permute(1, 2, 0).cpu().numpy()
+            else:
+                # Handle unexpected frame shapes - convert to expected format
+                first_frame = first_frame.cpu().numpy()
+                if len(first_frame.shape) == 2:
+                    # Grayscale frame, convert to RGB
+                    first_frame = np.stack([first_frame, first_frame, first_frame], axis=2)
+                elif len(first_frame.shape) == 3 and first_frame.shape[2] == 3:
+                    # Already in HWC format
+                    pass
+                else:
+                    # Unexpected format, return zeros
+                    return torch.zeros((112, 112), dtype=torch.float32)
             
             # Convert to uint8
             first_frame = (first_frame * 255).astype(np.uint8)
@@ -697,8 +955,8 @@ class MultiModalDeepfakeDataset(Dataset):
             # Use grayscale ELA 
             ela_gray = np.mean(ela, axis=2)
             
-            # Resize to 224x224
-            ela_resized = cv2.resize(ela_gray, (224, 224))
+            # Resize to 112x112 (reduced from 224x224 for memory efficiency)
+            ela_resized = cv2.resize(ela_gray, (112, 112))
             
             # Normalize
             ela_normalized = ela_resized / ela_resized.max() if ela_resized.max() > 0 else ela_resized
@@ -716,7 +974,7 @@ class MultiModalDeepfakeDataset(Dataset):
         except Exception as e:
             if self.logging:
                 warnings.warn(f"⚠️ Error extracting ELA features: {e}")
-            return torch.zeros((224, 224), dtype=torch.float32)
+            return torch.zeros((112, 112), dtype=torch.float32)
     
     def _extract_av_sync_features(self, video_frames, audio_tensor):
         """Extract features for audio-visual synchronization analysis."""
@@ -795,7 +1053,18 @@ class MultiModalDeepfakeDataset(Dataset):
             green_values = []
             
             for i in range(len(video_frames)):
-                frame = video_frames[i].permute(1, 2, 0).cpu().numpy()
+                frame = video_frames[i]
+                
+                # Ensure frame has correct dimensions for permute
+                if len(frame.shape) == 3 and frame.shape[0] == 3:
+                    frame = frame.permute(1, 2, 0).cpu().numpy()
+                elif len(frame.shape) == 3 and frame.shape[2] == 3:
+                    # Already in HWC format
+                    frame = frame.cpu().numpy()
+                else:
+                    # Handle unexpected frame shapes
+                    green_values.append(0.5)  # Default value
+                    continue
                 
                 # Simple skin detection (very basic)
                 r, g, b = frame[:, :, 0], frame[:, :, 1], frame[:, :, 2]
@@ -813,22 +1082,29 @@ class MultiModalDeepfakeDataset(Dataset):
             signal = np.array(green_values)
             
             # Simple signal processing: bandpass filter for heart rate range (0.7-4Hz, approx 40-240 BPM)
-            if len(signal) > 5:  # Need enough points for filtering
-                # Estimated frame rate: assume 30fps for simplicity
-                fps = 30
-                
-                # Design bandpass filter
-                nyquist = fps / 2
-                low = 0.7 / nyquist
-                high = 4.0 / nyquist
-                b, a = scipy.signal.butter(3, [low, high], btype='band')
-                
-                # Apply filter
-                filtered_signal = scipy.signal.filtfilt(b, a, signal)
-                
-                # Normalize
-                filtered_signal = (filtered_signal - np.mean(filtered_signal)) / (np.std(filtered_signal) + 1e-8)
+            if len(signal) > 30:  # Need enough points for filtering (increased minimum)
+                try:
+                    # Estimated frame rate: assume 30fps for simplicity
+                    fps = 30
+                    
+                    # Design bandpass filter
+                    nyquist = fps / 2
+                    low = 0.7 / nyquist
+                    high = 4.0 / nyquist
+                    b, a = scipy.signal.butter(3, [low, high], btype='band')
+                    
+                    # Apply filter with padlen adjustment
+                    padlen = min(len(signal) // 4, 10)  # Adaptive padlen
+                    filtered_signal = scipy.signal.filtfilt(b, a, signal, padlen=padlen)
+                    
+                    # Normalize
+                    filtered_signal = (filtered_signal - np.mean(filtered_signal)) / (np.std(filtered_signal) + 1e-8)
+                except Exception as filter_error:
+                    if self.logging:
+                        warnings.warn(f"⚠️ Filtering failed, using raw signal: {filter_error}")
+                    filtered_signal = signal
             else:
+                # Not enough signal points for filtering, use raw signal
                 filtered_signal = signal
             
             # Ensure correct length
@@ -856,7 +1132,18 @@ class MultiModalDeepfakeDataset(Dataset):
             skin_colors = []
             
             for i in range(len(video_frames)):
-                frame = video_frames[i].permute(1, 2, 0).cpu().numpy()
+                frame = video_frames[i]
+                
+                # Ensure frame has correct dimensions for permute
+                if len(frame.shape) == 3 and frame.shape[0] == 3:
+                    frame = frame.permute(1, 2, 0).cpu().numpy()
+                elif len(frame.shape) == 3 and frame.shape[2] == 3:
+                    # Already in HWC format
+                    frame = frame.cpu().numpy()
+                else:
+                    # Handle unexpected frame shapes
+                    skin_colors.append([0.5, 0.5, 0.5])  # Default values
+                    continue
                 
                 # Simple skin detection
                 r, g, b = frame[:, :, 0], frame[:, :, 1], frame[:, :, 2]
@@ -991,43 +1278,79 @@ class MultiModalDeepfakeDataset(Dataset):
                         blink_scores.append(0.5)  # Default value (undefined)
                         continue
                     
-                    # Calculate eye aspect ratio (EAR) for each eye
-                    # Left eye indices (based on 68-point model): 36-41
-                    left_eye_pts = [(landmarks[2*j], landmarks[2*j+1]) for j in range(36, 42)]
-                    
-                    # Right eye indices: 42-47
-                    right_eye_pts = [(landmarks[2*j], landmarks[2*j+1]) for j in range(42, 48)]
-                    
-                    # Calculate EAR (h/w ratio)
-                    def eye_aspect_ratio(eye):
-                        # Compute vertical distances
-                        v1 = torch.sqrt((eye[1][0] - eye[5][0])**2 + (eye[1][1] - eye[5][1])**2)
-                        v2 = torch.sqrt((eye[2][0] - eye[4][0])**2 + (eye[2][1] - eye[4][1])**2)
+                    try:
+                        # Extract eye landmarks (68-point model)
+                        # Left eye: points 36-41, Right eye: points 42-47
+                        left_eye_pts = []
+                        right_eye_pts = []
                         
-                        # Compute horizontal distance
-                        h = torch.sqrt((eye[0][0] - eye[3][0])**2 + (eye[0][1] - eye[3][1])**2)
+                        # Left eye landmarks - ensure indices are valid
+                        for j in range(36, 42):
+                            x_idx = j * 2
+                            y_idx = j * 2 + 1
+                            if x_idx < len(landmarks) and y_idx < len(landmarks):
+                                left_eye_pts.append([landmarks[x_idx], landmarks[y_idx]])
                         
-                        # Return ratio
-                        return (v1 + v2) / (2.0 * h + 1e-6)
-                    
-                    left_ear = eye_aspect_ratio(left_eye_pts)
-                    right_ear = eye_aspect_ratio(right_eye_pts)
-                    
-                    # Average EAR
-                    ear = (left_ear + right_ear) / 2.0
-                    
-                    # Convert to blink score (lower EAR = more closed eyes)
-                    # Typical threshold for blink detection is around 0.2
-                    blink_score = 1.0 - min(1.0, max(0.0, ear * 3))  # Scale and invert
-                    blink_scores.append(float(blink_score) if isinstance(blink_score, torch.Tensor) else blink_score)
+                        # Right eye landmarks - ensure indices are valid
+                        for j in range(42, 48):
+                            x_idx = j * 2
+                            y_idx = j * 2 + 1
+                            if x_idx < len(landmarks) and y_idx < len(landmarks):
+                                right_eye_pts.append([landmarks[x_idx], landmarks[y_idx]])
+                        
+                        # Calculate eye aspect ratio if we have enough points
+                        if len(left_eye_pts) >= 6 and len(right_eye_pts) >= 6:
+                            def eye_aspect_ratio(eye):
+                                # Ensure we have valid points
+                                if len(eye) < 6:
+                                    return torch.tensor(0.3)  # Default EAR value
+                                
+                                try:
+                                    # Compute vertical distances
+                                    v1 = torch.sqrt((eye[1][0] - eye[5][0])**2 + (eye[1][1] - eye[5][1])**2)
+                                    v2 = torch.sqrt((eye[2][0] - eye[4][0])**2 + (eye[2][1] - eye[4][1])**2)
+                                    
+                                    # Compute horizontal distance
+                                    h = torch.sqrt((eye[0][0] - eye[3][0])**2 + (eye[0][1] - eye[3][1])**2)
+                                    
+                                    # Return ratio
+                                    return (v1 + v2) / (2.0 * h + 1e-6)
+                                except Exception:
+                                    return torch.tensor(0.3)  # Default EAR value
+                            
+                            left_ear = eye_aspect_ratio(left_eye_pts)
+                            right_ear = eye_aspect_ratio(right_eye_pts)
+                            
+                            # Average EAR
+                            ear = (left_ear + right_ear) / 2.0
+                            
+                            # Convert to blink score (lower EAR = more closed eyes)
+                            # Typical threshold for blink detection is around 0.2
+                            blink_score = 1.0 - min(1.0, max(0.0, ear * 3))  # Scale and invert
+                            blink_scores.append(float(blink_score) if isinstance(blink_score, torch.Tensor) else blink_score)
+                        else:
+                            blink_scores.append(0.5)  # Default value if not enough landmarks
+                            
+                    except Exception as landmark_error:
+                        blink_scores.append(0.5)  # Default value on error
             else:
                 # Fallback to simpler detection directly from frames
                 for i in range(num_frames):
-                    frame = video_frames[i].permute(1, 2, 0).cpu().numpy()
-                    
-                    # Very basic eye detection and scoring (placeholder)
-                    # In a real implementation, this would be more sophisticated
-                    blink_scores.append(0.5)  # Default (undefined)
+                    try:
+                        frame = video_frames[i]
+                        # Ensure frame has correct dimensions for permute
+                        if len(frame.shape) == 3 and frame.shape[0] == 3:
+                            frame = frame.permute(1, 2, 0).cpu().numpy()
+                        else:
+                            # Handle unexpected frame shapes
+                            blink_scores.append(0.5)  # Default value
+                            continue
+                        
+                        # Very basic eye detection and scoring (placeholder)
+                        # In a real implementation, this would be more sophisticated
+                        blink_scores.append(0.5)  # Default (undefined)
+                    except Exception as frame_error:
+                        blink_scores.append(0.5)  # Default value on error
             
             # Ensure correct length
             if len(blink_scores) < self.max_frames:
@@ -1046,7 +1369,7 @@ class MultiModalDeepfakeDataset(Dataset):
         """Extract frequency domain features to detect artifacts from generative models."""
         try:
             if video_frames is None or len(video_frames) == 0:
-                return torch.zeros((1, 32, 32), dtype=torch.float32)
+                return torch.zeros((1, 16, 16), dtype=torch.float32)
             
             # Use first frame for frequency analysis
             first_frame = video_frames[0].cpu()
@@ -1069,7 +1392,7 @@ class MultiModalDeepfakeDataset(Dataset):
             # Resize to fixed dimensions for consistent processing
             magnitude_spectrum = F.interpolate(
                 magnitude_spectrum.unsqueeze(0).unsqueeze(0),  # Add batch and channel dims
-                size=(32, 32),
+                size=(16, 16),  # Reduced from (32, 32)
                 mode='bilinear',
                 align_corners=False
             ).squeeze(0)  # Remove batch dim, keep channel dim
@@ -1082,7 +1405,7 @@ class MultiModalDeepfakeDataset(Dataset):
         except Exception as e:
             if self.logging:
                 warnings.warn(f"⚠️ Error extracting frequency features: {e}")
-            return torch.zeros((1, 32, 32), dtype=torch.float32)
+            return torch.zeros((1, 16, 16), dtype=torch.float32)
 
 
 def get_transforms(phase='train'):
@@ -1152,8 +1475,8 @@ def get_transforms_enhanced(phase='train'):
 
 
 def get_data_loaders(
-    json_path, data_dir, batch_size=8, validation_split=0.2, test_split=0.1,
-    shuffle=True, num_workers=4, max_samples=None, detect_faces=True,
+    json_path, data_dir, batch_size=4, validation_split=0.2, test_split=0.1,
+    shuffle=True, num_workers=2, max_samples=None, detect_faces=True,
     compute_spectrograms=True, temporal_features=True, enhanced_preprocessing=True,
     enhanced_augmentation=False
 ):
@@ -1349,10 +1672,28 @@ def collate_fn(batch):
             values = [item[key] for item in batch if item[key] is not None]
             if values and all(v is not None and isinstance(v, torch.Tensor) for v in values):
                 try:
-                    result[key] = torch.stack(values)
-                except:
+                    # Special handling for face_embeddings to ensure correct shape
+                    if key == 'face_embeddings':
+                        # Ensure all face embeddings have the same shape before stacking
+                        normalized_values = []
+                        for v in values:
+                            if len(v.shape) == 2 and v.shape[0] == 1 and v.shape[1] == 256:
+                                normalized_values.append(v)
+                            elif len(v.shape) == 1 and v.shape[0] == 256:
+                                normalized_values.append(v.unsqueeze(0))
+                            else:
+                                # Create a properly shaped tensor
+                                normalized_values.append(torch.zeros((1, 256)))
+                        result[key] = torch.stack(normalized_values).squeeze(1)  # Remove extra dimension
+                    else:
+                        result[key] = torch.stack(values)
+                except Exception as stack_error:
                     # If can't stack (different sizes), store as list
-                    result[key] = values
+                    if key == 'face_embeddings':
+                        # For face embeddings, create a batch of zeros if stacking fails
+                        result[key] = torch.zeros((len(batch), 256))
+                    else:
+                        result[key] = values
             else:
                 # Try to convert non-tensor values to tensors
                 try:
@@ -1367,11 +1708,29 @@ def collate_fn(batch):
                                 pass  # Skip if can't convert to tensor
                     
                     if tensor_values:
-                        result[key] = torch.stack(tensor_values)
+                        if key == 'face_embeddings':
+                            # Special handling for face embeddings
+                            normalized_values = []
+                            for v in tensor_values:
+                                if len(v.shape) == 2 and v.shape[0] == 1 and v.shape[1] == 256:
+                                    normalized_values.append(v)
+                                elif len(v.shape) == 1 and v.shape[0] == 256:
+                                    normalized_values.append(v.unsqueeze(0))
+                                else:
+                                    normalized_values.append(torch.zeros((1, 256)))
+                            result[key] = torch.stack(normalized_values).squeeze(1)
+                        else:
+                            result[key] = torch.stack(tensor_values)
+                    else:
+                        if key == 'face_embeddings':
+                            result[key] = torch.zeros((len(batch), 256))
+                        else:
+                            result[key] = None
+                except:
+                    if key == 'face_embeddings':
+                        result[key] = torch.zeros((len(batch), 256))
                     else:
                         result[key] = None
-                except:
-                    result[key] = None
         elif key in ['fake_periods', 'timestamps']:
             # List of lists, don't stack
             result[key] = [item[key] for item in batch]
