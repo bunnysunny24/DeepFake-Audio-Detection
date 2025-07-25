@@ -191,3 +191,8 @@ cd /home/srmist54/backend/Models && python3 train_multimodal.py \
     --save_intermediate \
     --save_intermediate_interval 10 \
     --debug
+source /home/srmist54/backend/Models/miniconda3/bin/activate
+conda create -n dlib_env python=3.10 -y
+conda activate dlib_env
+conda install -c conda-forge dlib -y
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
