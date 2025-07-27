@@ -533,9 +533,9 @@ class DeepfakeTrainer:
             
             # Load model weights
             if self.distributed:
-                self.model.module.load_state_dict(checkpoint['model_state_dict'])
+                self.model.module.load_state_dict(checkpoint['model_state_dict'], strict=False)
             else:
-                self.model.load_state_dict(checkpoint['model_state_dict'])
+                self.model.load_state_dict(checkpoint['model_state_dict'], strict=False)
             
             # Load optimizer state
             if 'optimizer_state_dict' in checkpoint:
@@ -1583,9 +1583,9 @@ class DeepfakeTrainer:
         
         # Load model weights
         if self.distributed:
-            self.model.module.load_state_dict(checkpoint['model_state_dict'])
+            self.model.module.load_state_dict(checkpoint['model_state_dict'], strict=False)
         else:
-            self.model.load_state_dict(checkpoint['model_state_dict'])
+            self.model.load_state_dict(checkpoint['model_state_dict'], strict=False)
         
         print(f"Best model loaded (Epoch {checkpoint['epoch']}, Accuracy: {checkpoint['accuracy']:.4f}, F1: {checkpoint['f1_score']:.4f})")
     
