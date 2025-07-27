@@ -230,3 +230,6 @@ cd /home/srmist54/backend/Models && python3 train_multimodal.py \
     --save_intermediate \
     --save_intermediate_interval 10 \
     --debug
+
+cd Models|
+python predict_deepfake.py /home/srmist54/backend/Models/server_checkpoints/best_model.pth "/home/srmist54/backend/combined_data/fake_video (1).mp4"
