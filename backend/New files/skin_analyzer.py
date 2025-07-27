@@ -30,16 +30,20 @@ class SkinColorAnalyzer(nn.Module):
         
         # Create skin mask using strict type handling
         with torch.no_grad():
-            # RGB thresholds for skin detection
-            skin_mask = ((r > 0.4).to(dtype=torch.bool) & 
-                        (g > 0.28).to(dtype=torch.bool) & 
-                        (b > 0.2).to(dtype=torch.bool) &
-                        (r > g).to(dtype=torch.bool) & 
-                        (r > b).to(dtype=torch.bool))
+            # Compute all conditions separately and ensure boolean type
+            r_thresh = (r > 0.4).bool()
+            g_thresh = (g > 0.28).bool()
+            b_thresh = (b > 0.2).bool()
+            r_g_cond = (r > g).bool()
+            r_b_cond = (r > b).bool()
             
-            # Additional refinements with explicit type casting
+            # Combine conditions
+            skin_mask = r_thresh & g_thresh & b_thresh & r_g_cond & r_b_cond
+            
+            # Additional refinements
             diff_rg = (r - g).abs()
-            skin_mask = skin_mask & (diff_rg > 0.1).to(dtype=torch.bool)
+            diff_mask = (diff_rg > 0.1).bool()
+            skin_mask = skin_mask & diff_mask
             
         return skin_mask.to(device=device)
         
@@ -64,13 +68,21 @@ class SkinColorAnalyzer(nn.Module):
             for b in range(batch_size):
                 frame_features = []
                 for t in range(num_frames):
-                    mask = skin_mask[b, t]
+                    mask = skin_mask[b, t].bool()  # Ensure mask is boolean
                     if mask.any():
                         # Safe indexing with boolean mask
-                        r_mean = torch.mean(frames[b, t, 0][mask])
-                        g_mean = torch.mean(frames[b, t, 1][mask])
-                        b_mean = torch.mean(frames[b, t, 2][mask])
-                        frame_feat = torch.stack([r_mean, g_mean, b_mean])
+                        r_vals = frames[b, t, 0][mask]
+                        g_vals = frames[b, t, 1][mask]
+                        b_vals = frames[b, t, 2][mask]
+                        
+                        # Compute means only if we have valid values
+                        if r_vals.numel() > 0:
+                            r_mean = torch.mean(r_vals)
+                            g_mean = torch.mean(g_vals)
+                            b_mean = torch.mean(b_vals)
+                            frame_feat = torch.stack([r_mean, g_mean, b_mean])
+                        else:
+                            frame_feat = torch.tensor([0.5, 0.4, 0.35], device=device)
                     else:
                         frame_feat = torch.tensor([0.5, 0.4, 0.35], device=device)
                     frame_features.append(frame_feat)
