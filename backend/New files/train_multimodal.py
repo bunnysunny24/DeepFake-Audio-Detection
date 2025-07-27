@@ -676,6 +676,44 @@ class DeepfakeTrainer:
         self.class_weights = self.class_weights.to(self.device) if self.class_weights is not None else None
         
         # Initialize model
+        # Force enable skin color analysis
+        self.config.enable_skin_color_analysis = True
+        # Patch: ensure skin color analysis indices are correct dtype and add debug
+        def patch_skin_color_indices(model):
+            if hasattr(model, 'skin_color_extractor'):
+                orig_func = model.skin_color_extractor
+                def safe_skin_color_extractor(*args, **kwargs):
+                    def convert_indices(x):
+                        if isinstance(x, torch.Tensor):
+                            # If likely a mask (float or int, 0/1), convert to bool
+                            if x.dtype in [torch.float32, torch.float64, torch.int32, torch.int64, torch.uint8]:
+                                # If all values are 0/1, treat as mask
+                                if ((x == 0) | (x == 1)).all():
+                                    print(f"[SKIN PATCH] Converting mask tensor to bool, shape={x.shape}, dtype={x.dtype}")
+                                    return x.bool()
+                                else:
+                                    print(f"[SKIN PATCH] Converting index tensor to long, shape={x.shape}, dtype={x.dtype}")
+                                    return x.long()
+                        return x
+                    new_args = tuple(convert_indices(a) for a in args)
+                    new_kwargs = {k: convert_indices(v) for k, v in kwargs.items()}
+                    # Extra: forcibly convert any tensor used as index in args/kwargs to long if not bool/long
+                    for i, a in enumerate(new_args):
+                        if isinstance(a, torch.Tensor) and not (a.dtype == torch.bool or a.dtype == torch.long):
+                            print(f"[SKIN PATCH] Forcing arg {i} to long for indexing, shape={a.shape}, dtype={a.dtype}")
+                            new_args = tuple(a.long() if idx == i else val for idx, val in enumerate(new_args))
+                    for k, v in new_kwargs.items():
+                        if isinstance(v, torch.Tensor) and not (v.dtype == torch.bool or v.dtype == torch.long):
+                            print(f"[SKIN PATCH] Forcing kwarg '{k}' to long for indexing, shape={v.shape}, dtype={v.dtype}")
+                            new_kwargs[k] = v.long()
+                    try:
+                        result = orig_func(*new_args, **new_kwargs)
+                        return result
+                    except Exception as e:
+                        print(f"[SKIN PATCH] Error in skin color extraction: {e}")
+                        return None
+                model.skin_color_extractor = safe_skin_color_extractor
+        # ...existing code...
         self.model = MultiModalDeepfakeModel(
             num_classes=self.config.num_classes,
             video_feature_dim=self.config.video_feature_dim,
@@ -691,9 +729,10 @@ class DeepfakeTrainer:
             detect_deepfake_type=self.config.detect_deepfake_type,
             num_deepfake_types=self.config.num_deepfake_types,
             debug=self.config.debug,
-            enable_skin_color_analysis=getattr(self.config, 'enable_skin_color_analysis', False),
+            enable_skin_color_analysis=True,
             enable_advanced_physiological=getattr(self.config, 'enable_advanced_physiological', False)
         )
+        patch_skin_color_indices(self.model)
         
         # Load pretrained weights if specified
         if self.config.pretrained_path is not None and os.path.exists(self.config.pretrained_path):
@@ -926,6 +965,12 @@ class DeepfakeTrainer:
                                 loss += self.config.deepfake_type_weight * deepfake_type_loss
                     
                     # Backward pass
+                    # Check for NaN in loss before backward
+                    if torch.isnan(loss):
+                        print(f"[ERROR] NaN loss detected at batch {batch_idx}")
+                        print(f"[DEBUG] Skipping backward pass due to NaN loss.")
+                        self.optimizer.zero_grad()
+                        continue
                     loss.backward()
                     
                     # Check for NaN in gradients using model method
@@ -937,6 +982,8 @@ class DeepfakeTrainer:
                     # Apply model's gradient clipping
                     if hasattr(self.model, 'clip_gradients'):
                         self.model.clip_gradients(max_norm=1.0)
+                    # Always apply gradient clipping for safety
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                     
                     # Additional gradient clipping if configured
                     if self.config.gradient_clip > 0:
