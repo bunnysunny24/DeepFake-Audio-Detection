@@ -95,13 +95,21 @@ def main(model_path, video_path):
 
         # Determine label and confidence
         if pred.shape[-1] > 1:
-            confidence, label_idx = torch.max(pred, dim=-1)
-            label = "Fake" if label_idx.item() == 1 else "Real"
-            confidence_value = float(confidence.item())
+            fake_prob = float(pred[0, 1])
+            if fake_prob >= 0.5:
+                label = "Fake"
+                confidence_value = fake_prob
+            else:
+                label = "Real"
+                confidence_value = 1 - fake_prob
         else:
-            confidence_value = float(pred.item())
-            label = "Fake" if confidence_value > 0.5 else "Real"
-            confidence_value = confidence_value if label == "Fake" else 1 - confidence_value
+            raw_confidence = float(pred.item())
+            if raw_confidence >= 0.5:
+                label = "Fake"
+                confidence_value = raw_confidence
+            else:
+                label = "Real"
+                confidence_value = 1 - raw_confidence
         print(f"Prediction: {label} (Confidence: {confidence_value:.2f})")
 
 if __name__ == "__main__":
