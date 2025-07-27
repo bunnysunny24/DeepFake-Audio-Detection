@@ -3389,90 +3389,76 @@ class MultiModalDeepfakeModel(nn.Module):
         batch_size = video_frames.shape[0]
         num_frames = video_frames.shape[1]
         device = video_frames.device
+        skin_colors = torch.zeros((batch_size, num_frames, 3), device=device)
         
         if not hasattr(self, 'skin_analyzer'):
             from skin_analyzer import SkinColorAnalyzer
             self.skin_analyzer = SkinColorAnalyzer(feature_dim=32).to(device)
         
         try:
-            # Initialize output tensor
-            skin_colors = torch.zeros((batch_size, num_frames, 3), device=device)
-            chunk_size = 32  # Process frames in chunks to save memory
+            # Use skin analyzer to process all frames at once
+            # Ensure video frames are in the correct format [batch_size, num_frames, channels, height, width]
+            if video_frames.dim() == 5 and video_frames.size(2) == 3:
+                skin_colors = self.skin_analyzer(video_frames)
+            else:
+                # Reshape if necessary
+                video_frames = video_frames.view(batch_size, num_frames, 3, video_frames.size(-2), video_frames.size(-1))
+                skin_colors = self.skin_analyzer(video_frames)
             
-            # Process each batch and frame in chunks
-            for b in range(batch_size):
-                for chunk_start in range(0, num_frames, chunk_size):
-                    chunk_end = min(chunk_start + chunk_size, num_frames)
-                    
-                    # Process chunk of frames
-                    frame_chunk = video_frames[b, chunk_start:chunk_end]  # [chunk_size, C, H, W]
+            # Process frame chunks
+            chunk_size = 10  # Process 10 frames at a time to manage memory
+            for chunk_start in range(0, num_frames, chunk_size):
+                chunk_end = min(chunk_start + chunk_size, num_frames)
                 
-                    # Downsample frames for skin detection to save memory (224x224 -> 56x56)
-                    small_frames = torch.nn.functional.interpolate(
-                        frame_chunk, size=(56, 56), mode='bilinear', align_corners=False
-                    )  # [chunk_size, 3, 56, 56]                    # Simple skin detection using RGB values on GPU
-                    r = small_frames[:, 0].float()  # [chunk_size, 56, 56] - ensure float type
-                    g = small_frames[:, 1].float()  # [chunk_size, 56, 56]
-                    b = small_frames[:, 2].float()  # [chunk_size, 56, 56]
-                    
-                    # Ensure all tensors are on the same device and have the same dtype
-                    r = r.to(device=device, dtype=torch.float32)
-                    g = g.to(device=device, dtype=torch.float32)
-                    b = b.to(device=device, dtype=torch.float32)
-                    
-                    # Vectorized skin detection with explicit boolean conversion
-                    skin_mask = torch.zeros_like(r, dtype=torch.bool, device=device)
-                    skin_mask = ((r > 0.4) & (g > 0.28) & (b > 0.2) & 
-                               (r > g) & (r > b) & 
-                               ((r - g) > 0.1) & (torch.abs(r - g) > 0.15))
-                        
-                    # Extract average colors for each frame in chunk
+                for b in range(batch_size):
                     for i, t in enumerate(range(chunk_start, chunk_end)):
-                        mask = skin_mask[i]
-                        if not mask.dtype == torch.bool:
-                            mask = mask.bool()
-                        if self.debug:
-                            print(f"[SKIN] i type: {type(i)}, r type: {type(r)}, r shape: {getattr(r, 'shape', None)}")
-                        if not (isinstance(r, torch.Tensor) and r.shape[0] > i and r.shape[1:] == (56, 56)):
-                            skin_colors[b, t] = torch.tensor([0.5, 0.4, 0.35], device=device, dtype=torch.float32)
-                            continue
-                        if self.debug:
-                            print(f"[SKIN] i type: {type(i)}, r shape: {r.shape}, idx: {i}")
-                        r_frame = r[i]
-                        g_frame = g[i]
-                        b_frame = b[i]
-                        # Flatten for safe indexing
-                        mask_flat = mask.flatten()
-                        r_flat = r_frame.flatten()
-                        g_flat = g_frame.flatten()
-                        b_flat = b_frame.flatten()
                         try:
-                            # Ensure mask is boolean
-                            mask = mask.to(dtype=torch.bool)
-                            
-                            # Calculate means directly using the boolean mask
-                            if mask.any():  # Check if any True values exist in mask
-                                avg_r = torch.mean(r_frame[mask])
-                                avg_g = torch.mean(g_frame[mask])
-                                avg_b = torch.mean(b_frame[mask])
-                                skin_colors[b, t] = torch.stack([avg_r, avg_g, avg_b])
-                            else:
-                                # Fallback values if no skin pixels detected
-                                skin_colors[b, t] = torch.tensor([0.5, 0.4, 0.35], device=device, dtype=torch.float32)
+                            mask = skin_mask[i] if 'skin_mask' in locals() else None
+                            if mask is not None:
+                                if not mask.dtype == torch.bool:
+                                    mask = mask.bool()
+                                
+                                if self.debug:
+                                    print(f"[SKIN] i type: {type(i)}, r shape: {getattr(r, 'shape', None) if 'r' in locals() else None}")
+                                
+                                if not ('r' in locals() and isinstance(r, torch.Tensor) and r.shape[0] > i and r.shape[1:] == (56, 56)):
+                                    skin_colors[b, t] = torch.tensor([0.5, 0.4, 0.35], device=device, dtype=torch.float32)
+                                    continue
+                                
+                                if self.debug:
+                                    print(f"[SKIN] i type: {type(i)}, r shape: {r.shape}, idx: {i}")
+                                
+                                r_frame = r[i]
+                                g_frame = g[i]
+                                b_frame = b[i]
+                                
+                                # Ensure mask is boolean
+                                mask = mask.to(dtype=torch.bool)
+                                
+                                # Calculate means directly using the boolean mask
+                                if mask.any():  # Check if any True values exist in mask
+                                    avg_r = torch.mean(r_frame[mask])
+                                    avg_g = torch.mean(g_frame[mask])
+                                    avg_b = torch.mean(b_frame[mask])
+                                    skin_colors[b, t] = torch.stack([avg_r, avg_g, avg_b])
+                                else:
+                                    # Fallback values if no skin pixels detected
+                                    skin_colors[b, t] = torch.tensor([0.5, 0.4, 0.35], device=device, dtype=torch.float32)
+                        
                         except Exception as mask_error:
                             if self.debug:
                                 print(f"Error in skin color calculation: {mask_error}")
                             # Fallback values on error
                             skin_colors[b, t] = torch.tensor([0.5, 0.4, 0.35], device=device, dtype=torch.float32)
-                        
-                    # Clear intermediate tensors to free memory
-                    del frame_chunk, small_frames, r, g, b, skin_mask
-                    
-                    # Force garbage collection if needed
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-            
-            return skin_colors
+                
+                # Clear intermediate tensors to free memory
+                for var in ['frame_chunk', 'small_frames', 'r', 'g', 'b', 'skin_mask']:
+                    if var in locals():
+                        del locals()[var]
+                
+                # Force garbage collection if needed
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
         
         except Exception as e:
             if self.debug:
@@ -3481,16 +3467,9 @@ class MultiModalDeepfakeModel(nn.Module):
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             # Return zeros with shape [batch_size, num_frames, 3] (RGB values)
-            return torch.zeros((batch_size, num_frames, 3), device=device)
+            skin_colors = torch.zeros((batch_size, num_frames, 3), device=device)
         
-        except Exception as e:
-            if self.debug:
-                print(f"Error extracting skin colors: {e}")
-            # Clear any GPU memory that might be held
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            # Return zeros with shape [batch_size, num_frames, 3] (RGB values)
-            return torch.zeros((batch_size, num_frames, 3), device=video_frames.device)
+        return skin_colors
 
     def check_eye_blinking(self, frame):
         """Check if eyes are blinking in the given frame using face mesh."""
