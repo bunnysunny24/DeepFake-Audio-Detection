@@ -24,10 +24,12 @@ except ImportError:
 from scipy.signal import spectrogram
 import librosa
 from PIL import Image
-from PIL import Image
 import random
 import math
 import scipy.ndimage as ndimage
+
+# Import custom regularization layers
+from layers import MixupLayer, CutMixLayer
 import traceback
 import uuid
 
