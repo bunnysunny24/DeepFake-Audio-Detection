@@ -6,6 +6,7 @@ class WeightedFocalLoss(nn.Module):
     """
     Focal Loss with class weights for handling imbalanced datasets.
     Combines class weighting with focal modulation to down-weight easy examples.
+    Includes numerical stability improvements and proper handling of edge cases.
     """
     def __init__(self, alpha=0.25, gamma=2.0, class_weights=None, reduction='mean', eps=1e-8):
         """
@@ -31,15 +32,26 @@ class WeightedFocalLoss(nn.Module):
         Returns:
             Weighted focal loss value
         """
-        # Get probabilities
-        probs = F.softmax(inputs, dim=1)
+        if inputs.dim() > 2:
+            inputs = inputs.view(inputs.size(0), inputs.size(1), -1)  # (B, C, d1, d2, ...) -> (B, C, D)
+            inputs = inputs.transpose(1, 2)    # (B, C, D) -> (B, D, C)
+            inputs = inputs.contiguous().view(-1, inputs.size(2))   # (B, D, C) -> (B * D, C)
+        
+        targets = targets.view(-1)
+        
+        # Get probabilities with numerical stability
+        log_softmax = F.log_softmax(inputs, dim=1)
+        probs = torch.exp(log_softmax)  # More stable than direct softmax
         
         # Get the probability for the target class
         pt = probs.gather(1, targets.unsqueeze(1))
-        pt = pt.view(-1)  # Shape: [B]
+        pt = pt.view(-1) + self.eps  # Add eps for numerical stability
         
-        # Compute focal weights
-        focal_weights = (1 - pt) ** self.gamma
+        # Clamp probabilities to prevent extreme focal weights
+        pt = torch.clamp(pt, min=self.eps, max=1.0 - self.eps)
+        
+        # Compute focal weights with controlled scaling
+        focal_weights = ((1 - pt) ** self.gamma).clamp(min=0.0, max=100.0)
         
         # Compute alpha weights
         alpha = torch.ones_like(pt) * self.alpha
@@ -71,8 +83,10 @@ class MultiTaskLoss(nn.Module):
     """
     Multi-task loss that combines classification and regularization losses
     """
-    def __init__(self, class_weights=None, lambda_reg=0.1, lambda_aux=0.2):
+    def __init__(self, class_weights=None, type_class_weights=None, lambda_reg=0.1, lambda_aux=0.2):
         super().__init__()
+        self.class_weights = class_weights
+        self.type_class_weights = type_class_weights  # Separate weights for deepfake type classification
         # Main deepfake detection loss with class weighting and focal modulation
         self.main_loss = WeightedFocalLoss(class_weights=class_weights)
         # Weight for regularization losses
@@ -91,22 +105,32 @@ class MultiTaskLoss(nn.Module):
             aux_targets: Dict of auxiliary targets (optional)
             
         Returns:
-            total_loss, dict of individual losses
+            total_loss: Combined loss value
+            losses: Dict containing individual loss components
         """
         losses = {}
         
-        # Main classification loss
+        # Main classification loss using Weighted Focal Loss
         main_loss = self.main_loss(outputs, targets)
-        losses['main'] = main_loss
+        losses['main'] = main_loss.item() if isinstance(main_loss, torch.Tensor) else main_loss
         total_loss = main_loss
 
         # Auxiliary losses if provided
-        if aux_outputs and aux_targets:
-            if 'deepfake_type' in aux_outputs and 'deepfake_type' in aux_targets:
-                type_loss = F.cross_entropy(aux_outputs['deepfake_type'], 
-                                          aux_targets['deepfake_type'])
-                losses['type'] = type_loss
-                total_loss += self.lambda_aux * type_loss
-                
+        if aux_outputs is not None and aux_targets is not None:
+            if isinstance(aux_outputs, dict) and isinstance(aux_targets, dict):
+                if 'deepfake_type' in aux_outputs and 'deepfake_type' in aux_targets:
+                    # Use weighted cross entropy for deepfake type classification
+                    # Ensure weights are on the same device as the inputs
+                    weights = self.type_class_weights
+                    if weights is not None:
+                        weights = weights.to(aux_outputs['deepfake_type'].device)
+                    
+                    type_loss = F.cross_entropy(
+                        aux_outputs['deepfake_type'], 
+                        aux_targets['deepfake_type'],
+                        weight=weights
+                    )
+                    losses['type'] = type_loss.item()
+                    total_loss += self.lambda_aux * type_loss
+        
         return total_loss, losses
-
