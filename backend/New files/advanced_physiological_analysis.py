@@ -789,16 +789,6 @@ class AdvancedPhysiologicalAnalyzer(nn.Module):
             heart_rate = heartbeat_results['heart_rate']
             hrv_score = heartbeat_results['hrv_score']
             breathing_rate = breathing_results['breathing_rate']
-            # Ensure all are tensors of shape [batch, 1]
-            if not isinstance(heart_rate, torch.Tensor):
-                heart_rate = torch.tensor(heart_rate)
-            if not isinstance(hrv_score, torch.Tensor):
-                hrv_score = torch.tensor(hrv_score)
-            if not isinstance(breathing_rate, torch.Tensor):
-                breathing_rate = torch.tensor(breathing_rate)
-            heart_rate = heart_rate.view(-1, 1)
-            hrv_score = hrv_score.view(-1, 1)
-            breathing_rate = breathing_rate.view(-1, 1)
             
             # Expected relationships between physiological signals
             # 1. Heart rate and breathing rate correlation
@@ -807,29 +797,19 @@ class AdvancedPhysiologicalAnalyzer(nn.Module):
             
             hr_breath_ratio = heart_rate / (breathing_rate * 4 + 1e-8)  # Expect ~4:1 ratio
             hr_breath_coherence = torch.sigmoid(-(torch.abs(hr_breath_ratio - 1) - 1))
-            hr_breath_coherence = hr_breath_coherence.view(-1, 1)
             
             # Combine all coherence measures
-            # Ensure all features are tensors of shape [batch, 1]
-            blood_flow_score = blood_flow_results['blood_flow_score']
-            regularity_score = breathing_results['regularity_score']
-            if not isinstance(blood_flow_score, torch.Tensor):
-                blood_flow_score = torch.tensor(blood_flow_score)
-            if not isinstance(regularity_score, torch.Tensor):
-                regularity_score = torch.tensor(regularity_score)
-            blood_flow_score = blood_flow_score.view(-1, 1)
-            regularity_score = regularity_score.view(-1, 1)
             coherence_features = torch.cat([
                 heart_rate / 100,  # Normalize HR
                 breathing_rate / 20,  # Normalize breathing rate
-                blood_flow_score,
+                blood_flow_results['blood_flow_score'],
                 hrv_score,
-                regularity_score,
+                breathing_results['regularity_score'],
                 hr_breath_coherence
             ], dim=1)
+            
             coherence_score = self.coherence_analyzer(coherence_features)
-            # Ensure output is [batch, 1]
-            coherence_score = coherence_score.view(-1, 1)
+            
             return coherence_score
             
         except Exception as e:
@@ -848,33 +828,24 @@ class AdvancedPhysiologicalAnalyzer(nn.Module):
         heartbeat_results = self.heartbeat_detector(face_frames)
         blood_flow_results = self.blood_flow_analyzer(face_frames)
         breathing_results = self.breathing_detector(face_frames)
-
-        # Defensive: ensure all naturalness scores are tensors of shape [batch, 1]
-        def ensure_tensor_1d(x):
-            if not isinstance(x, torch.Tensor):
-                x = torch.tensor(x)
-            return x.view(-1, 1)
-        n_heartbeat = ensure_tensor_1d(heartbeat_results['naturalness'])
-        n_bloodflow = ensure_tensor_1d(blood_flow_results['naturalness'])
-        n_breathing = ensure_tensor_1d(breathing_results['naturalness'])
-
+        
         # Analyze physiological coherence
         coherence_score = self.analyze_physiological_coherence(
             heartbeat_results, blood_flow_results, breathing_results
         )
-
+        
         # Combine naturalness scores
         naturalness_scores = torch.cat([
-            n_heartbeat,
-            n_bloodflow,
-            n_breathing
+            heartbeat_results['naturalness'],
+            blood_flow_results['naturalness'],
+            breathing_results['naturalness']
         ], dim=1)
-
+        
         overall_naturalness = self.fusion_layer(naturalness_scores)
-
+        
         # Final naturalness considering coherence
         final_naturalness = (overall_naturalness + coherence_score) / 2
-
+        
         return {
             'heartbeat': heartbeat_results,
             'blood_flow': blood_flow_results,
