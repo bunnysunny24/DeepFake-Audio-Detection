@@ -1,5 +1,6 @@
 from multi_modal_model import MultiModalDeepfakeModel
 from dataset_loader import get_data_loaders, get_transforms, get_transforms_enhanced
+from losses import MultiTaskLoss, WeightedFocalLoss
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -451,6 +452,7 @@ class DeepfakeTrainer:
     def __init__(self, config):
         """Initialize the trainer with the given configuration."""
         self.config = config
+        self.debug = getattr(config, 'debug', False)  # Add debug attribute with default False
         self.device = torch.device(config.device if torch.cuda.is_available() else "cpu")
         self.amp_enabled = config.amp_enabled and self.device.type == 'cuda'
         self.distributed = config.distributed and torch.cuda.is_available() and torch.cuda.device_count() > 1
@@ -668,12 +670,64 @@ class DeepfakeTrainer:
         print(f"Data loaders created: {len(self.train_loader)} train batches, "
               f"{len(self.val_loader)} validation batches, {len(self.test_loader)} test batches")
     
+    def configure_anti_overfitting(self):
+        """Configure anti-overfitting measures and hyperparameters."""
+        # Default anti-overfitting settings
+        self.config.dropout_rate = getattr(self.config, 'dropout_rate', 0.5)
+        self.config.weight_decay = getattr(self.config, 'weight_decay', 0.01)
+        self.config.gradient_clip = getattr(self.config, 'gradient_clip', 1.0)
+        self.config.label_smoothing = getattr(self.config, 'label_smoothing', 0.1)
+        
+        # Early stopping configuration
+        self.config.early_stopping_patience = getattr(self.config, 'early_stopping_patience', 5)
+        self.config.early_stopping_delta = getattr(self.config, 'early_stopping_delta', 0.001)
+        
+        # Mixup and CutMix augmentation
+        self.config.use_mixup = getattr(self.config, 'use_mixup', True)
+        self.config.mixup_alpha = getattr(self.config, 'mixup_alpha', 0.2)
+        self.config.use_cutmix = getattr(self.config, 'use_cutmix', True)
+        self.config.cutmix_alpha = getattr(self.config, 'cutmix_alpha', 1.0)
+        
+        # Learning rate scheduling
+        self.config.use_cosine_schedule = getattr(self.config, 'use_cosine_schedule', True)
+        self.config.warmup_epochs = getattr(self.config, 'warmup_epochs', 5)
+        
+        # Stochastic Weight Averaging
+        self.config.use_swa = getattr(self.config, 'use_swa', True)
+        self.config.swa_start = getattr(self.config, 'swa_start', 10)
+        self.config.swa_freq = getattr(self.config, 'swa_freq', 5)
+        
+        if self.debug:
+            print("Anti-overfitting configuration:")
+            print(f"Dropout rate: {self.config.dropout_rate}")
+            print(f"Weight decay: {self.config.weight_decay}")
+            print(f"Gradient clipping: {self.config.gradient_clip}")
+            print(f"Label smoothing: {self.config.label_smoothing}")
+            print(f"Early stopping patience: {self.config.early_stopping_patience}")
+    
     def setup_model(self):
         """Initialize model, loss function, optimizer, and scheduler."""
         print(f"Initializing model on {self.device}...")
         
+        # Calculate class weights based on dataset distribution
+        if not hasattr(self, 'class_weights'):
+            # Count samples per class in training set
+            real_count = sum(1 for _, label in self.train_dataset if label == 0)
+            fake_count = sum(1 for _, label in self.train_dataset if label == 1)
+            total = real_count + fake_count
+            
+            # Calculate balanced weights
+            weight_real = total / (2 * real_count)
+            weight_fake = total / (2 * fake_count)
+            
+            self.class_weights = torch.tensor([weight_real, weight_fake])
+            print(f"Calculated class weights: Real={weight_real:.4f}, Fake={weight_fake:.4f}")
+        
         # Move class weights to device
-        self.class_weights = self.class_weights.to(self.device) if self.class_weights is not None else None
+        self.class_weights = self.class_weights.to(self.device)
+        
+        # Configure anti-overfitting measures
+        self.configure_anti_overfitting()
         
         # Initialize model
         # Force enable skin color analysis
@@ -758,7 +812,27 @@ class DeepfakeTrainer:
         
         # Initialize loss function with class weights for imbalanced data
         if self.class_weights is not None and self.config.use_weighted_loss:
-            self.criterion = nn.CrossEntropyLoss(weight=self.class_weights)
+            # Initialize multi-task loss with class weights and regularization
+            from losses import MultiTaskLoss
+            # Initialize multi-task loss with weighted focal loss and regularization
+            # Calculate balanced weights for deepfake type classes if enabled
+            type_class_weights = None
+            if self.config.detect_deepfake_type:
+                type_counts = [0] * self.config.num_deepfake_types
+                type_total = 0
+                # Initialize uniform weights for deepfake types
+                type_class_weights = torch.ones(self.config.num_deepfake_types, device=self.device)
+                
+            self.criterion = MultiTaskLoss(
+                class_weights=self.class_weights,
+                type_class_weights=type_class_weights,
+                lambda_reg=0.1,  # Weight for regularization losses
+                lambda_aux=0.2   # Weight for auxiliary tasks like deepfake type classification
+            ).to(self.device)
+            
+            if self.debug:
+                print(f"Initialized MultiTaskLoss with class weights: {self.class_weights}")
+                print(f"Lambda reg: {0.1}, Lambda aux: {0.2}")
             print(f"Using weighted CrossEntropyLoss with weights: {self.class_weights}")
         else:
             self.criterion = nn.CrossEntropyLoss()
@@ -888,21 +962,41 @@ class DeepfakeTrainer:
                         # Add numerical stability to outputs
                         outputs = torch.clamp(outputs, min=-50, max=50)  # Prevent extreme values
                         
-                        loss = self.criterion(outputs, labels)
+                        # Prepare auxiliary outputs and targets
+                        aux_outputs = {}
+                        aux_targets = {}
+                        
+                        # Add deepfake type classification if enabled
+                        if self.config.detect_deepfake_type and 'deepfake_type' in results:
+                            aux_outputs['deepfake_type'] = results['deepfake_type']
+                            if 'deepfake_type' in batch and batch['deepfake_type'] is not None:
+                                aux_targets['deepfake_type'] = batch['deepfake_type']
+                        
+                        # Calculate multi-task loss with all components
+                        loss, loss_components = self.criterion(outputs, labels, aux_outputs, aux_targets)
+                        
+                        # Log loss components and other metrics
+                        if self.config.use_wandb and self.is_main_process:
+                            metrics_dict = {
+                                f'loss/{name}': value.item() for name, value in loss_components.items()
+                            }
+                            # Add prediction probabilities
+                            probs = torch.softmax(outputs, dim=1)
+                            metrics_dict.update({
+                                'predictions/fake_prob_mean': probs[:, 1].mean().item(),
+                                'predictions/fake_prob_std': probs[:, 1].std().item(),
+                                'predictions/real_prob_mean': probs[:, 0].mean().item(),
+                                'predictions/real_prob_std': probs[:, 0].std().item(),
+                            })
+                            wandb.log(metrics_dict, step=self.global_step)
                         
                         # Check for NaN in loss
                         if torch.isnan(loss):
                             print(f"[ERROR] NaN loss detected at batch {batch_idx}")
                             print(f"[DEBUG] Labels: {labels}")
                             print(f"[DEBUG] Outputs: {outputs}")
+                            print(f"[DEBUG] Loss components: {loss_components}")
                             continue
-                        
-                        # Add regularization for deepfake type if enabled
-                        if self.config.detect_deepfake_type and 'deepfake_type' in results and results['deepfake_type'] is not None:
-                            if 'deepfake_type' in batch and batch['deepfake_type'] is not None:
-                                deepfake_type_loss = nn.CrossEntropyLoss()(results['deepfake_type'], batch['deepfake_type'])
-                                if not torch.isnan(deepfake_type_loss):
-                                    loss += self.config.deepfake_type_weight * deepfake_type_loss
                     
                     # Backward pass with scaler
                     self.scaler.scale(loss).backward()
