@@ -8,13 +8,6 @@ import numpy as np
 from typing import List, Dict, Tuple, Optional, Union
 import torch.nn.functional as F
 import timm
-
-# Import regularization components
-from layers import (
-    GaussianNoise, StochasticDepth, FeatureDropout,
-    MixupLayer, CutMixLayer, LabelSmoothing
-)
-from regularization import RegularizationConfig
 # Additional imports for enhanced features
 import cv2
 import librosa
@@ -2070,8 +2063,7 @@ class MultiModalDeepfakeModel(nn.Module):
                  enable_explainability=True, fusion_type='attention', 
                  backbone_visual='efficientnet', backbone_audio='wav2vec2',
                  use_spectrogram=True, detect_deepfake_type=True, num_deepfake_types=7,
-                 debug=False, enable_skin_color_analysis=True, enable_advanced_physiological=True,
-                 reg_config: Optional[RegularizationConfig] = None):
+                 debug=False, enable_skin_color_analysis=True, enable_advanced_physiological=True):
                  
         super(MultiModalDeepfakeModel, self).__init__()
         self.debug = debug
@@ -2080,22 +2072,8 @@ class MultiModalDeepfakeModel(nn.Module):
         self.fusion_type = fusion_type
         self.use_spectrogram = use_spectrogram
         self.detect_deepfake_type = detect_deepfake_type
-        self.enable_skin_color_analysis = enable_skin_color_analysis
-        self.enable_advanced_physiological = enable_advanced_physiological
-        
-        # Initialize regularization
-        self.reg_config = reg_config or RegularizationConfig()
-        
-        # Regularization layers
-        self.gaussian_noise = GaussianNoise(std=self.reg_config.gaussian_noise_std)
-        self.feature_dropout = FeatureDropout(drop_prob=self.reg_config.feature_dropout_rate)
-        self.stochastic_depth = StochasticDepth(drop_prob=self.reg_config.stochastic_depth_prob)
-        self.spatial_dropout = nn.Dropout2d(p=self.reg_config.spatial_dropout_rate)
-        
-        # Initialize training-specific layers
-        self.mixup = MixupLayer(alpha=self.reg_config.mixup_alpha)
-        self.cutmix = CutMixLayer(alpha=self.reg_config.cutmix_alpha)
-        self.label_smoothing = LabelSmoothing(smoothing=self.reg_config.label_smoothing)
+        self.enable_skin_color_analysis = enable_skin_color_analysis  # Memory optimization parameter
+        self.enable_advanced_physiological = enable_advanced_physiological  # Advanced physiological analysis
         
         # Automatically adjust feature dimensions based on selected backbones
         if backbone_visual == 'efficientnet':
@@ -2117,48 +2095,24 @@ class MultiModalDeepfakeModel(nn.Module):
             visual_out_dim = 1280
             
             # Freeze early layers to prevent gradient issues during initial training
-            # Initialize backbone
-            if backbone_visual == 'efficientnet':
-                self.visual_model = efficientnet_b0(weights=EfficientNet_B0_Weights.IMAGENET1K_V1)
-                self.visual_model.classifier = nn.Identity()
-                visual_out_dim = 1280
-                
-                # Freeze early layers
-                for i, (name, param) in enumerate(self.visual_model.named_parameters()):
-                    if i < 20:  # Freeze first 20 layers
-                        param.requires_grad = False
-                        
-            elif backbone_visual == 'swin':
-                self.visual_model = swin_v2_b(weights='IMAGENET1K_V1')
-                self.visual_model.head = nn.Identity()
-                visual_out_dim = 1024
-                
-                # Freeze early layers
-                for i, (name, param) in enumerate(self.visual_model.named_parameters()):
-                    if i < 20:
-                        param.requires_grad = False
-                        
-            else:  # Default to EfficientNet
-                self.visual_model = efficientnet_b0(weights=EfficientNet_B0_Weights.IMAGENET1K_V1)
-                self.visual_model.classifier = nn.Identity()
-                visual_out_dim = 1280
-                
-                # Freeze early layers
-                for i, (name, param) in enumerate(self.visual_model.named_parameters()):
-                    if i < 20:
-                        param.requires_grad = False
+            for i, (name, param) in enumerate(self.visual_model.named_parameters()):
+                if i < 20:  # Freeze first 20 layers
+                    param.requires_grad = False
+                    
+        elif backbone_visual == 'swin':
+            self.visual_model = swin_v2_b(weights='IMAGENET1K_V1')
+            self.visual_model.head = nn.Identity()
+            visual_out_dim = 1024
             
-            # Anti-overfitting measures
-            self.dropout_rate = 0.5  # Adjustable dropout rate
-            self.spatial_dropout = nn.Dropout2d(p=0.2)  # Spatial dropout for convolutional features
-            self.feature_dropout = nn.Dropout(p=self.dropout_rate)
-            self.gaussian_noise = GaussianNoise(0.1)  # Add small Gaussian noise during training
-            
-            # Layer normalization for better generalization
-            self.layer_norm = nn.LayerNorm(transformer_dim)
-            
-            # L2 regularization is handled through weight_decay in optimizer
-            self.regularization_strength = 0.01  # L2 regularization strength
+            # Freeze early layers
+            for i, (name, param) in enumerate(self.visual_model.named_parameters()):
+                if i < 20:
+                    param.requires_grad = False
+                    
+        else:  # Default to EfficientNet
+            self.visual_model = efficientnet_b0(weights=EfficientNet_B0_Weights.IMAGENET1K_V1)
+            self.visual_model.classifier = nn.Identity()
+            visual_out_dim = 1280
             
             # Freeze early layers
             for i, (name, param) in enumerate(self.visual_model.named_parameters()):
@@ -2350,41 +2304,24 @@ class MultiModalDeepfakeModel(nn.Module):
             combined_dim += 128 * 4  # Original: ELA + metadata + sync + face embeddings
             combined_dim += 512      # Additional features from new modules
         
-        # Enhanced main classifier with batch normalization and stronger regularization
+        # Main classifier
         self.classifier = nn.Sequential(
             nn.Linear(combined_dim, 512),
-            nn.BatchNorm1d(512),
             nn.ReLU(),
             nn.Dropout(0.5),
-            
             nn.Linear(512, 256),
-            nn.BatchNorm1d(256),
-            nn.ReLU(),
-            nn.Dropout(0.4),
-            
-            nn.Linear(256, 128),
-            nn.BatchNorm1d(128),
             nn.ReLU(),
             nn.Dropout(0.3),
-            
-            nn.Linear(128, num_classes)
+            nn.Linear(256, num_classes)
         )
         
         # Deepfake type classifier (optional)
         if self.detect_deepfake_type:
-            # Enhanced deepfake type classifier with regularization
             self.deepfake_type_classifier = nn.Sequential(
                 nn.Linear(combined_dim, 256),
-                nn.BatchNorm1d(256),
-                nn.ReLU(),
-                nn.Dropout(0.4),
-                
-                nn.Linear(256, 128),
-                nn.BatchNorm1d(128),
                 nn.ReLU(),
                 nn.Dropout(0.3),
-                
-                nn.Linear(128, num_deepfake_types)
+                nn.Linear(256, num_deepfake_types)
             )
 
         # Feature adapter for dimension mismatch handling
@@ -3448,80 +3385,85 @@ class MultiModalDeepfakeModel(nn.Module):
             return torch.zeros((batch_size, num_frames, 40), device=facial_landmarks.device)
 
     def extract_skin_color(self, video_frames):
-        """Extract average skin color from face regions for pulse analysis."""
-        batch_size = video_frames.shape[0]
-        num_frames = video_frames.shape[1]
-        device = video_frames.device
-        skin_colors = torch.zeros((batch_size, num_frames, 3), device=device)
-        
-        if not hasattr(self, 'skin_analyzer'):
-            from skin_analyzer import SkinColorAnalyzer
-            self.skin_analyzer = SkinColorAnalyzer(feature_dim=32).to(device)
+        """Extract average skin color from face regions for pulse analysis - Memory Optimized."""
+        batch_size, num_frames, C, H, W = video_frames.shape
         
         try:
-            # Use skin analyzer to process all frames at once
-            # Ensure video frames are in the correct format [batch_size, num_frames, channels, height, width]
-            if video_frames.dim() == 5 and video_frames.size(2) == 3:
-                skin_colors = self.skin_analyzer(video_frames)
-            else:
-                # Reshape if necessary
-                video_frames = video_frames.view(batch_size, num_frames, 3, video_frames.size(-2), video_frames.size(-1))
-                skin_colors = self.skin_analyzer(video_frames)
+            # Memory-optimized approach: Process in smaller chunks and use GPU operations
+            chunk_size = min(4, num_frames)  # Process 4 frames at a time max
+            device = video_frames.device
             
-            # Process frame chunks
-            chunk_size = 10  # Process 10 frames at a time to manage memory
-            for chunk_start in range(0, num_frames, chunk_size):
-                chunk_end = min(chunk_start + chunk_size, num_frames)
-                
-                for b in range(batch_size):
+            # Pre-allocate result tensor
+            skin_colors = torch.zeros((batch_size, num_frames, 3), device=device, dtype=torch.float32)
+            
+            for b in range(batch_size):
+                for chunk_start in range(0, num_frames, chunk_size):
+                    chunk_end = min(chunk_start + chunk_size, num_frames)
+                    
+                    # Process chunk of frames
+                    frame_chunk = video_frames[b, chunk_start:chunk_end]  # [chunk_size, C, H, W]
+                    
+                    # Downsample frames for skin detection to save memory (224x224 -> 56x56)
+                    small_frames = torch.nn.functional.interpolate(
+                        frame_chunk, size=(56, 56), mode='bilinear', align_corners=False
+                    )  # [chunk_size, 3, 56, 56]
+                    
+                    # Simple skin detection using RGB values on GPU
+                    r = small_frames[:, 0].float()  # [chunk_size, 56, 56] - ensure float type
+                    g = small_frames[:, 1].float()
+                    b = small_frames[:, 2].float()
+                    
+                    # Vectorized skin detection - ensure boolean tensor
+                    skin_mask = ((r > 0.4) & (g > 0.28) & (b > 0.2) & 
+                                (r > g) & (r > b) & 
+                                ((r - g) > 0.1) & (torch.abs(r - g) > 0.15)).bool()
+                    
+                    # Extract average colors for each frame in chunk
                     for i, t in enumerate(range(chunk_start, chunk_end)):
-                        try:
-                            mask = skin_mask[i] if 'skin_mask' in locals() else None
-                            if mask is not None:
-                                if not mask.dtype == torch.bool:
-                                    mask = mask.bool()
-                                
-                                if self.debug:
-                                    print(f"[SKIN] i type: {type(i)}, r shape: {getattr(r, 'shape', None) if 'r' in locals() else None}")
-                                
-                                if not ('r' in locals() and isinstance(r, torch.Tensor) and r.shape[0] > i and r.shape[1:] == (56, 56)):
-                                    skin_colors[b, t] = torch.tensor([0.5, 0.4, 0.35], device=device, dtype=torch.float32)
-                                    continue
-                                
-                                if self.debug:
-                                    print(f"[SKIN] i type: {type(i)}, r shape: {r.shape}, idx: {i}")
-                                
-                                r_frame = r[i]
-                                g_frame = g[i]
-                                b_frame = b[i]
-                                
-                                # Ensure mask is boolean
-                                mask = mask.to(dtype=torch.bool)
-                                
-                                # Calculate means directly using the boolean mask
-                                if mask.any():  # Check if any True values exist in mask
-                                    avg_r = torch.mean(r_frame[mask])
-                                    avg_g = torch.mean(g_frame[mask])
-                                    avg_b = torch.mean(b_frame[mask])
+                        mask = skin_mask[i]
+                        if not mask.dtype == torch.bool:
+                            mask = mask.bool()
+                        idx = int(i) if not isinstance(i, int) else i
+                        if self.debug:
+                            print(f"[SKIN] i type: {type(i)}, idx type: {type(idx)}, r type: {type(r)}, r shape: {getattr(r, 'shape', None)}")
+                                # Defensive: check shapes and types
+                        if not (isinstance(r, torch.Tensor) and r.shape[0] > idx and r.shape[1:] == (56, 56)):
+                            skin_colors[b, t] = torch.tensor([0.5, 0.4, 0.35], device=device, dtype=torch.float32)
+                            continue
+                        if self.debug:
+                            print(f"[SKIN] i type: {type(i)}, r shape: {r.shape}, idx: {idx}")
+                        if mask.any():
+                            try:
+                                r_frame = r[idx] if isinstance(idx, int) else r[int(idx)]
+                                g_frame = g[idx] if isinstance(idx, int) else g[int(idx)]
+                                b_frame = b[idx] if isinstance(idx, int) else b[int(idx)]
+                                mask_float = mask.float()
+                                r_masked = r_frame * mask_float
+                                g_masked = g_frame * mask_float
+                                b_masked = b_frame * mask_float
+                                mask_sum = mask_float.sum()
+                                if mask_sum > 0:
+                                    avg_r = r_masked.sum() / mask_sum
+                                    avg_g = g_masked.sum() / mask_sum
+                                    avg_b = b_masked.sum() / mask_sum
                                     skin_colors[b, t] = torch.stack([avg_r, avg_g, avg_b])
                                 else:
-                                    # Fallback values if no skin pixels detected
                                     skin_colors[b, t] = torch.tensor([0.5, 0.4, 0.35], device=device, dtype=torch.float32)
-                        
-                        except Exception as mask_error:
-                            if self.debug:
-                                print(f"Error in skin color calculation: {mask_error}")
-                            # Fallback values on error
+                            except Exception as mask_error:
+                                if self.debug:
+                                    print(f"Error in skin color calculation: {mask_error}")
+                                skin_colors[b, t] = torch.tensor([0.5, 0.4, 0.35], device=device, dtype=torch.float32)
+                        else:
                             skin_colors[b, t] = torch.tensor([0.5, 0.4, 0.35], device=device, dtype=torch.float32)
-                
-                # Clear intermediate tensors to free memory
-                for var in ['frame_chunk', 'small_frames', 'r', 'g', 'b', 'skin_mask']:
-                    if var in locals():
-                        del locals()[var]
-                
-                # Force garbage collection if needed
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                    
+                    # Clear intermediate tensors to free memory
+                    del frame_chunk, small_frames, r, g, b, skin_mask
+                    
+                    # Force garbage collection if needed
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+            
+            return skin_colors
         
         except Exception as e:
             if self.debug:
@@ -3530,9 +3472,7 @@ class MultiModalDeepfakeModel(nn.Module):
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             # Return zeros with shape [batch_size, num_frames, 3] (RGB values)
-            skin_colors = torch.zeros((batch_size, num_frames, 3), device=device)
-        
-        return skin_colors
+            return torch.zeros((batch_size, num_frames, 3), device=video_frames.device)
 
     def check_eye_blinking(self, frame):
         """Check if eyes are blinking in the given frame using face mesh."""
