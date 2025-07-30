@@ -8,6 +8,13 @@ import numpy as np
 from typing import List, Dict, Tuple, Optional, Union
 import torch.nn.functional as F
 import timm
+
+# Import regularization components
+from layers import (
+    GaussianNoise, StochasticDepth, FeatureDropout,
+    MixupLayer, CutMixLayer, LabelSmoothing
+)
+from regularization import RegularizationConfig
 # Additional imports for enhanced features
 import cv2
 import librosa
@@ -2063,7 +2070,8 @@ class MultiModalDeepfakeModel(nn.Module):
                  enable_explainability=True, fusion_type='attention', 
                  backbone_visual='efficientnet', backbone_audio='wav2vec2',
                  use_spectrogram=True, detect_deepfake_type=True, num_deepfake_types=7,
-                 debug=False, enable_skin_color_analysis=True, enable_advanced_physiological=True):
+                 debug=False, enable_skin_color_analysis=True, enable_advanced_physiological=True,
+                 reg_config: Optional[RegularizationConfig] = None):
                  
         super(MultiModalDeepfakeModel, self).__init__()
         self.debug = debug
@@ -2072,8 +2080,22 @@ class MultiModalDeepfakeModel(nn.Module):
         self.fusion_type = fusion_type
         self.use_spectrogram = use_spectrogram
         self.detect_deepfake_type = detect_deepfake_type
-        self.enable_skin_color_analysis = enable_skin_color_analysis  # Memory optimization parameter
-        self.enable_advanced_physiological = enable_advanced_physiological  # Advanced physiological analysis
+        self.enable_skin_color_analysis = enable_skin_color_analysis
+        self.enable_advanced_physiological = enable_advanced_physiological
+        
+        # Initialize regularization
+        self.reg_config = reg_config or RegularizationConfig()
+        
+        # Regularization layers
+        self.gaussian_noise = GaussianNoise(std=self.reg_config.gaussian_noise_std)
+        self.feature_dropout = FeatureDropout(drop_prob=self.reg_config.feature_dropout_rate)
+        self.stochastic_depth = StochasticDepth(drop_prob=self.reg_config.stochastic_depth_prob)
+        self.spatial_dropout = nn.Dropout2d(p=self.reg_config.spatial_dropout_rate)
+        
+        # Initialize training-specific layers
+        self.mixup = MixupLayer(alpha=self.reg_config.mixup_alpha)
+        self.cutmix = CutMixLayer(alpha=self.reg_config.cutmix_alpha)
+        self.label_smoothing = LabelSmoothing(smoothing=self.reg_config.label_smoothing)
         
         # Automatically adjust feature dimensions based on selected backbones
         if backbone_visual == 'efficientnet':
@@ -2095,24 +2117,48 @@ class MultiModalDeepfakeModel(nn.Module):
             visual_out_dim = 1280
             
             # Freeze early layers to prevent gradient issues during initial training
-            for i, (name, param) in enumerate(self.visual_model.named_parameters()):
-                if i < 20:  # Freeze first 20 layers
-                    param.requires_grad = False
-                    
-        elif backbone_visual == 'swin':
-            self.visual_model = swin_v2_b(weights='IMAGENET1K_V1')
-            self.visual_model.head = nn.Identity()
-            visual_out_dim = 1024
+            # Initialize backbone
+            if backbone_visual == 'efficientnet':
+                self.visual_model = efficientnet_b0(weights=EfficientNet_B0_Weights.IMAGENET1K_V1)
+                self.visual_model.classifier = nn.Identity()
+                visual_out_dim = 1280
+                
+                # Freeze early layers
+                for i, (name, param) in enumerate(self.visual_model.named_parameters()):
+                    if i < 20:  # Freeze first 20 layers
+                        param.requires_grad = False
+                        
+            elif backbone_visual == 'swin':
+                self.visual_model = swin_v2_b(weights='IMAGENET1K_V1')
+                self.visual_model.head = nn.Identity()
+                visual_out_dim = 1024
+                
+                # Freeze early layers
+                for i, (name, param) in enumerate(self.visual_model.named_parameters()):
+                    if i < 20:
+                        param.requires_grad = False
+                        
+            else:  # Default to EfficientNet
+                self.visual_model = efficientnet_b0(weights=EfficientNet_B0_Weights.IMAGENET1K_V1)
+                self.visual_model.classifier = nn.Identity()
+                visual_out_dim = 1280
+                
+                # Freeze early layers
+                for i, (name, param) in enumerate(self.visual_model.named_parameters()):
+                    if i < 20:
+                        param.requires_grad = False
             
-            # Freeze early layers
-            for i, (name, param) in enumerate(self.visual_model.named_parameters()):
-                if i < 20:
-                    param.requires_grad = False
-                    
-        else:  # Default to EfficientNet
-            self.visual_model = efficientnet_b0(weights=EfficientNet_B0_Weights.IMAGENET1K_V1)
-            self.visual_model.classifier = nn.Identity()
-            visual_out_dim = 1280
+            # Anti-overfitting measures
+            self.dropout_rate = 0.5  # Adjustable dropout rate
+            self.spatial_dropout = nn.Dropout2d(p=0.2)  # Spatial dropout for convolutional features
+            self.feature_dropout = nn.Dropout(p=self.dropout_rate)
+            self.gaussian_noise = GaussianNoise(0.1)  # Add small Gaussian noise during training
+            
+            # Layer normalization for better generalization
+            self.layer_norm = nn.LayerNorm(transformer_dim)
+            
+            # L2 regularization is handled through weight_decay in optimizer
+            self.regularization_strength = 0.01  # L2 regularization strength
             
             # Freeze early layers
             for i, (name, param) in enumerate(self.visual_model.named_parameters()):
@@ -2304,24 +2350,41 @@ class MultiModalDeepfakeModel(nn.Module):
             combined_dim += 128 * 4  # Original: ELA + metadata + sync + face embeddings
             combined_dim += 512      # Additional features from new modules
         
-        # Main classifier
+        # Enhanced main classifier with batch normalization and stronger regularization
         self.classifier = nn.Sequential(
             nn.Linear(combined_dim, 512),
+            nn.BatchNorm1d(512),
             nn.ReLU(),
             nn.Dropout(0.5),
+            
             nn.Linear(512, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Dropout(0.4),
+            
+            nn.Linear(256, 128),
+            nn.BatchNorm1d(128),
             nn.ReLU(),
             nn.Dropout(0.3),
-            nn.Linear(256, num_classes)
+            
+            nn.Linear(128, num_classes)
         )
         
         # Deepfake type classifier (optional)
         if self.detect_deepfake_type:
+            # Enhanced deepfake type classifier with regularization
             self.deepfake_type_classifier = nn.Sequential(
                 nn.Linear(combined_dim, 256),
+                nn.BatchNorm1d(256),
+                nn.ReLU(),
+                nn.Dropout(0.4),
+                
+                nn.Linear(256, 128),
+                nn.BatchNorm1d(128),
                 nn.ReLU(),
                 nn.Dropout(0.3),
-                nn.Linear(256, num_deepfake_types)
+                
+                nn.Linear(128, num_deepfake_types)
             )
 
         # Feature adapter for dimension mismatch handling
