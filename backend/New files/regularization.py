@@ -59,4 +59,3 @@ class RegularizationConfig:
         assert 0 <= self.label_smoothing < 1, "Label smoothing must be between 0 and 1"
         assert self.early_stopping_patience > 0, "Early stopping patience must be positive"
         assert self.early_stopping_delta > 0, "Early stopping delta must be positive"
-
