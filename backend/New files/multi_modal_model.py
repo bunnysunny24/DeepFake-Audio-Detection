@@ -3422,11 +3422,11 @@ class MultiModalDeepfakeModel(nn.Module):
                     for i, t in enumerate(range(chunk_start, chunk_end)):
                         mask = skin_mask[i]
                         if not mask.dtype == torch.bool:
-                            mask = mask.bool()
+                            mask = mask.to(dtype=torch.bool)
                         idx = int(i) if not isinstance(i, int) else i
                         if self.debug:
                             print(f"[SKIN] i type: {type(i)}, idx type: {type(idx)}, r type: {type(r)}, r shape: {getattr(r, 'shape', None)}")
-                                # Defensive: check shapes and types
+                        # Defensive: check shapes and types
                         if not (isinstance(r, torch.Tensor) and r.shape[0] > idx and r.shape[1:] == (56, 56)):
                             skin_colors[b, t] = torch.tensor([0.5, 0.4, 0.35], device=device, dtype=torch.float32)
                             continue
@@ -3434,9 +3434,9 @@ class MultiModalDeepfakeModel(nn.Module):
                             print(f"[SKIN] i type: {type(i)}, r shape: {r.shape}, idx: {idx}")
                         if mask.any():
                             try:
-                                r_frame = r[idx] if isinstance(idx, int) else r[int(idx)]
-                                g_frame = g[idx] if isinstance(idx, int) else g[int(idx)]
-                                b_frame = b[idx] if isinstance(idx, int) else b[int(idx)]
+                                r_frame = r[idx.long()] if not isinstance(idx, int) else r[idx]
+                                g_frame = g[idx.long()] if not isinstance(idx, int) else g[idx]
+                                b_frame = b[idx.long()] if not isinstance(idx, int) else b[idx]
                                 mask_float = mask.float()
                                 r_masked = r_frame * mask_float
                                 g_masked = g_frame * mask_float
@@ -3474,96 +3474,85 @@ class MultiModalDeepfakeModel(nn.Module):
             # Return zeros with shape [batch_size, num_frames, 3] (RGB values)
             return torch.zeros((batch_size, num_frames, 3), device=video_frames.device)
 
-    def check_eye_blinking(self, frame):
-        """Check if eyes are blinking in the given frame using face mesh."""
-        if not self.enable_face_mesh:
-            return None
-            
+    def extract_skin_color(self, video_frames):
+        """Extract average skin color from face regions for pulse analysis - Memory Optimized."""
+        batch_size, num_frames, C, H, W = video_frames.shape
         try:
-            # Convert PyTorch tensor to numpy for MediaPipe
-            frame_rgb = frame.permute(1, 2, 0).cpu().numpy()
-            
-            # Ensure frame is in correct format (0-1 float or 0-255 uint8)
-            if frame_rgb.max() <= 1.0:
-                frame_rgb = (frame_rgb * 255).astype(np.uint8)
-                
-            results = self.mp_face_mesh.process(frame_rgb)
-
-            if not results or not results.multi_face_landmarks:
-                return None
-
-            landmarks = results.multi_face_landmarks[0].landmark
-            
-            # Extract eye landmarks
-            left_eye = [landmarks[i] for i in [33, 160, 158, 133, 153, 144]]  # Key landmark indices for left eye
-            right_eye = [landmarks[i] for i in [362, 385, 387, 263, 373, 380]]  # Key landmark indices for right eye
-            
-            # Calculate eye openness ratios (vertical / horizontal)
-            def eye_aspect_ratio(eye_pts):
-                # Vertical distances
-                v1 = np.sqrt((eye_pts[1].x - eye_pts[5].x)**2 + (eye_pts[1].y - eye_pts[5].y)**2)
-                v2 = np.sqrt((eye_pts[2].x - eye_pts[4].x)**2 + (eye_pts[2].y - eye_pts[4].y)**2)
-                
-                # Horizontal distance
-                h = np.sqrt((eye_pts[0].x - eye_pts[3].x)**2 + (eye_pts[0].y - eye_pts[3].y)**2)
-                
-                # Eye aspect ratio
-                return (v1 + v2) / (2.0 * h) if h > 0 else 0
-            
-            # Calculate ratios
-            left_ear = eye_aspect_ratio(left_eye)
-            right_ear = eye_aspect_ratio(right_eye)
-            
-            # Average ratio
-            ear = (left_ear + right_ear) / 2.0
-            
-            # EAR threshold for blink detection
-            EAR_THRESHOLD = 0.2
-                
-            # Return True if eyes are blinking (eyes are closed)
-            return ear < EAR_THRESHOLD
-                
+            chunk_size = min(4, num_frames)  # Process 4 frames at a time max
+            device = video_frames.device
+            skin_colors = torch.zeros((batch_size, num_frames, 3), device=device, dtype=torch.float32)
+            for b in range(batch_size):
+                for chunk_start in range(0, num_frames, chunk_size):
+                    chunk_end = min(chunk_start + chunk_size, num_frames)
+                    frame_chunk = video_frames[b, chunk_start:chunk_end]  # [chunk_size, C, H, W]
+                    small_frames = torch.nn.functional.interpolate(
+                        frame_chunk, size=(56, 56), mode='bilinear', align_corners=False
+                    )  # [chunk_size, 3, 56, 56]
+                    r = small_frames[:, 0].float()
+                    g = small_frames[:, 1].float()
+                    b_ = small_frames[:, 2].float()
+                    skin_mask = ((r > 0.4) & (g > 0.28) & (b_ > 0.2) &
+                                (r > g) & (r > b_) &
+                                ((r - g) > 0.1) & (torch.abs(r - g) > 0.15)).bool()
+                    for i, t in enumerate(range(chunk_start, chunk_end)):
+                        mask = skin_mask[i]
+                        if self.debug:
+                            print(f"[SKIN-DEBUG] b={b}, t={t}, i={i}, mask dtype={mask.dtype}, mask shape={mask.shape}, r shape={r.shape}, g shape={g.shape}, b_ shape={b_.shape}")
+                        if not mask.dtype == torch.bool:
+                            print(f"[SKIN-ERROR] mask is not bool at b={b}, t={t}, i={i}, dtype={mask.dtype}")
+                        idx = int(i) if not isinstance(i, int) else i
+                        if self.debug:
+                            print(f"[SKIN-DEBUG] idx={idx}, r[idx] type={type(r)}, r[idx] shape={r[idx].shape if isinstance(r, torch.Tensor) else 'N/A'}")
+                        if not (isinstance(r, torch.Tensor) and r.shape[0] > idx and r.shape[1:] == (56, 56)):
+                            print(f"[SKIN-ERROR] r tensor shape issue at b={b}, t={t}, idx={idx}, r shape={r.shape}")
+                        if self.debug:
+                            print(f"[SKIN-DEBUG] mask.any()={mask.any()}, mask.sum()={mask.sum().item()}")
+                        try:
+                            if self.debug:
+                                print(f"[SKIN-DEBUG] About to index r[{idx}][mask] (r[{idx}].shape={r[idx].shape}, mask.shape={mask.shape}, mask dtype={mask.dtype})")
+                            if mask.any():
+                                # This is the line that may throw the error
+                                try:
+                                    r_masked = r[idx][mask]
+                                    g_masked = g[idx][mask]
+                                    b_masked = b_[idx][mask]
+                                    if self.debug:
+                                        print(f"[SKIN-DEBUG] r_masked shape: {r_masked.shape}, g_masked shape: {g_masked.shape}, b_masked shape: {b_masked.shape}")
+                                except Exception as mask_index_error:
+                                    print(f"[SKIN-ERROR] Exception during masking at b={b}, t={t}, idx={idx}: {mask_index_error}")
+                                    print(f"[SKIN-ERROR] mask type: {type(mask)}, mask dtype: {mask.dtype}, mask shape: {mask.shape}")
+                                    print(f"[SKIN-ERROR] r[idx] type: {type(r)}, r[idx] shape: {r[idx].shape if isinstance(r, torch.Tensor) else 'N/A'}")
+                                    print(f"[SKIN-ERROR] mask unique values: {mask.unique() if hasattr(mask, 'unique') else 'N/A'}")
+                                    raise
+                                r_mean = r_masked.mean().item()
+                                g_mean = g_masked.mean().item()
+                                b_mean = b_masked.mean().item()
+                                skin_colors[b, t] = torch.tensor([r_mean, g_mean, b_mean], device=device)
+                                if self.debug:
+                                    print(f"[SKIN-DEBUG] b={b}, t={t}, r_mean={r_mean}, g_mean={g_mean}, b_mean={b_mean}")
+                            else:
+                                r_mean = r[idx].mean().item()
+                                g_mean = g[idx].mean().item()
+                                b_mean = b_[idx].mean().item()
+                                skin_colors[b, t] = torch.tensor([r_mean, g_mean, b_mean], device=device)
+                                if self.debug:
+                                    print(f"[SKIN-DEBUG] b={b}, t={t}, fallback r_mean={r_mean}, g_mean={g_mean}, b_mean={b_mean}")
+                        except Exception as inner_e:
+                            print(f"[SKIN-ERROR] Exception at b={b}, t={t}, idx={idx}: {inner_e}")
+                            print(f"[SKIN-ERROR] mask type: {type(mask)}, mask dtype: {mask.dtype}, mask shape: {mask.shape}")
+                            print(f"[SKIN-ERROR] r[idx] type: {type(r)}, r[idx] shape: {r[idx].shape if isinstance(r, torch.Tensor) else 'N/A'}")
+                            print(f"[SKIN-ERROR] mask unique values: {mask.unique() if hasattr(mask, 'unique') else 'N/A'}")
+                    del frame_chunk, small_frames, r, g, b_, skin_mask
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+            return skin_colors
         except Exception as e:
-            if self.debug:
-                print(f"Error in eye blinking detection: {e}")
-            return None
-
-    def deepfake_check_video(self, video_frames, original_video_frames, fake_periods, timestamps, 
-                            original_audio=None, current_audio=None, ela_features=None, 
-                            metadata_features=None, temporal_consistency=None, av_sync_features=None,
-                            facial_landmarks=None, component_contributions=None):
-        """
-        Comprehensive deepfake check by analyzing multiple forensic signals.
-        
-        Returns the number of inconsistencies detected and explanation data.
-        """
-        inconsistencies = {
-            'video_frame_diff': 0,
-            'audio_diff': 0,
-            'ela_analysis': 0,
-            'temporal_inconsistency': 0,
-            'metadata_analysis': 0,
-            'av_sync_issues': 0,
-            'eye_blinking': 0,
-            'facial_dynamics': 0,
-            'physiological': 0,
-            'lighting_consistency': 0,
-            'frequency_domain': 0,
-            'micro_expressions': 0,
-            'head_pose': 0,
-            'lip_sync': 0,
-            'voice_authenticity': 0,
-            'gan_fingerprint': 0,
-            'texture_analysis': 0
-        }
-        total_checks = 0
-        explanation = {
-            'detection_scores': {},
-            'highlighted_regions': [],
-            'issues_found': [],
-            'confidence': 0.0,
-            'evidence': {}
-        }
+            print(f"Error extracting skin colors: {e}")
+            import traceback
+            traceback.print_exc()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            return torch.zeros((batch_size, num_frames, 3), device=video_frames.device)
 
         try:
             # Check video inconsistencies if original frames are available
