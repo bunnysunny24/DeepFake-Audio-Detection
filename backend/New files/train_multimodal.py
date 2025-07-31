@@ -25,12 +25,7 @@ import shutil
 import torch.multiprocessing as mp
 import traceback
 
-# Configure memory management for CUDA
-if torch.cuda.is_available():
-    # Set memory fraction to prevent allocating all GPU memory at once
-    torch.cuda.set_per_process_memory_fraction(0.5)
-    # Enable memory growth instead of pre-allocating all memory
-    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+
 
 mp.set_start_method('spawn', force=True)
 
@@ -1651,7 +1646,7 @@ def parse_args():
     parser.add_argument('--temporal_features', action='store_true', help='Compute temporal consistency features')
     parser.add_argument('--enhanced_preprocessing', action='store_true', help='Enable enhanced preprocessing features (physiological, etc.)')
     parser.add_argument('--enhanced_augmentation', action='store_true', help='Enable enhanced data augmentation')
-    parser.add_argument('--enable_skin_color_analysis', action='store_true', help='Enable skin color analysis (memory intensive)')
+    parser.add_argument('--enable_skin_color_analysis', action='store_true', default=True, help='Enable skin color analysis (memory intensive, enabled by default)')
     parser.add_argument('--enable_advanced_physiological', action='store_true', help='Enable advanced physiological analysis (heartbeat, blood flow, breathing)')
     parser.add_argument('--physiological_fps', type=int, default=30, help='Frame rate for physiological signal analysis')
     parser.add_argument('--resume_checkpoint', type=str, default=None, help='Path to checkpoint file to resume training from')
