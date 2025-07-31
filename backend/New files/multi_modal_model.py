@@ -3492,60 +3492,37 @@ class MultiModalDeepfakeModel(nn.Module):
                     g = small_frames[:, 1].float()
                     b_ = small_frames[:, 2].float()
                     skin_mask = ((r > 0.4) & (g > 0.28) & (b_ > 0.2) &
-                                (r > g) & (r > b_) &
-                                ((r - g) > 0.1) & (torch.abs(r - g) > 0.15)).bool()
+                                 (r > g) & (r > b_) &
+                                 ((r - g) > 0.1) & (torch.abs(r - g) > 0.15)).bool()
+
                     for i, t in enumerate(range(chunk_start, chunk_end)):
                         mask = skin_mask[i]
-                        if self.debug:
-                            print(f"[SKIN-DEBUG] b={b}, t={t}, i={i}, mask dtype={mask.dtype}, mask shape={mask.shape}, r shape={r.shape}, g shape={g.shape}, b_ shape={b_.shape}")
-                        if not mask.dtype == torch.bool:
-                            print(f"[SKIN-ERROR] mask is not bool at b={b}, t={t}, i={i}, dtype={mask.dtype}")
                         idx = int(i) if not isinstance(i, int) else i
-                        if self.debug:
-                            print(f"[SKIN-DEBUG] idx={idx}, r[idx] type={type(r)}, r[idx] shape={r[idx].shape if isinstance(r, torch.Tensor) else 'N/A'}")
-                        if not (isinstance(r, torch.Tensor) and r.shape[0] > idx and r.shape[1:] == (56, 56)):
-                            print(f"[SKIN-ERROR] r tensor shape issue at b={b}, t={t}, idx={idx}, r shape={r.shape}")
-                        if self.debug:
-                            print(f"[SKIN-DEBUG] mask.any()={mask.any()}, mask.sum()={mask.sum().item()}")
                         try:
-                            if self.debug:
-                                print(f"[SKIN-DEBUG] About to index r[{idx}][mask] (r[{idx}].shape={r[idx].shape}, mask.shape={mask.shape}, mask dtype={mask.dtype})")
                             if mask.any():
-                                # This is the line that may throw the error
                                 try:
                                     r_masked = r[idx][mask]
                                     g_masked = g[idx][mask]
                                     b_masked = b_[idx][mask]
-                                    if self.debug:
-                                        print(f"[SKIN-DEBUG] r_masked shape: {r_masked.shape}, g_masked shape: {g_masked.shape}, b_masked shape: {b_masked.shape}")
                                 except Exception as mask_index_error:
                                     print(f"[SKIN-ERROR] Exception during masking at b={b}, t={t}, idx={idx}: {mask_index_error}")
-                                    print(f"[SKIN-ERROR] mask type: {type(mask)}, mask dtype: {mask.dtype}, mask shape: {mask.shape}")
-                                    print(f"[SKIN-ERROR] r[idx] type: {type(r)}, r[idx] shape: {r[idx].shape if isinstance(r, torch.Tensor) else 'N/A'}")
-                                    print(f"[SKIN-ERROR] mask unique values: {mask.unique() if hasattr(mask, 'unique') else 'N/A'}")
                                     raise
                                 r_mean = r_masked.mean().item()
                                 g_mean = g_masked.mean().item()
                                 b_mean = b_masked.mean().item()
-                                skin_colors[b, t] = torch.tensor([r_mean, g_mean, b_mean], device=device)
-                                if self.debug:
-                                    print(f"[SKIN-DEBUG] b={b}, t={t}, r_mean={r_mean}, g_mean={g_mean}, b_mean={b_mean}")
                             else:
                                 r_mean = r[idx].mean().item()
                                 g_mean = g[idx].mean().item()
                                 b_mean = b_[idx].mean().item()
-                                skin_colors[b, t] = torch.tensor([r_mean, g_mean, b_mean], device=device)
-                                if self.debug:
-                                    print(f"[SKIN-DEBUG] b={b}, t={t}, fallback r_mean={r_mean}, g_mean={g_mean}, b_mean={b_mean}")
+                            skin_colors[b, t] = torch.tensor([r_mean, g_mean, b_mean], device=device)
                         except Exception as inner_e:
                             print(f"[SKIN-ERROR] Exception at b={b}, t={t}, idx={idx}: {inner_e}")
-                            print(f"[SKIN-ERROR] mask type: {type(mask)}, mask dtype: {mask.dtype}, mask shape: {mask.shape}")
-                            print(f"[SKIN-ERROR] r[idx] type: {type(r)}, r[idx] shape: {r[idx].shape if isinstance(r, torch.Tensor) else 'N/A'}")
-                            print(f"[SKIN-ERROR] mask unique values: {mask.unique() if hasattr(mask, 'unique') else 'N/A'}")
+                            raise
                     del frame_chunk, small_frames, r, g, b_, skin_mask
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
             return skin_colors
+
         except Exception as e:
             print(f"Error extracting skin colors: {e}")
             import traceback
