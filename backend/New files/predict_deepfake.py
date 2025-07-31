@@ -18,7 +18,7 @@ def extract_video_frames(video_path, num_frames=32, resize=(224, 224)):
             continue
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         frame = cv2.resize(frame, resize)
-        frames.append(torch.tensor(frame).permute(2, 0, 1).float() / 255.)  # [C, H, W]
+        frames.append(torch.tensor(frame, device='cuda').permute(2, 0, 1).float() / 255.)  # [C, H, W]
     cap.release()
     if len(frames) == 0:
         raise RuntimeError("No frames extracted from video.")
@@ -51,10 +51,10 @@ def extract_audio_tensor(video_path, audio_length=8000):
         audio = audio[start:start + audio_length]
     else:
         audio = np.pad(audio, (0, audio_length - len(audio)), mode='constant')
-    return torch.tensor(audio, dtype=torch.float32)  # [audio_length]
+    return torch.tensor(audio, dtype=torch.float32, device='cuda')  # [audio_length]
 
 def load_model(model_path, device):
-    checkpoint = torch.load(model_path, map_location=device)
+    checkpoint = torch.load(model_path, map_location='cuda')
     if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
         config = checkpoint.get('config', {})
         model = MultiModalDeepfakeModel(
@@ -73,18 +73,18 @@ def load_model(model_path, device):
     else:
         model = MultiModalDeepfakeModel()
         model.load_state_dict(checkpoint, strict=False)
-    model.to(device)
+    model.to('cuda')
     model.eval()
     return model
 
 def main(model_path, video_path):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda")
     model = load_model(model_path, device)
     video_frames = extract_video_frames(video_path)  # [num_frames, C, H, W]
     audio_tensor = extract_audio_tensor(video_path)  # [audio_length]
     inputs = {
-        "video_frames": video_frames.unsqueeze(0).to(device),  # [1, num_frames, C, H, W]
-        "audio": audio_tensor.unsqueeze(0).to(device),         # [1, audio_length]
+        "video_frames": video_frames.unsqueeze(0).to('cuda'),  # [1, num_frames, C, H, W]
+        "audio": audio_tensor.unsqueeze(0).to('cuda'),         # [1, audio_length]
     }
     with torch.no_grad():
         output, results = model(inputs)
