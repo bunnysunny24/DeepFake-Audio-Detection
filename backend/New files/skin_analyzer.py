@@ -57,42 +57,32 @@ class SkinColorAnalyzer(nn.Module):
         """
         batch_size, num_frames = frames.shape[:2]
         device = frames.device
-        
         try:
             # Detect skin regions
-            skin_mask = self.detect_skin(frames)
-            
-            # Extract color features for skin regions
-            skin_features = []
-            
-            for b in range(batch_size):
-                frame_features = []
-                for t in range(num_frames):
-                    mask = skin_mask[b, t].bool()  # Ensure mask is boolean
-                    if mask.any():
-                        # Safe indexing with boolean mask
-                        r_vals = frames[b, t, 0][mask]
-                        g_vals = frames[b, t, 1][mask]
-                        b_vals = frames[b, t, 2][mask]
-                        
-                        # Compute means only if we have valid values
-                        if r_vals.numel() > 0:
-                            r_mean = torch.mean(r_vals)
-                            g_mean = torch.mean(g_vals)
-                            b_mean = torch.mean(b_vals)
-                            frame_feat = torch.stack([r_mean, g_mean, b_mean])
-                        else:
-                            frame_feat = torch.tensor([0.5, 0.4, 0.35], device=device)
-                    else:
-                        frame_feat = torch.tensor([0.5, 0.4, 0.35], device=device)
-                    frame_features.append(frame_feat)
-                
-                # Stack frame features
-                skin_features.append(torch.stack(frame_features))
-            
-            # Stack batch features
-            return torch.stack(skin_features)
-            
+            skin_mask = self.detect_skin(frames)  # [B, T, H, W]
+            # Prepare output tensor
+            skin_features = torch.full((batch_size, num_frames, 3), 0.0, device=device)
+            # Reshape for vectorized computation
+            # frames: [B, T, 3, H, W], skin_mask: [B, T, H, W]
+            mask_flat = skin_mask.view(batch_size, num_frames, -1)  # [B, T, H*W]
+            frames_flat = frames.view(batch_size, num_frames, 3, -1)  # [B, T, 3, H*W]
+            # For each batch and frame, compute mean for each channel where mask is True
+            for c in range(3):
+                channel_vals = frames_flat[:, :, c, :]  # [B, T, H*W]
+                masked_vals = channel_vals * mask_flat.float()  # zeros out non-skin, ensure float mask
+                # Count number of skin pixels per frame
+                skin_counts = mask_flat.sum(dim=-1)  # [B, T]
+                # Avoid division by zero
+                skin_counts_safe = skin_counts.clone()
+                skin_counts_safe[skin_counts_safe == 0] = 1
+                # Sum over skin pixels
+                skin_sum = masked_vals.sum(dim=-1)  # [B, T]
+                skin_mean = skin_sum / skin_counts_safe  # [B, T]
+                # Where no skin, set to default value
+                default_val = torch.tensor([0.5, 0.4, 0.35], device=device)[c]
+                skin_mean = torch.where(skin_counts > 0, skin_mean, default_val)
+                skin_features[:, :, c] = skin_mean
+            return skin_features
         except Exception as e:
             print(f"Error in skin color analysis: {str(e)}")
             # Return fallback tensor
