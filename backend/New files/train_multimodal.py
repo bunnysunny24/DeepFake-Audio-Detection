@@ -1,6 +1,7 @@
 from multi_modal_model import MultiModalDeepfakeModel
 from dataset_loader import get_data_loaders, get_transforms, get_transforms_enhanced
 import torch
+from skin_analyzer import SkinColorAnalyzer
 import torch.nn as nn
 import torch.optim as optim
 from torch.cuda.amp import GradScaler, autocast
@@ -816,6 +817,21 @@ class DeepfakeTrainer:
                 
                 # Move batch to device
                 batch = move_batch_to_device(batch, self.device, trainer=self)
+                # --- SkinColorAnalyzer integration ---
+                if getattr(self.config, 'enable_skin_color_analysis', False) and 'video_frames' in batch:
+                    if not hasattr(self, '_skin_color_analyzer'):
+                        self._skin_color_analyzer = SkinColorAnalyzer().to(self.device)
+                    with torch.no_grad():
+                        frames = batch['video_frames']
+                        if frames.dim() == 5 and frames.shape[2] == 3:
+                            frames_small = torch.nn.functional.interpolate(
+                                frames.view(-1, 3, frames.shape[3], frames.shape[4]),
+                                size=(56, 56), mode='bilinear', align_corners=False
+                            ).view(frames.shape[0], frames.shape[1], 3, 56, 56)
+                        else:
+                            frames_small = frames
+                        skin_features = self._skin_color_analyzer(frames_small)
+                        batch['skin_color_features'] = skin_features
                 
                 # Get labels
                 labels = batch['label']
@@ -1699,7 +1715,7 @@ def main():
     
     # Suppress warnings
     suppress_warnings()
-    
+
     # Create trainer and run
     trainer = DeepfakeTrainer(args)
     trainer.run()
