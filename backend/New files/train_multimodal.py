@@ -396,15 +396,26 @@ def check_memory_and_reduce_batch_size(batch, max_retries=3, trainer=None):
                 if trainer is not None:
                     trainer.memory_warnings += 1
                 
-                # Create smaller batch
+                # Create smaller batch - ENSURE ALL COMPONENTS ARE REDUCED CONSISTENTLY
                 reduced_batch = {}
                 for key, value in batch.items():
-                    if isinstance(value, torch.Tensor) and len(value) > new_batch_size:
-                        reduced_batch[key] = value[:new_batch_size]
-                    elif isinstance(value, list) and len(value) > new_batch_size:
-                        reduced_batch[key] = value[:new_batch_size]
+                    if isinstance(value, torch.Tensor):
+                        if value.size(0) > new_batch_size:
+                            reduced_batch[key] = value[:new_batch_size]
+                        else:
+                            reduced_batch[key] = value
+                    elif isinstance(value, list):
+                        if len(value) > new_batch_size:
+                            reduced_batch[key] = value[:new_batch_size]
+                        else:
+                            reduced_batch[key] = value
                     else:
                         reduced_batch[key] = value
+                
+                # Verify batch consistency after reduction
+                actual_batch_size = len(reduced_batch['label']) if 'label' in reduced_batch else new_batch_size
+                if actual_batch_size != new_batch_size:
+                    print(f"[WARNING] Batch size inconsistency after reduction: expected {new_batch_size}, got {actual_batch_size}")
                 
                 batch = reduced_batch
                 current_batch_size = new_batch_size
@@ -840,6 +851,19 @@ class DeepfakeTrainer:
                 
                 # Get labels
                 labels = batch['label']
+                
+                # Validate batch consistency before forward pass
+                expected_batch_size = labels.shape[0]
+                for key, value in batch.items():
+                    if isinstance(value, torch.Tensor) and value.shape[0] != expected_batch_size:
+                        print(f"[WARNING] Batch size mismatch in {key}: expected {expected_batch_size}, got {value.shape[0]}")
+                        # Fix the mismatch by truncating or padding
+                        if value.shape[0] > expected_batch_size:
+                            batch[key] = value[:expected_batch_size]
+                        elif value.shape[0] < expected_batch_size:
+                            # Skip this batch if we can't fix it easily
+                            print(f"[ERROR] Cannot fix batch size mismatch for {key}, skipping batch")
+                            continue
 
                 # Forward pass with mixed precision
                 self.optimizer.zero_grad()
@@ -849,14 +873,26 @@ class DeepfakeTrainer:
                 total_samples = len(labels)
 
                 def _check_and_fix_batch_size(outputs, labels):
-                    # Ensure outputs and labels have matching batch size
+                    """Check and fix batch size mismatches between outputs and labels."""
                     out_bs = outputs.shape[0] if hasattr(outputs, 'shape') and len(outputs.shape) > 0 else 1
                     lbl_bs = labels.shape[0] if hasattr(labels, 'shape') and len(labels.shape) > 0 else 1
+                    
                     if out_bs != lbl_bs:
                         print(f"[ERROR] Output batch size {out_bs} does not match label batch size {lbl_bs} at batch {batch_idx}")
                         print(f"[DEBUG] outputs.shape: {getattr(outputs, 'shape', None)} labels.shape: {getattr(labels, 'shape', None)}")
-                        return False
-                    return True
+                        
+                        # Try to fix the mismatch
+                        if out_bs > lbl_bs:
+                            # Truncate outputs to match labels
+                            print(f"[FIX] Truncating outputs from {out_bs} to {lbl_bs}")
+                            outputs = outputs[:lbl_bs]
+                            return outputs, labels, True
+                        elif lbl_bs > out_bs:
+                            # Truncate labels to match outputs 
+                            print(f"[FIX] Truncating labels from {lbl_bs} to {out_bs}")
+                            labels = labels[:out_bs]
+                            return outputs, labels, True
+                    return outputs, labels, True
 
                 if self.amp_enabled:
                     with autocast():
@@ -873,7 +909,9 @@ class DeepfakeTrainer:
                         # Add numerical stability to outputs
                         outputs = torch.clamp(outputs, min=-50, max=50)  # Prevent extreme values
                         # Check and fix batch size
-                        if not _check_and_fix_batch_size(outputs, labels):
+                        outputs, labels, batch_valid = _check_and_fix_batch_size(outputs, labels)
+                        if not batch_valid:
+                            print(f"[ERROR] Cannot fix batch size mismatch, skipping batch {batch_idx}")
                             self.optimizer.zero_grad()
                             continue
                         loss = self.criterion(outputs, labels)
@@ -886,9 +924,29 @@ class DeepfakeTrainer:
                         # Add regularization for deepfake type if enabled
                         if self.config.detect_deepfake_type and 'deepfake_type' in results and results['deepfake_type'] is not None:
                             if 'deepfake_type' in batch and batch['deepfake_type'] is not None:
-                                deepfake_type_loss = nn.CrossEntropyLoss()(results['deepfake_type'], batch['deepfake_type'])
-                                if not torch.isnan(deepfake_type_loss):
-                                    loss += self.config.deepfake_type_weight * deepfake_type_loss
+                                # Ensure deepfake_type target is a tensor
+                                deepfake_type_target = batch['deepfake_type']
+                                if isinstance(deepfake_type_target, list):
+                                    deepfake_type_target = torch.tensor(deepfake_type_target, device=outputs.device, dtype=torch.long)
+                                elif not isinstance(deepfake_type_target, torch.Tensor):
+                                    deepfake_type_target = torch.tensor([deepfake_type_target], device=outputs.device, dtype=torch.long)
+                                
+                                # Ensure batch size consistency
+                                if deepfake_type_target.shape[0] != results['deepfake_type'].shape[0]:
+                                    min_batch = min(deepfake_type_target.shape[0], results['deepfake_type'].shape[0])
+                                    deepfake_type_target = deepfake_type_target[:min_batch]
+                                    deepfake_type_pred = results['deepfake_type'][:min_batch]
+                                else:
+                                    deepfake_type_pred = results['deepfake_type']
+                                
+                                try:
+                                    deepfake_type_loss = nn.CrossEntropyLoss()(deepfake_type_pred, deepfake_type_target)
+                                    if not torch.isnan(deepfake_type_loss):
+                                        loss += self.config.deepfake_type_weight * deepfake_type_loss
+                                except Exception as e:
+                                    if self.debug:
+                                        print(f"[WARNING] Error computing deepfake type loss: {e}")
+                                    # Skip deepfake type loss if there's an error
                     # Backward pass with scaler
                     self.scaler.scale(loss).backward()
                     # Check for NaN in gradients using model method
@@ -901,14 +959,22 @@ class DeepfakeTrainer:
                         # Skip this batch but continue training
                         continue
                     # Apply model's gradient clipping
+                    unscale_called = False
                     if hasattr(self.model, 'clip_gradients'):
                         self.scaler.unscale_(self.optimizer)
+                        unscale_called = True
                         self.model.clip_gradients(max_norm=self.config.gradient_clip)
                     # Additional gradient clipping if configured
                     if self.config.gradient_clip > 0:
                         if not hasattr(self.model, 'clip_gradients'):  # Only if not already done
                             self.scaler.unscale_(self.optimizer)
+                            unscale_called = True
                         nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clip)
+                    
+                    # Ensure unscale is called at least once before step
+                    if not unscale_called:
+                        self.scaler.unscale_(self.optimizer)
+                    
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
                 else:
@@ -925,7 +991,9 @@ class DeepfakeTrainer:
                     # Add numerical stability to outputs
                     outputs = torch.clamp(outputs, min=-50, max=50)  # Prevent extreme values
                     # Check and fix batch size
-                    if not _check_and_fix_batch_size(outputs, labels):
+                    outputs, labels, batch_valid = _check_and_fix_batch_size(outputs, labels)
+                    if not batch_valid:
+                        print(f"[ERROR] Cannot fix batch size mismatch, skipping batch {batch_idx}")
                         self.optimizer.zero_grad()
                         continue
                     loss = self.criterion(outputs, labels)
@@ -938,9 +1006,29 @@ class DeepfakeTrainer:
                     # Add regularization for deepfake type if enabled
                     if self.config.detect_deepfake_type and 'deepfake_type' in results and results['deepfake_type'] is not None:
                         if 'deepfake_type' in batch and batch['deepfake_type'] is not None:
-                            deepfake_type_loss = nn.CrossEntropyLoss()(results['deepfake_type'], batch['deepfake_type'])
-                            if not torch.isnan(deepfake_type_loss):
-                                loss += self.config.deepfake_type_weight * deepfake_type_loss
+                            # Ensure deepfake_type target is a tensor
+                            deepfake_type_target = batch['deepfake_type']
+                            if isinstance(deepfake_type_target, list):
+                                deepfake_type_target = torch.tensor(deepfake_type_target, device=outputs.device, dtype=torch.long)
+                            elif not isinstance(deepfake_type_target, torch.Tensor):
+                                deepfake_type_target = torch.tensor([deepfake_type_target], device=outputs.device, dtype=torch.long)
+                            
+                            # Ensure batch size consistency
+                            if deepfake_type_target.shape[0] != results['deepfake_type'].shape[0]:
+                                min_batch = min(deepfake_type_target.shape[0], results['deepfake_type'].shape[0])
+                                deepfake_type_target = deepfake_type_target[:min_batch]
+                                deepfake_type_pred = results['deepfake_type'][:min_batch]
+                            else:
+                                deepfake_type_pred = results['deepfake_type']
+                            
+                            try:
+                                deepfake_type_loss = nn.CrossEntropyLoss()(deepfake_type_pred, deepfake_type_target)
+                                if not torch.isnan(deepfake_type_loss):
+                                    loss += self.config.deepfake_type_weight * deepfake_type_loss
+                            except Exception as e:
+                                if getattr(self.config, 'debug', False):
+                                    print(f"[WARNING] Error computing deepfake type loss: {e}")
+                                # Skip deepfake type loss if there's an error
                     # Backward pass
                     loss.backward()
                     # Check for NaN in gradients using model method
@@ -952,9 +1040,7 @@ class DeepfakeTrainer:
                     if hasattr(self.model, 'clip_gradients'):
                         self.model.clip_gradients(max_norm=1.0)
                     # Additional gradient clipping if configured
-                    if self.config.gradient_clip > 0:
-                        nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clip)
-                    if self.config.gradient_clip > 0:
+                    elif self.config.gradient_clip > 0:
                         nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clip)
                     self.optimizer.step()
                 
