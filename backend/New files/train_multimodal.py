@@ -1754,12 +1754,12 @@ def parse_args():
     parser.add_argument('--physiological_fps', type=int, default=30, help='Frame rate for physiological signal analysis')
     parser.add_argument('--resume_checkpoint', type=str, default=None, help='Path to checkpoint file to resume training from')
     # Training parameters
-    parser.add_argument('--batch_size', type=int, default=8, help='Batch size')
+    parser.add_argument('--batch_size', type=int, default=128, help='Batch size')
     parser.add_argument('--num_epochs', type=int, default=30, help='Number of training epochs')
     parser.add_argument('--learning_rate', type=float, default=1e-4, help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=1e-5, help='Weight decay')
-    parser.add_argument('--max_samples', type=int, default=1000, help='Maximum number of samples to use')
-    parser.add_argument('--num_workers', type=int, default=2, help='Number of data loader workers')
+    parser.add_argument('--max_samples', type=int, default=10000, help='Maximum number of samples to use')
+    parser.add_argument('--num_workers', type=int, default=8, help='Number of data loader workers (increased for A100)')
     parser.add_argument('--validation_split', type=float, default=0.2, help='Validation split ratio')
     parser.add_argument('--test_split', type=float, default=0.1, help='Test split ratio')
     parser.add_argument('--use_weighted_loss', action='store_true', help='Use class-weighted loss function')
@@ -1788,9 +1788,18 @@ def parse_args():
     # Misc parameters
     parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
     parser.add_argument('--device', type=str, default='cuda', help='Device to use (cuda or cpu)')
-    parser.add_argument('--amp_enabled', action='store_true', help='Enable automatic mixed precision')
+    parser.add_argument('--amp_enabled', action='store_true', default=True, help='Enable automatic mixed precision (default: True)')
     parser.add_argument('--debug', action='store_true', help='Enable debug mode')
     parser.add_argument('--pretrained_path', type=str, default=None, help='Path to pretrained model weights')
+    
+    # Performance optimization parameters
+    parser.add_argument('--pin_memory', action='store_true', default=True, help='Pin memory for faster data loading')
+    parser.add_argument('--persistent_workers', action='store_true', default=True, help='Keep workers alive between epochs')
+    parser.add_argument('--prefetch_factor', type=int, default=4, help='Number of samples loaded in advance by each worker')
+    parser.add_argument('--reduce_frames', type=int, default=8, help='Reduce number of frames per video for faster processing (default: 8, original: 16)')
+    parser.add_argument('--disable_skin_analysis', action='store_true', help='Disable memory-intensive skin color analysis for speed')
+    parser.add_argument('--disable_advanced_physio', action='store_true', help='Disable advanced physiological analysis for speed')
+    parser.add_argument('--fast_mode', action='store_true', help='Enable fast mode with reduced feature extraction')
     
     return parser.parse_args()
 
