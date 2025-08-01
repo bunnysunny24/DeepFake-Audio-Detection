@@ -1632,119 +1632,201 @@ def get_data_loaders(
 
 def collate_fn(batch):
     """
-    Custom collate function to handle None values and variable-sized tensors in the batch.
+    Custom collate function that handles variable-sized data and ensures consistent batch dimensions.
     """
-    # Filter out None values
-    batch = [item for item in batch if item is not None]
-    
-    if not batch:
-        raise ValueError("All items in batch are None!")
-    
-    # Create a dictionary to hold the batched data
     result = {}
     
-    # Get all keys from the first sample
-    keys = batch[0].keys()
+    # Process all possible keys that might be in batch
+    all_keys = set()
+    for item in batch:
+        all_keys.update(item.keys())
     
-    # Batch each key
-    for key in keys:
-        if key in ['label', 'deepfake_type']:
-            # Make sure we're stacking tensors, not ints
-            values = [item[key] if isinstance(item[key], torch.Tensor) else torch.tensor(item[key]) for item in batch]
-            result[key] = torch.stack(values)
-        elif key in ['video_frames', 'audio', 'audio_spectrogram', 'metadata_features', 'temporal_consistency',
-                    'pulse_signal', 'head_pose', 'eye_blink_features']:
-            # Stack tensors
-            values = [item[key] for item in batch if item[key] is not None]
-            if values:
+    # Get the actual batch size
+    actual_batch_size = len(batch)
+    
+    for key in all_keys:
+        values = [item.get(key) for item in batch]
+        
+        # Filter out None values but keep track of positions
+        valid_values = []
+        valid_indices = []
+        for i, v in enumerate(values):
+            if v is not None:
+                valid_values.append(v)
+                valid_indices.append(i)
+        
+        if key in ['video_frames', 'audio', 'audio_spectrogram', 'facial_landmarks']:
+            # These are critical tensors that must have consistent batch dimensions
+            if valid_values and all(isinstance(v, torch.Tensor) for v in valid_values):
                 try:
-                    result[key] = torch.stack(values)
-                except:
-                    # If can't stack, convert to tensors and stack
-                    try:
-                        values = [v if isinstance(v, torch.Tensor) else torch.tensor(v) for v in values]
-                        result[key] = torch.stack(values)
-                    except:
-                        # If still can't stack, store as list
-                        result[key] = values
-            else:
-                result[key] = None
-        elif key in ['original_video_frames', 'original_audio', 'ela_features', 'audio_visual_sync', 'face_embeddings',
-                    'facial_landmarks', 'mfcc_features', 'skin_color_variations', 'frequency_features']:
-            # Handle potentially missing data
-            values = [item[key] for item in batch if item[key] is not None]
-            if values and all(v is not None and isinstance(v, torch.Tensor) for v in values):
-                try:
-                    # Special handling for face_embeddings to ensure correct shape
-                    if key == 'face_embeddings':
-                        # Ensure all face embeddings have the same shape before stacking
-                        normalized_values = []
-                        for v in values:
-                            if len(v.shape) == 2 and v.shape[0] == 1 and v.shape[1] == 256:
-                                normalized_values.append(v)
-                            elif len(v.shape) == 1 and v.shape[0] == 256:
-                                normalized_values.append(v.unsqueeze(0))
-                            else:
-                                # Create a properly shaped tensor
-                                normalized_values.append(torch.zeros((1, 256)))
-                        result[key] = torch.stack(normalized_values).squeeze(1)  # Remove extra dimension
-                    else:
-                        result[key] = torch.stack(values)
-                except Exception as stack_error:
-                    # If can't stack (different sizes), store as list
-                    if key == 'face_embeddings':
-                        # For face embeddings, create a batch of zeros if stacking fails
-                        result[key] = torch.zeros((len(batch), 256))
-                    else:
-                        result[key] = values
-            else:
-                # Try to convert non-tensor values to tensors
-                try:
-                    tensor_values = []
-                    for v in values:
-                        if isinstance(v, torch.Tensor):
-                            tensor_values.append(v)
+                    # If we have the full batch, just stack
+                    if len(valid_values) == actual_batch_size:
+                        # Check if all tensors have the same shape
+                        ref_shape = valid_values[0].shape
+                        if all(v.shape == ref_shape for v in valid_values):
+                            # Clone tensors to avoid memory sharing issues
+                            cloned_tensors = [v.clone() for v in valid_values]
+                            result[key] = torch.stack(cloned_tensors)
                         else:
-                            try:
-                                tensor_values.append(torch.tensor(v))
-                            except:
-                                pass  # Skip if can't convert to tensor
-                    
-                    if tensor_values:
-                        if key == 'face_embeddings':
-                            # Special handling for face embeddings
-                            normalized_values = []
-                            for v in tensor_values:
-                                if len(v.shape) == 2 and v.shape[0] == 1 and v.shape[1] == 256:
-                                    normalized_values.append(v)
-                                elif len(v.shape) == 1 and v.shape[0] == 256:
-                                    normalized_values.append(v.unsqueeze(0))
+                            # Handle different shapes by padding to max dimensions
+                            max_shape = list(ref_shape)
+                            for v in valid_values[1:]:
+                                for j in range(len(v.shape)):
+                                    max_shape[j] = max(max_shape[j], v.shape[j])
+                            
+                            # Pad all tensors to max shape
+                            padded_tensors = []
+                            for v in valid_values:
+                                if list(v.shape) == max_shape:
+                                    padded_tensors.append(v.clone())
                                 else:
-                                    normalized_values.append(torch.zeros((1, 256)))
-                            result[key] = torch.stack(normalized_values).squeeze(1)
-                        else:
-                            result[key] = torch.stack(tensor_values)
+                                    # Create padding specification
+                                    pad_spec = []
+                                    for j in range(len(v.shape)):
+                                        pad_amount = max_shape[j] - v.shape[j]
+                                        pad_spec = [0, pad_amount] + pad_spec  # PyTorch padding is reversed
+                                    
+                                    padded = torch.nn.functional.pad(v, pad_spec)
+                                    padded_tensors.append(padded.clone())
+                            
+                            result[key] = torch.stack(padded_tensors)
                     else:
-                        if key == 'face_embeddings':
-                            result[key] = torch.zeros((len(batch), 256))
-                        else:
-                            result[key] = None
-                except:
-                    if key == 'face_embeddings':
-                        result[key] = torch.zeros((len(batch), 256))
+                        # Missing some values, create full batch tensor with zeros
+                        ref_shape = valid_values[0].shape
+                        full_batch_tensor = torch.zeros(actual_batch_size, *ref_shape, dtype=valid_values[0].dtype)
+                        
+                        # Fill in the valid values at their correct positions
+                        for i, valid_idx in enumerate(valid_indices):
+                            if valid_idx < actual_batch_size:
+                                full_batch_tensor[valid_idx] = valid_values[i].clone()
+                        
+                        result[key] = full_batch_tensor
+                        
+                except Exception as e:
+                    print(f"[ERROR] Failed to collate {key}: {e}")
+                    # Fallback: create empty tensor with correct batch size
+                    if key == 'video_frames':
+                        result[key] = torch.zeros(actual_batch_size, 16, 3, 224, 224)
+                    elif key == 'audio':
+                        result[key] = torch.zeros(actual_batch_size, 8000)
+                    elif key == 'audio_spectrogram':
+                        result[key] = torch.zeros(actual_batch_size, 1, 64, 64)
+                    elif key == 'facial_landmarks':
+                        result[key] = torch.zeros(actual_batch_size, 16, 136)
                     else:
                         result[key] = None
+            else:
+                # Create appropriate zero tensor for missing data
+                if key == 'video_frames':
+                    result[key] = torch.zeros(actual_batch_size, 16, 3, 224, 224)
+                elif key == 'audio':
+                    result[key] = torch.zeros(actual_batch_size, 8000)
+                elif key == 'audio_spectrogram':
+                    result[key] = torch.zeros(actual_batch_size, 1, 64, 64)
+                elif key == 'facial_landmarks':
+                    result[key] = torch.zeros(actual_batch_size, 16, 136)
+                else:
+                    result[key] = None
+                    
+        elif key in ['ela_features', 'metadata_features', 'face_embeddings', 'temporal_consistency']:
+            # Optional tensor features
+            if valid_values and all(isinstance(v, torch.Tensor) for v in valid_values):
+                try:
+                    # Stack valid tensors and pad batch if needed
+                    if len(valid_values) == actual_batch_size:
+                        # Check if all tensors have the same shape
+                        ref_shape = valid_values[0].shape
+                        if all(v.shape == ref_shape for v in valid_values):
+                            result[key] = torch.stack(valid_values)
+                        else:
+                            # Handle different shapes by padding
+                            max_shape = list(ref_shape)
+                            for v in valid_values[1:]:
+                                for j in range(len(v.shape)):
+                                    max_shape[j] = max(max_shape[j], v.shape[j])
+                            
+                            # Pad all tensors to max shape
+                            padded_tensors = []
+                            for v in valid_values:
+                                if list(v.shape) == max_shape:
+                                    padded_tensors.append(v.clone())  # Clone to avoid memory sharing
+                                else:
+                                    # Create padding specification
+                                    pad_spec = []
+                                    for j in range(len(v.shape)):
+                                        pad_amount = max_shape[j] - v.shape[j]
+                                        pad_spec = [0, pad_amount] + pad_spec
+                                    
+                                    padded = torch.nn.functional.pad(v, pad_spec)
+                                    padded_tensors.append(padded.clone())  # Clone to avoid memory sharing
+                            
+                            result[key] = torch.stack(padded_tensors)
+                    else:
+                        # Create tensor with zeros for missing samples
+                        ref_shape = valid_values[0].shape
+                        full_batch_tensor = torch.zeros(actual_batch_size, *ref_shape, dtype=valid_values[0].dtype)
+                        
+                        for i, valid_idx in enumerate(valid_indices):
+                            if valid_idx < actual_batch_size:
+                                full_batch_tensor[valid_idx] = valid_values[i].clone()  # Clone to avoid memory sharing
+                        
+                        result[key] = full_batch_tensor
+                except Exception as e:
+                    print(f"[WARNING] Failed to collate optional feature {key}: {e}")
+                    result[key] = None
+            else:
+                result[key] = None
+                
+        elif key in ['original_video_frames', 'original_audio', 'audio_visual_sync']:
+            # These may have different batch sizes, handle gracefully
+            if valid_values and all(isinstance(v, torch.Tensor) for v in valid_values):
+                try:
+                    # Check if we can create a consistent batch
+                    ref_shape = valid_values[0].shape
+                    compatible = all(v.shape[1:] == ref_shape[1:] for v in valid_values)
+                    
+                    if compatible and len(valid_values) == actual_batch_size:
+                        result[key] = torch.stack(valid_values)
+                    else:
+                        # For mismatched batches, store as list or use first valid sample
+                        print(f"[WARNING] Batch size mismatch for {key}: expected {actual_batch_size}, got {len(valid_values)}")
+                        if len(valid_values) > 0:
+                            # Use first valid sample and repeat it to fill the batch
+                            first_sample = valid_values[0]
+                            result[key] = first_sample.unsqueeze(0).repeat(actual_batch_size, *([1] * len(first_sample.shape)))
+                        else:
+                            result[key] = None
+                except Exception as e:
+                    print(f"[WARNING] Failed to collate {key}: {e}")
+                    result[key] = None
+            else:
+                result[key] = None
+                
         elif key in ['fake_periods', 'timestamps']:
             # List of lists, don't stack
-            result[key] = [item[key] for item in batch]
+            result[key] = [item.get(key, []) for item in batch]
         elif key in ['transcript', 'file_path']:
             # List of strings
-            result[key] = [item[key] for item in batch]
+            result[key] = [item.get(key, "") for item in batch]
         elif key == 'fake_mask':
             # Don't stack fake_masks of different sizes, keep as list
-            result[key] = [item[key] for item in batch]
+            result[key] = [item.get(key, []) for item in batch]
+        elif key == 'label':
+            # Labels should always be stackable
+            if valid_values and all(isinstance(v, (int, torch.Tensor)) for v in valid_values):
+                # Create full batch labels
+                labels = torch.zeros(actual_batch_size, dtype=torch.long)
+                for i, valid_idx in enumerate(valid_indices):
+                    if isinstance(valid_values[i], torch.Tensor):
+                        labels[valid_idx] = valid_values[i].clone()
+                    else:
+                        labels[valid_idx] = torch.tensor(valid_values[i], dtype=torch.long)
+                result[key] = labels
+            else:
+                # Fallback to all zeros
+                result[key] = torch.zeros(actual_batch_size, dtype=torch.long)
         else:
             # Handle other types if needed
-            result[key] = [item[key] for item in batch]
+            result[key] = [item.get(key) for item in batch]
     
     return result
