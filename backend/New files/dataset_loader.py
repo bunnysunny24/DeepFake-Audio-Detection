@@ -32,6 +32,9 @@ import traceback
 import uuid
 
 class MultiModalDeepfakeDataset(Dataset):
+    # NOTE: To maximize GPU usage, ensure that all output tensors (e.g., video_frames, audio, features)
+    # are moved to the correct device (e.g., .to('cuda')) in your training loop or collate_fn.
+    # This is typically handled in the training script, not the dataset itself, for best flexibility.
     def __init__(self, json_path, data_dir, max_frames=16, audio_length=8000, transform=None, audio_transform=None, 
                  logging=False, phase='train', detect_faces=True, compute_spectrograms=True, temporal_features=True,
                  enhanced_preprocessing=True):
