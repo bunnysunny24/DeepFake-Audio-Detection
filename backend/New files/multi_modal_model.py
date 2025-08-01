@@ -150,21 +150,58 @@ class ForensicConsistencyModule(nn.Module):
         # x shape: [batch, frames, channels, height, width]
         batch_size, num_frames = x.shape[:2]
         
-        # Reshape for convolutions
-        x = x.view(batch_size * num_frames, *x.shape[2:])
-        
-        # Feature extraction
-        x = F.relu(self.conv1(x))
-        x = F.relu(self.conv2(x))
-        x = self.pool(x).squeeze(-1).squeeze(-1)
-        
-        # Reshape back to batch, frames, features
-        x = x.view(batch_size, num_frames, -1)
-        
-        # Project features
-        x = self.fc(x)
-        
-        return x
+        # Memory optimization: process in chunks if batch size is large
+        if batch_size * num_frames > 32:  # Process in chunks to save memory
+            chunk_size = max(1, 32 // num_frames)
+            results = []
+            
+            for i in range(0, batch_size, chunk_size):
+                end_idx = min(i + chunk_size, batch_size)
+                chunk = x[i:end_idx]
+                chunk_batch_size = chunk.shape[0]
+                
+                # Reshape for convolutions
+                chunk_reshaped = chunk.view(chunk_batch_size * num_frames, *chunk.shape[2:])
+                
+                # Feature extraction with gradient checkpointing for memory efficiency
+                if self.training:
+                    from torch.utils.checkpoint import checkpoint
+                    conv1_out = checkpoint(F.relu, checkpoint(self.conv1, chunk_reshaped))
+                    conv2_out = checkpoint(F.relu, checkpoint(self.conv2, conv1_out))
+                else:
+                    conv1_out = F.relu(self.conv1(chunk_reshaped))
+                    conv2_out = F.relu(self.conv2(conv1_out))
+                
+                pooled = self.pool(conv2_out).squeeze(-1).squeeze(-1)
+                
+                # Reshape back to batch, frames, features
+                chunk_result = pooled.view(chunk_batch_size, num_frames, -1)
+                
+                # Project features
+                chunk_result = self.fc(chunk_result)
+                results.append(chunk_result)
+                
+                # Clear intermediate tensors
+                del chunk_reshaped, conv1_out, conv2_out, pooled, chunk_result
+                
+            return torch.cat(results, dim=0)
+        else:
+            # Original processing for smaller batches
+            # Reshape for convolutions
+            x = x.view(batch_size * num_frames, *x.shape[2:])
+            
+            # Feature extraction
+            x = F.relu(self.conv1(x))
+            x = F.relu(self.conv2(x))
+            x = self.pool(x).squeeze(-1).squeeze(-1)
+            
+            # Reshape back to batch, frames, features
+            x = x.view(batch_size, num_frames, -1)
+            
+            # Project features
+            x = self.fc(x)
+            
+            return x
 
 
 class AudioVisualSyncDetector(nn.Module):
@@ -532,14 +569,18 @@ class EyeAnalysisModule(nn.Module):
     def _init_eye_encoder(self, landmark_dim):
         """Dynamically initialize the eye encoder based on input dimensions"""
         self.landmark_dim = landmark_dim
+        # Robustly get device for new layers
+        try:
+            device = next(self.blink_detector.parameters()).device
+        except (StopIteration, AttributeError):
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.eye_encoder = nn.Sequential(
             nn.Linear(landmark_dim, self.hidden_dim),
             nn.ReLU(),
             nn.Dropout(0.2),
             nn.Linear(self.hidden_dim, self.hidden_dim // 2),
             nn.ReLU()
-        ).to(next(self.blink_detector.parameters()).device)
-        
+        ).to(device)
         print(f"[INFO] Dynamically initialized eye encoder with input dim {landmark_dim}")
         
     def forward(self, eye_landmarks):
@@ -552,12 +593,14 @@ class EyeAnalysisModule(nn.Module):
         """
         # Handle None or empty input
         if eye_landmarks is None or eye_landmarks.numel() == 0:
-            device = next(self.blink_detector.parameters()).device
+            try:
+                device = next(self.blink_detector.parameters()).device
+            except (StopIteration, AttributeError):
+                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             batch_size = 1
             seq_len = 1
             if eye_landmarks is not None and len(eye_landmarks.shape) >= 2:
                 batch_size, seq_len = eye_landmarks.shape[:2]
-            
             return (
                 torch.ones(batch_size, 1, device=device) * 0.5,  # naturalness
                 torch.zeros(batch_size, seq_len, device=device),  # blinks
@@ -712,12 +755,16 @@ class OculomotorDynamicsAnalyzer(nn.Module):
     def _init_movement_encoder(self, eye_feature_dim):
         """Dynamically initialize the movement encoder based on input dimensions"""
         self.eye_feature_dim = eye_feature_dim
+        # Robustly get device for new layers
+        try:
+            device = next(self.temporal_cnn.parameters()).device
+        except (StopIteration, AttributeError):
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.movement_encoder = nn.Sequential(
             nn.Linear(eye_feature_dim, self.hidden_dim),
             nn.ReLU(),
             nn.Linear(self.hidden_dim, self.hidden_dim)
-        ).to(next(self.temporal_cnn.parameters()).device)
-        
+        ).to(device)
         print(f"[INFO] Dynamically initialized oculomotor movement encoder with input dim {eye_feature_dim}")
         
     def forward(self, eye_movement_features):
@@ -730,11 +777,13 @@ class OculomotorDynamicsAnalyzer(nn.Module):
         """
         # Handle None or empty input
         if eye_movement_features is None or eye_movement_features.numel() == 0:
-            device = next(self.temporal_cnn.parameters()).device
+            try:
+                device = next(self.temporal_cnn.parameters()).device
+            except (StopIteration, AttributeError):
+                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             batch_size = 1
             if eye_movement_features is not None and len(eye_movement_features.shape) > 0:
                 batch_size = eye_movement_features.shape[0]
-                
             return (
                 torch.ones(batch_size, 1, device=device) * 0.5,  # naturalness
                 torch.ones(batch_size, 3, device=device) / 3.0  # uniform distribution
@@ -2490,7 +2539,8 @@ class MultiModalDeepfakeModel(nn.Module):
                 'explanation': None,
                 'component_weights': None,
                 'component_contributions': {},
-                'detailed_results': {}
+                'detailed_results': {},
+                'error': None
             }
             
             # Extract inputs
@@ -3187,14 +3237,16 @@ class MultiModalDeepfakeModel(nn.Module):
                     component_contributions=component_contributions
                 )
 
-            # Update results dictionary
+            # Update results dictionary - ENSURE ALL KEYS ARE ALWAYS PRESENT
             results.update({
                 'logits': output,
                 'deepfake_type': deepfake_type_output,
                 'deepfake_check': deepfake_check_results,
                 'explanation': explanation_data,
                 'component_weights': F.softmax(self.component_weights, dim=0) if self.enable_explainability else None,
-                'component_contributions': component_contributions
+                'component_contributions': component_contributions,
+                'detailed_results': results.get('detailed_results', {}),  # Ensure this key always exists
+                'error': None  # Ensure error key exists when no error
             })
 
             return output, results
@@ -3204,7 +3256,18 @@ class MultiModalDeepfakeModel(nn.Module):
             import traceback
             traceback.print_exc()
             # Return zero tensor with proper shape as fallback
-            return torch.zeros((batch_size, 2), device=video_frames.device), {"error": str(e)}
+            # ENSURE CONSISTENT DICTIONARY KEYS EVEN IN ERROR CASE
+            error_results = {
+                'logits': None,
+                'deepfake_type': None,
+                'deepfake_check': None,
+                'explanation': None,
+                'component_weights': None,
+                'component_contributions': {},
+                'detailed_results': {},
+                'error': str(e)
+            }
+            return torch.zeros((batch_size, 2), device=video_frames.device), error_results
 
     def extract_facial_landmarks(self, video_frames):
         """Extract facial landmarks using mediapipe/dlib."""
