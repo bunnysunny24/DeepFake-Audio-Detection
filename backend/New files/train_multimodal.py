@@ -667,10 +667,10 @@ class DeepfakeTrainer:
     def setup_model(self):
         """Initialize model, loss function, optimizer, and scheduler."""
         print(f"Initializing model on {self.device}...")
-        
+
         # Move class weights to device
         self.class_weights = self.class_weights.to(self.device) if self.class_weights is not None else None
-        
+
         # Initialize model
         self.model = MultiModalDeepfakeModel(
             num_classes=self.config.num_classes,
@@ -690,7 +690,7 @@ class DeepfakeTrainer:
             enable_skin_color_analysis=getattr(self.config, 'enable_skin_color_analysis', False),
             enable_advanced_physiological=getattr(self.config, 'enable_advanced_physiological', False)
         )
-        
+
         # Load pretrained weights if specified
         if self.config.pretrained_path is not None and os.path.exists(self.config.pretrained_path):
             print(f"Loading pretrained weights from: {self.config.pretrained_path}")
@@ -698,21 +698,26 @@ class DeepfakeTrainer:
             # Handle different state dict formats
             if 'model_state_dict' in state_dict:
                 state_dict = state_dict['model_state_dict']
-            
+
             # Handle partial loading with mismatched keys
             model_dict = self.model.state_dict()
             pretrained_dict = {k: v for k, v in state_dict.items() if k in model_dict and v.shape == model_dict[k].shape}
             model_dict.update(pretrained_dict)
             self.model.load_state_dict(model_dict)
             print(f"Loaded {len(pretrained_dict)}/{len(model_dict)} layers from pretrained weights")
-        
+
         # Move model to device
         self.model.to(self.device)
-        
+
+        # Enable DataParallel for multi-GPU if available and not using distributed
+        if torch.cuda.device_count() > 1 and not self.distributed:
+            print(f"[INFO] Using DataParallel on {torch.cuda.device_count()} GPUs.")
+            self.model = torch.nn.DataParallel(self.model)
+
         # Initialize in distributed mode if specified
         if self.distributed:
             self.model = DDP(self.model, device_ids=[self.local_rank])
-        
+
         # Initialize loss function with class weights for imbalanced data
         if self.class_weights is not None and self.config.use_weighted_loss:
             self.criterion = nn.CrossEntropyLoss(weight=self.class_weights)
@@ -720,7 +725,7 @@ class DeepfakeTrainer:
         else:
             self.criterion = nn.CrossEntropyLoss()
             print("Using standard CrossEntropyLoss")
-        
+
         # Initialize optimizer
         if self.config.optimizer == 'adam':
             self.optimizer = optim.Adam(self.model.parameters(), lr=self.config.learning_rate, weight_decay=self.config.weight_decay)
@@ -730,7 +735,7 @@ class DeepfakeTrainer:
             self.optimizer = optim.SGD(self.model.parameters(), lr=self.config.learning_rate, momentum=0.9, weight_decay=self.config.weight_decay)
         else:
             self.optimizer = optim.AdamW(self.model.parameters(), lr=self.config.learning_rate, weight_decay=self.config.weight_decay)
-        
+
         # Initialize learning rate scheduler
         if self.config.scheduler == 'step':
             self.scheduler = optim.lr_scheduler.StepLR(
@@ -746,14 +751,14 @@ class DeepfakeTrainer:
             )
         else:
             self.scheduler = None
-        
+
         # Initialize learning rate warmup
         self.warmup_scheduler = None
         if self.config.warmup_epochs > 0:
             self.warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
                 self.optimizer, start_factor=0.1, end_factor=1.0, total_iters=self.config.warmup_epochs * len(self.train_loader)
             )
-        
+
         print("Model, optimizer, and scheduler initialized")
     
     def save_intermediate_checkpoint(self, epoch, batch_idx):
@@ -835,18 +840,27 @@ class DeepfakeTrainer:
                 
                 # Get labels
                 labels = batch['label']
-                
+
                 # Forward pass with mixed precision
                 self.optimizer.zero_grad()
-                
+
                 # Count successful vs failed samples for debugging
                 success_count = 0
                 total_samples = len(labels)
-                
+
+                def _check_and_fix_batch_size(outputs, labels):
+                    # Ensure outputs and labels have matching batch size
+                    out_bs = outputs.shape[0] if hasattr(outputs, 'shape') and len(outputs.shape) > 0 else 1
+                    lbl_bs = labels.shape[0] if hasattr(labels, 'shape') and len(labels.shape) > 0 else 1
+                    if out_bs != lbl_bs:
+                        print(f"[ERROR] Output batch size {out_bs} does not match label batch size {lbl_bs} at batch {batch_idx}")
+                        print(f"[DEBUG] outputs.shape: {getattr(outputs, 'shape', None)} labels.shape: {getattr(labels, 'shape', None)}")
+                        return False
+                    return True
+
                 if self.amp_enabled:
                     with autocast():
                         outputs, results = self.model(batch)
-                        
                         # Check for NaN in outputs
                         if torch.isnan(outputs).any():
                             print(f"[ERROR] NaN detected in model outputs at batch {batch_idx}")
@@ -856,57 +870,49 @@ class DeepfakeTrainer:
                             self.optimizer.zero_grad()
                             self.nan_count += 1
                             continue
-                        
                         # Add numerical stability to outputs
                         outputs = torch.clamp(outputs, min=-50, max=50)  # Prevent extreme values
-                        
+                        # Check and fix batch size
+                        if not _check_and_fix_batch_size(outputs, labels):
+                            self.optimizer.zero_grad()
+                            continue
                         loss = self.criterion(outputs, labels)
-                        
                         # Check for NaN in loss
                         if torch.isnan(loss):
                             print(f"[ERROR] NaN loss detected at batch {batch_idx}")
                             print(f"[DEBUG] Labels: {labels}")
                             print(f"[DEBUG] Outputs: {outputs}")
                             continue
-                        
                         # Add regularization for deepfake type if enabled
                         if self.config.detect_deepfake_type and 'deepfake_type' in results and results['deepfake_type'] is not None:
                             if 'deepfake_type' in batch and batch['deepfake_type'] is not None:
                                 deepfake_type_loss = nn.CrossEntropyLoss()(results['deepfake_type'], batch['deepfake_type'])
                                 if not torch.isnan(deepfake_type_loss):
                                     loss += self.config.deepfake_type_weight * deepfake_type_loss
-                    
                     # Backward pass with scaler
                     self.scaler.scale(loss).backward()
-                    
                     # Check for NaN in gradients using model method
                     if hasattr(self.model, 'check_for_nan_gradients') and self.model.check_for_nan_gradients():
                         print(f"[ERROR] Skipping backward pass due to NaN gradients at batch {batch_idx}")
                         self.optimizer.zero_grad()
-                        
                         # Apply model stabilization
                         if hasattr(self.model, 'stabilize_model'):
                             self.model.stabilize_model()
-                        
                         # Skip this batch but continue training
                         continue
-                    
                     # Apply model's gradient clipping
                     if hasattr(self.model, 'clip_gradients'):
                         self.scaler.unscale_(self.optimizer)
                         self.model.clip_gradients(max_norm=self.config.gradient_clip)
-                    
                     # Additional gradient clipping if configured
                     if self.config.gradient_clip > 0:
                         if not hasattr(self.model, 'clip_gradients'):  # Only if not already done
                             self.scaler.unscale_(self.optimizer)
                         nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clip)
-                    
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
                 else:
                     outputs, results = self.model(batch)
-                    
                     # Check for NaN in outputs
                     if torch.isnan(outputs).any():
                         print(f"[ERROR] NaN detected in model outputs at batch {batch_idx}")
@@ -916,45 +922,40 @@ class DeepfakeTrainer:
                         self.optimizer.zero_grad()
                         self.nan_count += 1
                         continue
-                    
                     # Add numerical stability to outputs
                     outputs = torch.clamp(outputs, min=-50, max=50)  # Prevent extreme values
-                    
+                    # Check and fix batch size
+                    if not _check_and_fix_batch_size(outputs, labels):
+                        self.optimizer.zero_grad()
+                        continue
                     loss = self.criterion(outputs, labels)
-                    
                     # Check for NaN in loss
                     if torch.isnan(loss):
                         print(f"[ERROR] NaN loss detected at batch {batch_idx}")
                         print(f"[DEBUG] Labels: {labels}")
                         print(f"[DEBUG] Outputs: {outputs}")
                         continue
-                    
                     # Add regularization for deepfake type if enabled
                     if self.config.detect_deepfake_type and 'deepfake_type' in results and results['deepfake_type'] is not None:
                         if 'deepfake_type' in batch and batch['deepfake_type'] is not None:
                             deepfake_type_loss = nn.CrossEntropyLoss()(results['deepfake_type'], batch['deepfake_type'])
                             if not torch.isnan(deepfake_type_loss):
                                 loss += self.config.deepfake_type_weight * deepfake_type_loss
-                    
                     # Backward pass
                     loss.backward()
-                    
                     # Check for NaN in gradients using model method
                     if hasattr(self.model, 'check_for_nan_gradients') and self.model.check_for_nan_gradients():
                         print(f"[ERROR] Skipping backward pass due to NaN gradients at batch {batch_idx}")
                         self.optimizer.zero_grad()
                         continue
-                    
                     # Apply model's gradient clipping
                     if hasattr(self.model, 'clip_gradients'):
                         self.model.clip_gradients(max_norm=1.0)
-                    
                     # Additional gradient clipping if configured
                     if self.config.gradient_clip > 0:
                         nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clip)
                     if self.config.gradient_clip > 0:
                         nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clip)
-                    
                     self.optimizer.step()
                 
                 # Update learning rate with warmup if enabled
