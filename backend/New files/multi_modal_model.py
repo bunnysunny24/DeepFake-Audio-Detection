@@ -194,8 +194,13 @@ class ForensicConsistencyModule(nn.Module):
                 # Feature extraction with gradient checkpointing for memory efficiency
                 if self.training:
                     from torch.utils.checkpoint import checkpoint
-                    conv1_out = checkpoint(F.relu, checkpoint(self.conv1, chunk_reshaped))
-                    conv2_out = checkpoint(F.relu, checkpoint(self.conv2, conv1_out))
+                    # Use single checkpoint to avoid parameter reuse issues with DDP
+                    def checkpoint_block(x):
+                        conv1_out = F.relu(self.conv1(x))
+                        conv2_out = F.relu(self.conv2(conv1_out))
+                        return conv2_out
+                    conv2_out = checkpoint(checkpoint_block, chunk_reshaped)
+                    conv1_out = None  # Not needed for cleanup, set to None
                 else:
                     conv1_out = F.relu(self.conv1(chunk_reshaped))
                     conv2_out = F.relu(self.conv2(conv1_out))
@@ -209,8 +214,10 @@ class ForensicConsistencyModule(nn.Module):
                 chunk_result = self.fc(chunk_result)
                 results.append(chunk_result)
                 
-                # Clear intermediate tensors
-                del chunk_reshaped, conv1_out, conv2_out, pooled, chunk_result
+                # Clear intermediate tensors (only delete variables that exist)
+                del chunk_reshaped, conv2_out, pooled, chunk_result
+                if conv1_out is not None:
+                    del conv1_out
                 
             final_result = torch.cat(results, dim=0)
             
@@ -2477,6 +2484,19 @@ class MultiModalDeepfakeModel(nn.Module):
         else:  # Default to Wav2Vec2
             self.audio_model = Wav2Vec2Model.from_pretrained("facebook/wav2vec2-base")
             audio_out_dim = 768
+        
+        # Disable gradient checkpointing in audio model to avoid DDP conflicts
+        if hasattr(self.audio_model, 'gradient_checkpointing_disable'):
+            self.audio_model.gradient_checkpointing_disable()
+        elif hasattr(self.audio_model, 'config') and hasattr(self.audio_model.config, 'gradient_checkpointing'):
+            self.audio_model.config.gradient_checkpointing = False
+        
+        # Also disable attention dropout during training to avoid parameter reuse issues
+        if hasattr(self.audio_model, 'config'):
+            if hasattr(self.audio_model.config, 'attention_dropout'):
+                self.audio_model.config.attention_dropout = 0.0
+            if hasattr(self.audio_model.config, 'activation_dropout'):
+                self.audio_model.config.activation_dropout = 0.0
             
         self.audio_projection = nn.Linear(audio_out_dim, self.actual_audio_feature_dim)
         
