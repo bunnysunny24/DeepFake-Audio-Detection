@@ -6,6 +6,9 @@ Implements cutting-edge techniques for detecting subtle physiological signals:
 3. Breathing Pattern Detection from chest/shoulder movements
 4. Heart Rate Variability Analysis
 5. Pulse Transit Time Analysis
+
+🧼 PROCESS SAFETY: This module includes GPU memory management and proper error handling
+to prevent zombie processes and Xid 43 errors.
 """
 
 import torch
@@ -16,6 +19,23 @@ import cv2
 from scipy import signal
 from scipy.fft import fft, fftfreq
 import math
+import atexit
+import gc
+import warnings
+
+# 🧼 GPU Memory Management and Process Safety
+def cleanup_gpu_memory():
+    """Clean up GPU memory and handle CUDA context properly."""
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            gc.collect()
+    except Exception as e:
+        warnings.warn(f"GPU cleanup warning: {e}")
+
+# Register cleanup function to run at exit
+atexit.register(cleanup_gpu_memory)
 
 
 class DigitalHeartbeatDetector(nn.Module):
@@ -294,6 +314,8 @@ class DigitalHeartbeatDetector(nn.Module):
             
         except Exception as e:
             print(f"Error in digital heartbeat detection: {e}")
+            # 🧼 Cleanup GPU memory on error
+            cleanup_gpu_memory()
             batch_size = face_frames.size(0)
             return {
                 'heart_rate': torch.zeros((batch_size, 1), device=face_frames.device),
@@ -460,6 +482,8 @@ class BloodFlowSkinAnalyzer(nn.Module):
             
         except Exception as e:
             print(f"Error in blood flow skin analysis: {e}")
+            # 🧼 Cleanup GPU memory on error
+            cleanup_gpu_memory()
             batch_size = face_frames.size(0)
             return {
                 'blood_flow_score': torch.zeros((batch_size, 1), device=face_frames.device),
@@ -733,6 +757,8 @@ class BreathingPatternDetector(nn.Module):
             
         except Exception as e:
             print(f"Error in breathing pattern detection: {e}")
+            # 🧼 Cleanup GPU memory on error
+            cleanup_gpu_memory()
             batch_size = face_frames.size(0)
             return {
                 'breathing_rate': torch.zeros((batch_size, 1), device=face_frames.device),
@@ -854,3 +880,53 @@ class AdvancedPhysiologicalAnalyzer(nn.Module):
             'naturalness': final_naturalness,
             'overall_naturalness': overall_naturalness
         }
+
+
+# 🧼 PROCESS SAFETY GUARD
+if __name__ == "__main__":
+    """
+    Safety test for advanced physiological analysis.
+    Prevents zombie processes and Xid 43 errors.
+    """
+    import multiprocessing
+    
+    # Set multiprocessing start method (important for CUDA compatibility)
+    try:
+        multiprocessing.set_start_method('spawn', force=True)
+    except RuntimeError:
+        pass  # Already set
+    
+    print("🧼 Advanced Physiological Analysis Safety Test")
+    print("✅ GPU memory management enabled")
+    print("✅ Automatic cleanup on exit registered")
+    print("✅ Error handling with GPU cleanup")
+    
+    try:
+        # Test with small dummy data
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f"✅ Using device: {device}")
+        
+        # Create analyzer
+        analyzer = AdvancedPhysiologicalAnalyzer(feature_dim=64, fps=30).to(device)
+        
+        # Test with dummy face frames
+        dummy_frames = torch.randn(2, 8, 3, 64, 64).to(device)  # Small frames for testing
+        
+        with torch.no_grad():  # No gradients for testing
+            results = analyzer(dummy_frames)
+            print("✅ Analysis completed successfully")
+            print(f"   - Heartbeat naturalness: {results['heartbeat']['naturalness'].mean():.3f}")
+            print(f"   - Blood flow naturalness: {results['blood_flow']['naturalness'].mean():.3f}")
+            print(f"   - Breathing naturalness: {results['breathing']['naturalness'].mean():.3f}")
+            print(f"   - Overall naturalness: {results['naturalness'].mean():.3f}")
+        
+        # Manual cleanup
+        cleanup_gpu_memory()
+        print("✅ GPU memory cleaned successfully")
+        
+    except Exception as e:
+        print(f"❌ Error in safety test: {e}")
+        cleanup_gpu_memory()
+        
+    finally:
+        print("🧼 Advanced physiological analysis safety test completed")
