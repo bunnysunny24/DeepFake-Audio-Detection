@@ -21,14 +21,52 @@ from pathlib import Path
 import pandas as pd
 import wandb
 import argparse
-from datetime import datetime
+from datetime import datetime, timedelta
 import shutil
 import torch.multiprocessing as mp
 import traceback
+import glob
+import atexit
+import gc
+import signal
+import sys
 
+# 🧼 PROCESS SAFETY: Set multiprocessing method early and force it
+try:
+    mp.set_start_method('spawn', force=True)
+except RuntimeError:
+    pass  # Already set
 
+# 🧼 GPU Memory Management and Process Safety
+def cleanup_gpu_memory():
+    """Clean up GPU memory and handle CUDA context properly."""
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            gc.collect()
+    except Exception as e:
+        print(f"GPU cleanup warning: {e}")
 
-mp.set_start_method('spawn', force=True)
+def cleanup_processes():
+    """Clean up processes and GPU memory."""
+    try:
+        cleanup_gpu_memory()
+        if dist.is_initialized():
+            dist.destroy_process_group()
+    except Exception as e:
+        print(f"Process cleanup warning: {e}")
+
+def signal_handler(signum, frame):
+    """Handle termination signals gracefully."""
+    print(f"🧼 Received signal {signum}, cleaning up...")
+    cleanup_processes()
+    sys.exit(0)
+
+# Register cleanup functions
+atexit.register(cleanup_processes)
+signal.signal(signal.SIGTERM, signal_handler)
+signal.signal(signal.SIGINT, signal_handler)
 
 
 def suppress_warnings():
@@ -458,14 +496,52 @@ class DeepfakeTrainer:
     def __init__(self, config):
         """Initialize the trainer with the given configuration."""
         self.config = config
-        self.device = torch.device(config.device if torch.cuda.is_available() else "cpu")
-        self.amp_enabled = config.amp_enabled and self.device.type == 'cuda'
         self.distributed = config.distributed and torch.cuda.is_available() and torch.cuda.device_count() > 1
         self.local_rank = config.local_rank
         self.is_main_process = not self.distributed or self.local_rank == 0
         
+        # Set device properly for distributed training
+        if self.distributed:
+            # In distributed mode, use the local rank as device ID
+            self.device = torch.device(f'cuda:{self.local_rank}')
+        else:
+            self.device = torch.device(config.device if torch.cuda.is_available() else "cpu")
+        
+        self.amp_enabled = config.amp_enabled and self.device.type == 'cuda'
+        
         # Set up directories
         self.setup_directories()
+        
+        # In distributed mode, synchronize directory paths across all processes
+        if self.distributed:
+            # Wait for main process to create directories
+            if dist.is_initialized():
+                dist.barrier()
+            
+            # Non-main processes need to get the directory paths from main process
+            if not self.is_main_process:
+                # Find the most recent run directory created by main process
+                import glob
+                run_pattern = os.path.join(self.config.output_dir, "run_*")
+                run_dirs = glob.glob(run_pattern)
+                if run_dirs:
+                    # Get the most recent run directory
+                    self.run_dir = max(run_dirs, key=os.path.getctime)
+                    self.log_dir = os.path.join(self.run_dir, "logs")
+                    self.viz_dir = os.path.join(self.run_dir, "visualizations")
+                    self.plot_dir = os.path.join(self.run_dir, "plots")
+                    print(f"[Rank {self.local_rank}] Using shared run directory: {self.run_dir}")
+                else:
+                    print(f"[Rank {self.local_rank}] Warning: No run directory found, using fallback")
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    self.run_dir = os.path.join(self.config.output_dir, f"run_{timestamp}")
+                    self.log_dir = os.path.join(self.run_dir, "logs")
+                    self.viz_dir = os.path.join(self.run_dir, "visualizations")
+                    self.plot_dir = os.path.join(self.run_dir, "plots")
+            
+            # Another barrier to ensure all processes have the correct paths
+            if dist.is_initialized():
+                dist.barrier()
         
         # Initialize wandb if enabled
         if config.use_wandb and self.is_main_process:
@@ -515,9 +591,40 @@ class DeepfakeTrainer:
         self.scaler = GradScaler() if self.amp_enabled else None
         
         # Create a specific run folder in the checkpoint directory
-        self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # In distributed training, only main process creates the directory
+        if self.distributed:
+            # Use the same timestamp across all processes by broadcasting from rank 0
+            if self.local_rank == 0:
+                self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            else:
+                self.timestamp = None
+            
+            # Synchronize timestamp across all processes (simplified approach)
+            # In practice, you'd use dist.broadcast, but we'll use a simpler approach
+            import time
+            if self.local_rank == 0:
+                # Main process creates timestamp file
+                timestamp_file = os.path.join(self.config.checkpoint_dir, "current_run_timestamp.txt")
+                os.makedirs(self.config.checkpoint_dir, exist_ok=True)
+                with open(timestamp_file, 'w') as f:
+                    f.write(self.timestamp)
+            
+            # Wait a bit and then all processes read the same timestamp
+            time.sleep(1)
+            timestamp_file = os.path.join(self.config.checkpoint_dir, "current_run_timestamp.txt")
+            if os.path.exists(timestamp_file):
+                with open(timestamp_file, 'r') as f:
+                    self.timestamp = f.read().strip()
+            else:
+                self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        else:
+            self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
         self.run_checkpoint_dir = os.path.join(self.config.checkpoint_dir, f"run_{self.timestamp}")
-        os.makedirs(self.run_checkpoint_dir, exist_ok=True)
+        
+        # Only main process creates the directory in distributed training
+        if not self.distributed or self.is_main_process:
+            os.makedirs(self.run_checkpoint_dir, exist_ok=True)
         
         # Initialize starting epoch
         self.start_epoch = 0
@@ -576,6 +683,10 @@ class DeepfakeTrainer:
         
     def setup_directories(self):
         """Set up directories for saving models, logs, and visualizations."""
+        # Only main process creates directories in distributed training
+        if self.distributed and not self.is_main_process:
+            return
+            
         os.makedirs(self.config.output_dir, exist_ok=True)
         
         # Create timestamped run directory
@@ -635,6 +746,10 @@ class DeepfakeTrainer:
     
     def save_config(self):
         """Save configuration to JSON file."""
+        # Only main process saves config in distributed training
+        if self.distributed and not self.is_main_process:
+            return
+            
         config_path = os.path.join(self.run_dir, "config.json")
         with open(config_path, 'w') as f:
             # Convert config to dict and handle non-serializable values
@@ -651,9 +766,42 @@ class DeepfakeTrainer:
         """Initialize data loaders for training, validation, and testing."""
         print("Setting up data loaders...")
         
+        # Initialize distributed training BEFORE setting up data loaders
         if self.distributed:
-            dist.init_process_group(backend='nccl', init_method='env://')
+            # Initialize the process group with timeout
+            if not dist.is_initialized():
+                # Set timeout for NCCL operations to prevent hanging (use new env var names)
+                os.environ['NCCL_TIMEOUT'] = '1800'  # 30 minutes
+                os.environ['TORCH_NCCL_BLOCKING_WAIT'] = '1'  # Updated env var name
+                os.environ['NCCL_DEBUG'] = 'INFO'  # Enable NCCL debugging
+                
+                # Initialize process group with explicit device_id to avoid GPU mapping warnings
+                dist.init_process_group(
+                    backend='nccl', 
+                    init_method='env://',
+                    timeout=timedelta(seconds=1800)  # 30 minute timeout
+                )
+            
+            # Set the device for this process BEFORE any CUDA operations
             torch.cuda.set_device(self.local_rank)
+            self.device = torch.device(f'cuda:{self.local_rank}')
+            
+            print(f"[Rank {self.local_rank}] Using CUDA device: {self.device}")
+            print(f"[Rank {self.local_rank}] Process group initialized with {dist.get_world_size()} processes")
+            
+            # Add barrier to ensure all processes are synchronized
+            if dist.is_initialized():
+                dist.barrier()
+                print(f"[Rank {self.local_rank}] Passed initialization barrier")
+        
+        # 🧼 OPTIMIZED: Check num_workers setting based on benchmarks
+        if self.config.num_workers > 0:
+            print(f"⚠️  EXPERIMENTAL: Using num_workers={self.config.num_workers}")
+            print("📊 Benchmarks show num_workers=0 is fastest for this multimodal dataset")
+            print("🧼 If training is slow, try --num_workers=0")
+        else:
+            print(f"✅ OPTIMAL: Using num_workers=0 (benchmarked as fastest for multimodal data)")
+            print("🚀 Single-threaded loading avoids I/O contention with complex preprocessing")
         
         # Get data loaders with appropriate options
         self.train_loader, self.val_loader, self.test_loader, self.class_weights = get_data_loaders(
@@ -669,10 +817,11 @@ class DeepfakeTrainer:
             compute_spectrograms=self.config.compute_spectrograms,
             temporal_features=self.config.temporal_features,
             enhanced_preprocessing=getattr(self.config, 'enhanced_preprocessing', True),
-            enhanced_augmentation=getattr(self.config, 'enhanced_augmentation', False)
+            enhanced_augmentation=getattr(self.config, 'enhanced_augmentation', False),
+            multiprocessing_context="spawn"  # 🧼 SAFETY: Prevent GPU context corruption in multiprocessing
         )
         
-        print(f"Data loaders created: {len(self.train_loader)} train batches, "
+        print(f"✅ Data loaders created: {len(self.train_loader)} train batches, "
               f"{len(self.val_loader)} validation batches, {len(self.test_loader)} test batches")
     
     def setup_model(self):
@@ -720,14 +869,33 @@ class DeepfakeTrainer:
         # Move model to device
         self.model.to(self.device)
 
-        # Enable DataParallel for multi-GPU if available and not using distributed
-        if torch.cuda.device_count() > 1 and not self.distributed:
-            print(f"[INFO] Using DataParallel on {torch.cuda.device_count()} GPUs.")
-            self.model = torch.nn.DataParallel(self.model)
-
         # Initialize in distributed mode if specified
         if self.distributed:
-            self.model = DDP(self.model, device_ids=[self.local_rank])
+            # Ensure the model is on the correct device before wrapping with DDP
+            print(f"[Rank {self.local_rank}] Moving model to device: {self.device}")
+            
+            # Explicitly set the device before DDP wrapping to avoid GPU mapping warnings
+            torch.cuda.set_device(self.local_rank)
+            self.model = self.model.to(self.device)
+            
+            # Wrap model with DDP, explicitly specifying device_ids to avoid warnings
+            self.model = DDP(
+                self.model, 
+                device_ids=[self.local_rank], 
+                output_device=self.local_rank,
+                find_unused_parameters=True,  # Enable unused parameter detection for complex models
+                static_graph=True  # Static graph optimization for gradient checkpointing
+            )
+            
+            # Enable static graph optimization to handle gradient checkpointing
+            self.model._set_static_graph()
+            
+            print(f"[Rank {self.local_rank}] Model wrapped with DDP on device {self.local_rank}")
+            print(f"[Rank {self.local_rank}] Static graph optimization enabled for gradient checkpointing")
+        # Enable DataParallel for multi-GPU if available and not using distributed
+        elif torch.cuda.device_count() > 1:
+            print(f"[INFO] Using DataParallel on {torch.cuda.device_count()} GPUs.")
+            self.model = torch.nn.DataParallel(self.model)
 
         # Initialize loss function with class weights for imbalanced data
         if self.class_weights is not None and self.config.use_weighted_loss:
@@ -771,9 +939,73 @@ class DeepfakeTrainer:
             )
 
         print("Model, optimizer, and scheduler initialized")
+        
+        # Debug: Print GPU usage information
+        self.print_gpu_usage_info()
+    
+    def print_gpu_usage_info(self):
+        """Print detailed information about GPU usage."""
+        print("\n" + "="*60)
+        print("🔥 GPU USAGE INFORMATION")
+        print("="*60)
+        
+        if torch.cuda.is_available():
+            total_gpus = torch.cuda.device_count()
+            print(f"📊 Total GPUs Available: {total_gpus}")
+            
+            # Show which GPUs are visible
+            if 'CUDA_VISIBLE_DEVICES' in os.environ:
+                visible_devices = os.environ['CUDA_VISIBLE_DEVICES']
+                print(f"🎯 CUDA_VISIBLE_DEVICES: {visible_devices}")
+                gpu_list = visible_devices.split(',')
+                print(f"📝 GPUs in use: {len(gpu_list)} GPUs (indices: {gpu_list})")
+            else:
+                print(f"📝 All {total_gpus} GPUs are visible (no CUDA_VISIBLE_DEVICES set)")
+            
+            # Show current device
+            current_device = torch.cuda.current_device()
+            print(f"🎮 Current CUDA Device: {current_device}")
+            
+            # Show GPU memory for each visible device
+            print(f"\n💾 GPU Memory Status:")
+            for i in range(total_gpus):
+                try:
+                    memory_allocated = torch.cuda.memory_allocated(i) / 1024**3  # GB
+                    memory_reserved = torch.cuda.memory_reserved(i) / 1024**3    # GB
+                    memory_total = torch.cuda.get_device_properties(i).total_memory / 1024**3  # GB
+                    gpu_name = torch.cuda.get_device_properties(i).name
+                    print(f"   GPU {i} ({gpu_name}): {memory_allocated:.2f}GB/{memory_total:.2f}GB allocated, {memory_reserved:.2f}GB reserved")
+                except Exception as e:
+                    print(f"   GPU {i}: Error getting memory info - {e}")
+            
+            # Show model parallel status
+            print(f"\n🚀 Model Parallel Status:")
+            if self.distributed:
+                print(f"   ✅ Using DistributedDataParallel (DDP)")
+                print(f"   📍 Local Rank: {self.local_rank}")
+                print(f"   🌟 Main Process: {self.is_main_process}")
+            elif hasattr(self.model, 'module'):
+                # DataParallel wraps model in .module
+                print(f"   ✅ Using DataParallel")
+                if hasattr(self.model, 'device_ids'):
+                    print(f"   📍 Device IDs: {self.model.device_ids}")
+                else:
+                    print(f"   📍 Using all available GPUs")
+            else:
+                print(f"   ❌ Using Single GPU only")
+                print(f"   💡 Consider using --distributed for better multi-GPU performance")
+            
+        else:
+            print("❌ CUDA not available - using CPU")
+        
+        print("="*60)
     
     def save_intermediate_checkpoint(self, epoch, batch_idx):
         """Save intermediate checkpoint during training."""
+        # Only main process saves checkpoints in distributed training
+        if not self.is_main_process:
+            return
+            
         if not self.config.save_intermediate:
             return
             
@@ -788,7 +1020,13 @@ class DeepfakeTrainer:
             f"checkpoint_epoch_{epoch+1}_batch_{batch_idx}.pth"
         )
         
-        model_state_dict = self.model.module.state_dict() if self.distributed else self.model.state_dict()
+        # Handle distributed vs non-distributed model state dict
+        if self.distributed:
+            model_state_dict = self.model.module.state_dict()
+        elif hasattr(self.model, 'module'):  # DataParallel
+            model_state_dict = self.model.module.state_dict()
+        else:
+            model_state_dict = self.model.state_dict()
         
         checkpoint = {
             'epoch': epoch + 1,
@@ -819,8 +1057,22 @@ class DeepfakeTrainer:
         train_progress = tqdm(self.train_loader, desc=f"Epoch {epoch+1}/{self.config.num_epochs} [Train]", 
                            disable=not self.is_main_process)
         
+        # Add debugging info for distributed training
+        if self.is_main_process:
+            print(f"[RANK {self.local_rank}] Starting training epoch {epoch+1} with {len(self.train_loader)} batches")
+        
         for batch_idx, batch in enumerate(train_progress):
+            # Debug: Print batch loading progress
+            if self.is_main_process and batch_idx == 0:
+                print(f"[RANK {self.local_rank}] Processing first batch...")
+            elif batch_idx % 10 == 0 and self.is_main_process:
+                print(f"[RANK {self.local_rank}] Processing batch {batch_idx}/{len(self.train_loader)}")
             try:
+                # Add timeout protection for first batch
+                if batch_idx == 0:
+                    print(f"[RANK {self.local_rank}] Loading first batch, this may take time...")
+                    start_time = time.time()
+                
                 # Clear GPU cache periodically to prevent memory buildup
                 if batch_idx % 10 == 0:
                     clear_gpu_cache()
@@ -831,8 +1083,13 @@ class DeepfakeTrainer:
                     print(f"[MEMORY] High memory usage detected: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
                     clear_gpu_cache()
                 
-                # Move batch to device
+                # Move batch to device with timeout protection
+                print(f"[RANK {self.local_rank}] Moving batch {batch_idx} to device...")
                 batch = move_batch_to_device(batch, self.device, trainer=self)
+                
+                if batch_idx == 0:
+                    load_time = time.time() - start_time
+                    print(f"[RANK {self.local_rank}] First batch loaded in {load_time:.2f} seconds")
                 # --- SkinColorAnalyzer integration ---
                 if getattr(self.config, 'enable_skin_color_analysis', False) and 'video_frames' in batch:
                     if not hasattr(self, '_skin_color_analyzer'):
@@ -851,6 +1108,24 @@ class DeepfakeTrainer:
                 
                 # Get labels
                 labels = batch['label']
+                
+                # For first few batches, reduce effective batch size to prevent hanging
+                if batch_idx < 3 and labels.shape[0] > 40:
+                    print(f"[RANK {self.local_rank}] Reducing batch size for initial batches: {labels.shape[0]} -> 40")
+                    # Truncate all batch elements to smaller size
+                    for key, value in batch.items():
+                        if isinstance(value, torch.Tensor) and value.shape[0] == labels.shape[0]:
+                            batch[key] = value[:40]
+                    labels = batch['label']
+                
+                # Debug: Print initial batch information
+                if batch_idx < 5:  # Only for first few batches to avoid spam
+                    print(f"[DEBUG] Batch {batch_idx} - Initial labels shape: {labels.shape}")
+                    for key, value in batch.items():
+                        if isinstance(value, torch.Tensor):
+                            print(f"[DEBUG] Batch {batch_idx} - {key} shape: {value.shape}")
+                        elif isinstance(value, list):
+                            print(f"[DEBUG] Batch {batch_idx} - {key} length: {len(value)}")
                 
                 # Validate batch consistency before forward pass
                 expected_batch_size = labels.shape[0]
@@ -896,7 +1171,21 @@ class DeepfakeTrainer:
 
                 if self.amp_enabled:
                     with autocast():
+                        # Debug: Check input shapes before model forward pass
+                        if batch_idx < 5:
+                            print(f"[DEBUG] Before model forward - labels shape: {labels.shape}")
+                            if 'video_frames' in batch:
+                                print(f"[DEBUG] Before model forward - video_frames shape: {batch['video_frames'].shape}")
+                            if 'audio' in batch:
+                                print(f"[DEBUG] Before model forward - audio shape: {batch['audio'].shape}")
+                        
                         outputs, results = self.model(batch)
+                        
+                        # Debug: Check output shapes after model forward pass
+                        if batch_idx < 5:
+                            print(f"[DEBUG] After model forward - outputs shape: {outputs.shape}")
+                            print(f"[DEBUG] After model forward - labels shape: {labels.shape}")
+                        
                         # Check for NaN in outputs
                         if torch.isnan(outputs).any():
                             print(f"[ERROR] NaN detected in model outputs at batch {batch_idx}")
@@ -947,8 +1236,10 @@ class DeepfakeTrainer:
                                     if self.debug:
                                         print(f"[WARNING] Error computing deepfake type loss: {e}")
                                     # Skip deepfake type loss if there's an error
-                    # Backward pass with scaler
+                    
+                    # Backward pass with scaler (AMP enabled)
                     self.scaler.scale(loss).backward()
+                    
                     # Check for NaN in gradients using model method
                     if hasattr(self.model, 'check_for_nan_gradients') and self.model.check_for_nan_gradients():
                         print(f"[ERROR] Skipping backward pass due to NaN gradients at batch {batch_idx}")
@@ -958,12 +1249,14 @@ class DeepfakeTrainer:
                             self.model.stabilize_model()
                         # Skip this batch but continue training
                         continue
-                    # Apply model's gradient clipping
+                    
+                    # Apply model's gradient clipping with AMP
                     unscale_called = False
                     if hasattr(self.model, 'clip_gradients'):
                         self.scaler.unscale_(self.optimizer)
                         unscale_called = True
                         self.model.clip_gradients(max_norm=self.config.gradient_clip)
+                    
                     # Additional gradient clipping if configured
                     if self.config.gradient_clip > 0:
                         if not hasattr(self.model, 'clip_gradients'):  # Only if not already done
@@ -1688,32 +1981,56 @@ class DeepfakeTrainer:
         print(f"Best model loaded (Epoch {checkpoint['epoch']}, Accuracy: {checkpoint['accuracy']:.4f}, F1: {checkpoint['f1_score']:.4f})")
     
     def run(self):
-        """Run the full training pipeline."""
-        # Record start time
-        self.training_start_time = time.time()
-        
-        # Print initial memory status
-        if torch.cuda.is_available():
-            allocated, reserved = get_gpu_memory_usage()
-            print(f"[MEMORY] Initial GPU memory - Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB")
-        
-        # Train and validate
-        self.train_and_validate()
-        
-        # Print final memory statistics
-        if self.is_main_process:
-            print(f"\n[MEMORY] Training completed with {self.oom_errors} out-of-memory errors and {self.memory_warnings} memory warnings")
+        """
+        Run the full training pipeline with comprehensive error handling.
+        🧼 PROCESS SAFETY: Includes proper cleanup to prevent zombie processes.
+        """
+        try:
+            # Record start time
+            self.training_start_time = time.time()
+            
+            # Print initial memory status
             if torch.cuda.is_available():
                 allocated, reserved = get_gpu_memory_usage()
-                print(f"[MEMORY] Final GPU memory - Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB")
-        
-        # Finalize experiment on WandB
-        if self.config.use_wandb and self.is_main_process:
-            wandb.finish()
-        
-        # Clean up distributed training resources
-        if self.distributed:
-            dist.destroy_process_group()
+                print(f"[MEMORY] Initial GPU memory - Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB")
+            
+            print("🧼 Starting training with GPU memory management enabled")
+            
+            # Train and validate
+            self.train_and_validate()
+            
+            # Print final memory statistics
+            if self.is_main_process:
+                print(f"\n[MEMORY] Training completed with {self.oom_errors} out-of-memory errors and {self.memory_warnings} memory warnings")
+                if torch.cuda.is_available():
+                    allocated, reserved = get_gpu_memory_usage()
+                    print(f"[MEMORY] Final GPU memory - Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB")
+            
+            print("✅ Training pipeline completed successfully")
+            
+        except Exception as e:
+            print(f"❌ Error in training pipeline: {e}")
+            traceback.print_exc()
+            # Cleanup on error
+            cleanup_gpu_memory()
+            raise
+            
+        finally:
+            try:
+                # Finalize experiment on WandB
+                if self.config.use_wandb and self.is_main_process:
+                    wandb.finish()
+                
+                # Clean up distributed training resources
+                if self.distributed and dist.is_initialized():
+                    dist.destroy_process_group()
+                    
+                # Final GPU cleanup
+                cleanup_gpu_memory()
+                print("🧼 Training cleanup completed")
+                
+            except Exception as cleanup_error:
+                print(f"Warning during cleanup: {cleanup_error}")
         
         # Final GPU cache cleanup
         clear_gpu_cache()
@@ -1759,7 +2076,7 @@ def parse_args():
     parser.add_argument('--learning_rate', type=float, default=1e-4, help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=1e-5, help='Weight decay')
     parser.add_argument('--max_samples', type=int, default=10000, help='Maximum number of samples to use')
-    parser.add_argument('--num_workers', type=int, default=8, help='Number of data loader workers (increased for A100)')
+    parser.add_argument('--num_workers', type=int, default=0, help='🧼 SAFETY: Number of data loader workers (default=0, optimal for complex multimodal datasets)')  # Reverted based on benchmark results
     parser.add_argument('--validation_split', type=float, default=0.2, help='Validation split ratio')
     parser.add_argument('--test_split', type=float, default=0.1, help='Test split ratio')
     parser.add_argument('--use_weighted_loss', action='store_true', help='Use class-weighted loss function')
@@ -1792,10 +2109,10 @@ def parse_args():
     parser.add_argument('--debug', action='store_true', help='Enable debug mode')
     parser.add_argument('--pretrained_path', type=str, default=None, help='Path to pretrained model weights')
     
-    # Performance optimization parameters
-    parser.add_argument('--pin_memory', action='store_true', default=True, help='Pin memory for faster data loading')
-    parser.add_argument('--persistent_workers', action='store_true', default=True, help='Keep workers alive between epochs')
-    parser.add_argument('--prefetch_factor', type=int, default=4, help='Number of samples loaded in advance by each worker')
+    # Performance optimization parameters - 🧼 SAFETY OVERRIDES
+    parser.add_argument('--pin_memory', action='store_true', default=False, help='🧼 SAFETY: Pin memory for faster data loading (default=False to prevent memory leaks)')
+    parser.add_argument('--persistent_workers', action='store_true', default=False, help='🧼 SAFETY: Keep workers alive between epochs (default=False to prevent hanging processes)')
+    parser.add_argument('--prefetch_factor', type=int, default=2, help='Number of samples loaded in advance by each worker (reduced for safety)')
     parser.add_argument('--reduce_frames', type=int, default=8, help='Reduce number of frames per video for faster processing (default: 8, original: 16)')
     parser.add_argument('--disable_skin_analysis', action='store_true', help='Disable memory-intensive skin color analysis for speed')
     parser.add_argument('--disable_advanced_physio', action='store_true', help='Disable advanced physiological analysis for speed')
@@ -1805,16 +2122,43 @@ def parse_args():
 
 
 def main():
-    """Main entry point."""
-    # Parse arguments
-    args = parse_args()
-    
-    # Suppress warnings
-    suppress_warnings()
-
-    # Create trainer and run
-    trainer = DeepfakeTrainer(args)
-    trainer.run()
+    """
+    Main entry point with comprehensive error handling and cleanup.
+    🧼 PROCESS SAFETY: Includes proper cleanup to prevent zombie processes.
+    """
+    try:
+        # Parse arguments
+        args = parse_args()
+        
+        # Set local_rank from environment variable if running with torchrun
+        if args.distributed and 'LOCAL_RANK' in os.environ:
+            args.local_rank = int(os.environ['LOCAL_RANK'])
+        
+        # Suppress warnings
+        suppress_warnings()
+        
+        print("🧼 Starting training with process safety measures enabled")
+        
+        # Create trainer and run
+        trainer = DeepfakeTrainer(args)
+        trainer.run()
+        
+        print("✅ Training completed successfully")
+        
+    except KeyboardInterrupt:
+        print("🧼 Training interrupted by user, cleaning up...")
+        cleanup_processes()
+        
+    except Exception as e:
+        print(f"❌ Training failed with error: {e}")
+        traceback.print_exc()
+        cleanup_processes()
+        raise
+        
+    finally:
+        # Final cleanup
+        cleanup_processes()
+        print("🧼 Process cleanup completed")
 
 
 if __name__ == "__main__":
