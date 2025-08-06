@@ -2086,7 +2086,7 @@ def parse_args():
     parser.add_argument('--num_epochs', type=int, default=30, help='Number of training epochs')
     parser.add_argument('--learning_rate', type=float, default=1e-4, help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=1e-5, help='Weight decay')
-    parser.add_argument('--max_samples', type=int, default=10000, help='Maximum number of samples to use')
+    parser.add_argument('--max_samples', type=int, default=1000, help='Maximum number of samples to use')
     parser.add_argument('--num_workers', type=int, default=0, help='🧼 SAFETY: Number of data loader workers (default=0, optimal for complex multimodal datasets)')  # Reverted based on benchmark results
     parser.add_argument('--validation_split', type=float, default=0.2, help='Validation split ratio')
     parser.add_argument('--test_split', type=float, default=0.1, help='Test split ratio')
