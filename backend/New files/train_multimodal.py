@@ -883,15 +883,14 @@ class DeepfakeTrainer:
                 self.model, 
                 device_ids=[self.local_rank], 
                 output_device=self.local_rank,
-                find_unused_parameters=True,  # Enable unused parameter detection for complex models
-                static_graph=True  # Static graph optimization for gradient checkpointing
+                find_unused_parameters=True,  # Re-enable to handle dynamic parameter usage
+                static_graph=False  # Disable static graph to allow dynamic parameter usage
             )
             
-            # Enable static graph optimization to handle gradient checkpointing
-            self.model._set_static_graph()
+            # Note: Static graph disabled due to dynamic parameter usage in multimodal model
             
             print(f"[Rank {self.local_rank}] Model wrapped with DDP on device {self.local_rank}")
-            print(f"[Rank {self.local_rank}] Static graph optimization enabled for gradient checkpointing")
+            print(f"[Rank {self.local_rank}] Dynamic parameter detection enabled (find_unused_parameters=True)")
         # Enable DataParallel for multi-GPU if available and not using distributed
         elif torch.cuda.device_count() > 1:
             print(f"[INFO] Using DataParallel on {torch.cuda.device_count()} GPUs.")
@@ -1238,38 +1237,50 @@ class DeepfakeTrainer:
                                     # Skip deepfake type loss if there's an error
                     
                     # Backward pass with scaler (AMP enabled)
-                    self.scaler.scale(loss).backward()
-                    
-                    # Check for NaN in gradients using model method
-                    if hasattr(self.model, 'check_for_nan_gradients') and self.model.check_for_nan_gradients():
-                        print(f"[ERROR] Skipping backward pass due to NaN gradients at batch {batch_idx}")
-                        self.optimizer.zero_grad()
-                        # Apply model stabilization
-                        if hasattr(self.model, 'stabilize_model'):
-                            self.model.stabilize_model()
-                        # Skip this batch but continue training
-                        continue
-                    
-                    # Apply model's gradient clipping with AMP
-                    unscale_called = False
-                    if hasattr(self.model, 'clip_gradients'):
-                        self.scaler.unscale_(self.optimizer)
-                        unscale_called = True
-                        self.model.clip_gradients(max_norm=self.config.gradient_clip)
-                    
-                    # Additional gradient clipping if configured
-                    if self.config.gradient_clip > 0:
-                        if not hasattr(self.model, 'clip_gradients'):  # Only if not already done
+                    try:
+                        self.scaler.scale(loss).backward()
+                        
+                        # Check for NaN in gradients using model method
+                        if hasattr(self.model, 'check_for_nan_gradients') and self.model.check_for_nan_gradients():
+                            print(f"[ERROR] Skipping backward pass due to NaN gradients at batch {batch_idx}")
+                            self.optimizer.zero_grad()
+                            # Apply model stabilization
+                            if hasattr(self.model, 'stabilize_model'):
+                                self.model.stabilize_model()
+                            # Reset scaler state
+                            self.scaler.update()
+                            # Skip this batch but continue training
+                            continue
+                        
+                        # Apply model's gradient clipping with AMP
+                        unscale_called = False
+                        if hasattr(self.model, 'clip_gradients'):
                             self.scaler.unscale_(self.optimizer)
                             unscale_called = True
-                        nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clip)
-                    
-                    # Ensure unscale is called at least once before step
-                    if not unscale_called:
-                        self.scaler.unscale_(self.optimizer)
-                    
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
+                            self.model.clip_gradients(max_norm=self.config.gradient_clip)
+                        
+                        # Additional gradient clipping if configured
+                        if self.config.gradient_clip > 0:
+                            if not hasattr(self.model, 'clip_gradients'):  # Only if not already done
+                                self.scaler.unscale_(self.optimizer)
+                                unscale_called = True
+                            nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clip)
+                        
+                        # Ensure unscale is called at least once before step
+                        if not unscale_called:
+                            self.scaler.unscale_(self.optimizer)
+                        
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
+                        
+                    except Exception as scaler_error:
+                        print(f"[ERROR] AMP scaler error at batch {batch_idx}: {scaler_error}")
+                        # Reset optimizer and scaler state
+                        self.optimizer.zero_grad()
+                        # Recreate scaler to fix state issues
+                        self.scaler = GradScaler(enabled=self.amp_enabled, init_scale=2**8)
+                        print(f"[INFO] Recreated AMP scaler with fresh state")
+                        continue
                 else:
                     outputs, results = self.model(batch)
                     # Check for NaN in outputs
