@@ -8,6 +8,8 @@ from torch.cuda.amp import GradScaler, autocast
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from sklearn.metrics import precision_recall_fscore_support, confusion_matrix, roc_auc_score, accuracy_score
+import matplotlib
+matplotlib.use('Agg')  # Set non-interactive backend for server environments
 import matplotlib.pyplot as plt
 import seaborn as sns
 import warnings
@@ -124,45 +126,71 @@ def visualize_attention_maps(frames, attention_maps, save_dir, sample_idx, epoch
 
 def plot_metrics(train_values, val_values, metric_name, epoch, save_dir="plots"):
     """Plot training and validation metrics on the same graph and save to file."""
-    os.makedirs(save_dir, exist_ok=True)
-    
-    plt.figure(figsize=(10, 6))
-    plt.plot(range(1, len(train_values) + 1), train_values, label=f"Train {metric_name}", color="blue", marker="o")
-    plt.plot(range(1, len(val_values) + 1), val_values, label=f"Validation {metric_name}", color="red", marker="o")
-    plt.title(f"{metric_name.capitalize()} for Epoch {epoch}")
-    plt.xlabel("Epoch")
-    plt.ylabel(metric_name.capitalize())
-    plt.legend()
-    plt.grid(True)
-    
-    # Save plot
-    plot_path = os.path.join(save_dir, f"{metric_name}_epoch_{epoch}.png")
-    plt.savefig(plot_path)
-    plt.close()
-    
-    return plot_path
+    try:
+        # Ensure matplotlib uses a non-interactive backend
+        plt.switch_backend('Agg')
+        
+        os.makedirs(save_dir, exist_ok=True)
+        
+        plt.figure(figsize=(10, 6))
+        plt.plot(range(1, len(train_values) + 1), train_values, label=f"Train {metric_name}", color="blue", marker="o")
+        plt.plot(range(1, len(val_values) + 1), val_values, label=f"Validation {metric_name}", color="red", marker="o")
+        plt.title(f"{metric_name.capitalize()} for Epoch {epoch}")
+        plt.xlabel("Epoch")
+        plt.ylabel(metric_name.capitalize())
+        plt.legend()
+        plt.grid(True)
+        
+        # Save plot
+        plot_path = os.path.join(save_dir, f"{metric_name}_epoch_{epoch}.png")
+        plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        print(f"[DEBUG] Plot saved successfully: {plot_path}")
+        return plot_path
+        
+    except Exception as e:
+        print(f"❌ Error in plot_metrics for {metric_name}: {e}")
+        import traceback
+        traceback.print_exc()
+        # Ensure plot is closed even if there's an error
+        plt.close('all')
+        return None
 
 
 def plot_confusion_matrix(y_true, y_pred, epoch, save_dir="plots"):
     """Plot confusion matrix and save to file."""
-    os.makedirs(save_dir, exist_ok=True)
-    
-    cm = confusion_matrix(y_true, y_pred)
-    
-    plt.figure(figsize=(8, 6))
-    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", cbar=False)
-    plt.title(f"Confusion Matrix - Epoch {epoch}")
-    plt.xlabel("Predicted Label")
-    plt.ylabel("True Label")
-    plt.xticks([0.5, 1.5], ["Real", "Fake"])
-    plt.yticks([0.5, 1.5], ["Real", "Fake"])
-    
-    # Save plot
-    cm_path = os.path.join(save_dir, f"confusion_matrix_epoch_{epoch}.png")
-    plt.savefig(cm_path)
-    plt.close()
-    
-    return cm_path
+    try:
+        # Ensure matplotlib uses a non-interactive backend
+        plt.switch_backend('Agg')
+        
+        os.makedirs(save_dir, exist_ok=True)
+        
+        cm = confusion_matrix(y_true, y_pred)
+        
+        plt.figure(figsize=(8, 6))
+        sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", cbar=False)
+        plt.title(f"Confusion Matrix - Epoch {epoch}")
+        plt.xlabel("Predicted Label")
+        plt.ylabel("True Label")
+        plt.xticks([0.5, 1.5], ["Real", "Fake"])
+        plt.yticks([0.5, 1.5], ["Real", "Fake"])
+        
+        # Save plot
+        cm_path = os.path.join(save_dir, f"confusion_matrix_epoch_{epoch}.png")
+        plt.savefig(cm_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        print(f"[DEBUG] Confusion matrix saved successfully: {cm_path}")
+        return cm_path
+        
+    except Exception as e:
+        print(f"❌ Error in plot_confusion_matrix: {e}")
+        import traceback
+        traceback.print_exc()
+        # Ensure plot is closed even if there's an error
+        plt.close('all')
+        return None
 
 
 def calculate_metrics(y_true, y_pred, y_probs, epoch, return_dict=False):
@@ -1006,37 +1034,48 @@ class DeepfakeTrainer:
             return
             
         if not self.config.save_intermediate:
+            print(f"[DEBUG] Intermediate saving disabled, skipping batch {batch_idx}")
             return
             
         if batch_idx % self.config.save_intermediate_interval != 0:
+            print(f"[DEBUG] Batch {batch_idx} not at save interval ({self.config.save_intermediate_interval}), skipping")
             return
+        
+        print(f"[CHECKPOINT] Saving intermediate checkpoint at epoch {epoch+1}, batch {batch_idx}")
+        
+        try:
+            intermediate_dir = os.path.join(self.run_checkpoint_dir, "intermediate")
+            os.makedirs(intermediate_dir, exist_ok=True)
             
-        intermediate_dir = os.path.join(self.run_checkpoint_dir, "intermediate")
-        os.makedirs(intermediate_dir, exist_ok=True)
-        
-        checkpoint_path = os.path.join(
-            intermediate_dir, 
-            f"checkpoint_epoch_{epoch+1}_batch_{batch_idx}.pth"
-        )
-        
-        # Handle distributed vs non-distributed model state dict
-        if self.distributed:
-            model_state_dict = self.model.module.state_dict()
-        elif hasattr(self.model, 'module'):  # DataParallel
-            model_state_dict = self.model.module.state_dict()
-        else:
-            model_state_dict = self.model.state_dict()
-        
-        checkpoint = {
-            'epoch': epoch + 1,
-            'batch': batch_idx,
-            'model_state_dict': model_state_dict,
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'timestamp': datetime.now().strftime("%Y%m%d_%H%M%S")
-        }
-        
-        torch.save(checkpoint, checkpoint_path)
-        print(f"Intermediate checkpoint saved: {checkpoint_path}")
+            checkpoint_path = os.path.join(
+                intermediate_dir, 
+                f"checkpoint_epoch_{epoch+1}_batch_{batch_idx}.pth"
+            )
+            
+            # Handle distributed vs non-distributed model state dict
+            if self.distributed:
+                model_state_dict = self.model.module.state_dict()
+            elif hasattr(self.model, 'module'):  # DataParallel
+                model_state_dict = self.model.module.state_dict()
+            else:
+                model_state_dict = self.model.state_dict()
+            
+            checkpoint = {
+                'epoch': epoch + 1,
+                'batch': batch_idx,
+                'model_state_dict': model_state_dict,
+                'optimizer_state_dict': self.optimizer.state_dict(),
+                'timestamp': datetime.now().strftime("%Y%m%d_%H%M%S"),
+                'config': vars(self.config)  # Save config for resume compatibility
+            }
+            
+            torch.save(checkpoint, checkpoint_path)
+            print(f"✅ Intermediate checkpoint saved: {checkpoint_path}")
+            
+        except Exception as e:
+            print(f"❌ Error saving intermediate checkpoint: {e}")
+            import traceback
+            traceback.print_exc()
     
     def train_epoch(self, epoch):
         """Train the model for one epoch."""
@@ -1393,6 +1432,10 @@ class DeepfakeTrainer:
                         **component_weights
                     })
                     
+                # Save intermediate checkpoint if enabled (before any exception handling)
+                if self.is_main_process:
+                    self.save_intermediate_checkpoint(epoch, batch_idx)
+                
                 # Visualize sample predictions periodically
                 if (batch_idx + 1) % self.config.visualization_interval == 0 and self.is_main_process:
                     try:
@@ -1404,10 +1447,6 @@ class DeepfakeTrainer:
                         )
                     except Exception as vis_error:
                         print(f"Error visualizing predictions: {vis_error}")
-                
-                # Save intermediate checkpoint if enabled
-                if self.is_main_process:
-                    self.save_intermediate_checkpoint(epoch, batch_idx)
                 
             except torch.cuda.OutOfMemoryError as oom_error:
                 print(f"[CUDA OOM] Out of memory error in training batch {batch_idx}: {oom_error}")
@@ -1823,18 +1862,29 @@ class DeepfakeTrainer:
                 # Save checkpoint
                 self.save_checkpoint(epoch, val_acc, val_f1)
                 
-                # Plot metrics
-                for metric_name, train_values, val_values in [
-                    ('loss', self.metrics['train_losses'], self.metrics['val_losses']),
-                    ('accuracy', self.metrics['train_accuracies'], self.metrics['val_accuracies']),
-                    ('f1', self.metrics['train_f1_scores'], self.metrics['val_f1_scores']),
-                    ('auc', self.metrics['train_auc_scores'], self.metrics['val_auc_scores'])
-                ]:
-                    plot_path = plot_metrics(train_values, val_values, metric_name, epoch+1, self.plot_dir)
+                # Plot metrics with error handling
+                print("[DEBUG] Starting to generate plots...")
+                try:
+                    for metric_name, train_values, val_values in [
+                        ('loss', self.metrics['train_losses'], self.metrics['val_losses']),
+                        ('accuracy', self.metrics['train_accuracies'], self.metrics['val_accuracies']),
+                        ('f1', self.metrics['train_f1_scores'], self.metrics['val_f1_scores']),
+                        ('auc', self.metrics['train_auc_scores'], self.metrics['val_auc_scores'])
+                    ]:
+                        print(f"[DEBUG] Plotting {metric_name} - Train: {len(train_values)} values, Val: {len(val_values)} values")
+                        plot_path = plot_metrics(train_values, val_values, metric_name, epoch+1, self.plot_dir)
+                        print(f"[DEBUG] Successfully saved {metric_name} plot to: {plot_path}")
+                        
+                        # Log metrics plot to WandB
+                        if self.config.use_wandb:
+                            wandb.log({f"{metric_name}_plot": wandb.Image(plot_path)})
                     
-                    # Log metrics plot to WandB
-                    if self.config.use_wandb:
-                        wandb.log({f"{metric_name}_plot": wandb.Image(plot_path)})
+                    print("✅ All plots generated successfully!")
+                    
+                except Exception as e:
+                    print(f"❌ Error generating plots: {e}")
+                    import traceback
+                    traceback.print_exc()
                 
                 # Log epoch metrics to WandB
                 if self.config.use_wandb:
@@ -2111,7 +2161,7 @@ def parse_args():
     parser.add_argument('--log_interval', type=int, default=10, help='Interval for logging batch results')
     parser.add_argument('--visualization_interval', type=int, default=50, help='Interval for visualizing predictions')
     parser.add_argument('--save_intermediate', action='store_true', help='Save intermediate checkpoints')
-    parser.add_argument('--save_intermediate_interval', type=int, default=500, help='Interval for saving intermediate checkpoints')
+    parser.add_argument('--save_intermediate_interval', type=int, default=20, help='Interval for saving intermediate checkpoints')
     
     # Misc parameters
     parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
