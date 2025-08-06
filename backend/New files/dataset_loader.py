@@ -13,6 +13,9 @@ import warnings
 import traceback
 import random
 import math
+import librosa
+import uuid
+import multiprocessing
 import uuid
 import dlib
 from audiomentations import Compose, AddGaussianNoise, PitchShift, TimeStretch, Shift
@@ -1481,7 +1484,7 @@ def get_data_loaders(
     json_path, data_dir, batch_size=4, validation_split=0.2, test_split=0.1,
     shuffle=True, num_workers=2, max_samples=None, detect_faces=True,
     compute_spectrograms=True, temporal_features=True, enhanced_preprocessing=True,
-    enhanced_augmentation=False
+    enhanced_augmentation=False, multiprocessing_context=None
 ):
     """
     Load data loaders with an option to restrict the maximum number of samples.
@@ -1494,13 +1497,13 @@ def get_data_loaders(
         test_split (float): Fraction of the dataset to use for testing.
         shuffle (bool): Whether to shuffle the dataset.
         num_workers (int): Number of worker threads for loading data.
-        max_samples (int, optional): Maximum number of samples to load from the dataset
         max_samples (int, optional): Maximum number of samples to load from the dataset.
         detect_faces (bool): Whether to detect and extract facial features.
         compute_spectrograms (bool): Whether to compute audio spectrograms.
         temporal_features (bool): Whether to compute temporal consistency features.
         enhanced_preprocessing (bool): Whether to enable enhanced preprocessing features.
         enhanced_augmentation (bool): Whether to use enhanced data augmentation techniques.
+        multiprocessing_context (str, optional): Multiprocessing context method ('spawn', 'fork', etc.) for safety.
     
     Returns:
         tuple: Training, validation, and test data loaders, plus class weights.
@@ -1592,39 +1595,61 @@ def get_data_loaders(
     # Get class weights for weighted sampling
     class_weights = train_dataset.class_weights
 
+    # Handle multiprocessing context for safety
+    mp_context = None
+    if num_workers > 0 and multiprocessing_context:
+        import multiprocessing as mp
+        try:
+            mp_context = mp.get_context(multiprocessing_context)
+        except Exception as e:
+            print(f"⚠️ Warning: Could not set multiprocessing context '{multiprocessing_context}': {e}")
+            mp_context = None
+
     # Create data loaders
-    train_loader = DataLoader(
-        train_dataset, 
-        batch_size=batch_size, 
-        sampler=train_sampler,
-        num_workers=num_workers, 
-        pin_memory=True,
-        drop_last=False,
-        collate_fn=collate_fn,
-        persistent_workers=True if num_workers > 0 else False,
-    )
+    train_loader_kwargs = {
+        'dataset': train_dataset,
+        'batch_size': batch_size,
+        'sampler': train_sampler,
+        'num_workers': num_workers,
+        'pin_memory': True,
+        'drop_last': False,
+        'collate_fn': collate_fn,
+        'persistent_workers': True if num_workers > 0 else False,
+    }
+    if mp_context is not None:
+        train_loader_kwargs['multiprocessing_context'] = mp_context
     
-    val_loader = DataLoader(
-        val_dataset, 
-        batch_size=batch_size, 
-        sampler=val_sampler,
-        num_workers=num_workers, 
-        pin_memory=True,
-        drop_last=False,
-        collate_fn=collate_fn,
-        persistent_workers=True if num_workers > 0 else False,
-    )
+    train_loader = DataLoader(**train_loader_kwargs)
     
-    test_loader = DataLoader(
-        test_dataset, 
-        batch_size=batch_size, 
-        sampler=test_sampler,
-        num_workers=num_workers, 
-        pin_memory=True,
-        drop_last=False,
-        collate_fn=collate_fn,
-        persistent_workers=True if num_workers > 0 else False,
-    )
+    val_loader_kwargs = {
+        'dataset': val_dataset,
+        'batch_size': batch_size,
+        'sampler': val_sampler,
+        'num_workers': num_workers,
+        'pin_memory': True,
+        'drop_last': False,
+        'collate_fn': collate_fn,
+        'persistent_workers': True if num_workers > 0 else False,
+    }
+    if mp_context is not None:
+        val_loader_kwargs['multiprocessing_context'] = mp_context
+    
+    val_loader = DataLoader(**val_loader_kwargs)
+    
+    test_loader_kwargs = {
+        'dataset': test_dataset,
+        'batch_size': batch_size,
+        'sampler': test_sampler,
+        'num_workers': num_workers,
+        'pin_memory': True,
+        'drop_last': False,
+        'collate_fn': collate_fn,
+        'persistent_workers': True if num_workers > 0 else False,
+    }
+    if mp_context is not None:
+        test_loader_kwargs['multiprocessing_context'] = mp_context
+    
+    test_loader = DataLoader(**test_loader_kwargs)
 
     print(f"✅ Dataset loaded with {len(train_indices)} training, {len(val_indices)} validation, and {len(test_indices)} test samples.")
     return train_loader, val_loader, test_loader, class_weights
@@ -1655,7 +1680,7 @@ def collate_fn(batch):
                 valid_values.append(v)
                 valid_indices.append(i)
         
-        if key in ['video_frames', 'audio', 'audio_spectrogram', 'facial_landmarks']:
+        if key in ['video_frames', 'audio', 'audio_spectrogram', 'facial_landmarks', 'mfcc_features', 'pulse_signal', 'skin_color_variations', 'head_pose', 'eye_blink_features', 'frequency_features']:
             # These are critical tensors that must have consistent batch dimensions
             if valid_values and all(isinstance(v, torch.Tensor) for v in valid_values):
                 try:
@@ -1713,6 +1738,18 @@ def collate_fn(batch):
                         result[key] = torch.zeros(actual_batch_size, 1, 64, 64)
                     elif key == 'facial_landmarks':
                         result[key] = torch.zeros(actual_batch_size, 16, 136)
+                    elif key == 'mfcc_features':
+                        result[key] = torch.zeros(actual_batch_size, 20, 50)
+                    elif key == 'pulse_signal':
+                        result[key] = torch.zeros(actual_batch_size, 16)
+                    elif key == 'skin_color_variations':
+                        result[key] = torch.zeros(actual_batch_size, 16, 3)
+                    elif key == 'head_pose':
+                        result[key] = torch.zeros(actual_batch_size, 16, 3)
+                    elif key == 'eye_blink_features':
+                        result[key] = torch.zeros(actual_batch_size, 16)
+                    elif key == 'frequency_features':
+                        result[key] = torch.zeros(actual_batch_size, 1, 16, 16)
                     else:
                         result[key] = None
             else:
@@ -1725,6 +1762,18 @@ def collate_fn(batch):
                     result[key] = torch.zeros(actual_batch_size, 1, 64, 64)
                 elif key == 'facial_landmarks':
                     result[key] = torch.zeros(actual_batch_size, 16, 136)
+                elif key == 'mfcc_features':
+                    result[key] = torch.zeros(actual_batch_size, 20, 50)
+                elif key == 'pulse_signal':
+                    result[key] = torch.zeros(actual_batch_size, 16)
+                elif key == 'skin_color_variations':
+                    result[key] = torch.zeros(actual_batch_size, 16, 3)
+                elif key == 'head_pose':
+                    result[key] = torch.zeros(actual_batch_size, 16, 3)
+                elif key == 'eye_blink_features':
+                    result[key] = torch.zeros(actual_batch_size, 16)
+                elif key == 'frequency_features':
+                    result[key] = torch.zeros(actual_batch_size, 1, 16, 16)
                 else:
                     result[key] = None
                     
@@ -1778,7 +1827,7 @@ def collate_fn(batch):
                 result[key] = None
                 
         elif key in ['original_video_frames', 'original_audio', 'audio_visual_sync']:
-            # These may have different batch sizes, handle gracefully
+            # These may have different batch sizes, handle gracefully by creating zeros for missing samples
             if valid_values and all(isinstance(v, torch.Tensor) for v in valid_values):
                 try:
                     # Check if we can create a consistent batch
@@ -1788,19 +1837,47 @@ def collate_fn(batch):
                     if compatible and len(valid_values) == actual_batch_size:
                         result[key] = torch.stack(valid_values)
                     else:
-                        # For mismatched batches, store as list or use first valid sample
-                        print(f"[WARNING] Batch size mismatch for {key}: expected {actual_batch_size}, got {len(valid_values)}")
+                        # For mismatched batches, create full batch tensor with zeros for missing samples
                         if len(valid_values) > 0:
-                            # Use first valid sample and repeat it to fill the batch
-                            first_sample = valid_values[0]
-                            result[key] = first_sample.unsqueeze(0).repeat(actual_batch_size, *([1] * len(first_sample.shape)))
+                            # Create full batch tensor filled with zeros
+                            full_batch_tensor = torch.zeros(actual_batch_size, *ref_shape, dtype=valid_values[0].dtype)
+                            
+                            # Fill in the valid values at their correct positions
+                            for i, valid_idx in enumerate(valid_indices):
+                                if valid_idx < actual_batch_size and i < len(valid_values):
+                                    full_batch_tensor[valid_idx] = valid_values[i].clone()
+                            
+                            result[key] = full_batch_tensor
                         else:
-                            result[key] = None
+                            # Create appropriate zero tensor based on the key
+                            if key == 'original_video_frames':
+                                result[key] = torch.zeros(actual_batch_size, 16, 3, 224, 224)
+                            elif key == 'original_audio':
+                                result[key] = torch.zeros(actual_batch_size, 8000)
+                            elif key == 'audio_visual_sync':
+                                result[key] = torch.zeros(actual_batch_size, 5)
+                            else:
+                                result[key] = None
                 except Exception as e:
-                    print(f"[WARNING] Failed to collate {key}: {e}")
-                    result[key] = None
+                    # Create fallback tensors for failed collation
+                    if key == 'original_video_frames':
+                        result[key] = torch.zeros(actual_batch_size, 16, 3, 224, 224)
+                    elif key == 'original_audio':
+                        result[key] = torch.zeros(actual_batch_size, 8000)
+                    elif key == 'audio_visual_sync':
+                        result[key] = torch.zeros(actual_batch_size, 5)
+                    else:
+                        result[key] = None
             else:
-                result[key] = None
+                # Create appropriate zero tensor when no valid values
+                if key == 'original_video_frames':
+                    result[key] = torch.zeros(actual_batch_size, 16, 3, 224, 224)
+                elif key == 'original_audio':
+                    result[key] = torch.zeros(actual_batch_size, 8000)
+                elif key == 'audio_visual_sync':
+                    result[key] = torch.zeros(actual_batch_size, 5)
+                else:
+                    result[key] = None
                 
         elif key in ['fake_periods', 'timestamps']:
             # List of lists, don't stack
