@@ -654,8 +654,9 @@ class DeepfakeTrainer:
         if not self.distributed or self.is_main_process:
             os.makedirs(self.run_checkpoint_dir, exist_ok=True)
         
-        # Initialize starting epoch
+        # Initialize starting epoch and batch
         self.start_epoch = 0
+        self.start_batch = 0
         
         # Check for resume checkpoint
         if hasattr(config, 'resume_checkpoint') and config.resume_checkpoint:
@@ -694,18 +695,29 @@ class DeepfakeTrainer:
             if 'f1_score' in checkpoint:
                 self.best_val_f1 = checkpoint['f1_score']
             
-            # Set the starting epoch
-            self.start_epoch = checkpoint.get('epoch', 0)
+            # Handle both intermediate and epoch checkpoints
+            if 'batch' in checkpoint:
+                # This is an intermediate checkpoint - resume from within the epoch
+                self.start_epoch = checkpoint.get('epoch', 1) - 1  # Convert to 0-indexed
+                self.start_batch = checkpoint.get('batch', 0) + 1  # Resume from next batch
+                print(f"🔄 Intermediate checkpoint detected")
+                print(f"📍 Will resume from epoch {self.start_epoch + 1}, batch {self.start_batch}")
+            else:
+                # This is a regular epoch checkpoint - start next epoch
+                self.start_epoch = checkpoint.get('epoch', 0)
+                self.start_batch = 0
+                print(f"🔄 Epoch checkpoint detected")
+                print(f"📍 Will resume from epoch {self.start_epoch + 1}, batch 0")
             
             # Load metrics history if available
             if 'metrics' in checkpoint:
                 self.metrics = checkpoint['metrics']
             
-            print(f"Checkpoint loaded successfully. Resuming from epoch {self.start_epoch}")
-            print(f"Previous best metrics - Accuracy: {self.best_val_accuracy:.4f}, F1: {self.best_val_f1:.4f}")
+            print(f"✅ Checkpoint loaded successfully!")
+            print(f"📊 Previous best metrics - Accuracy: {self.best_val_accuracy:.4f}, F1: {self.best_val_f1:.4f}")
         
         except Exception as e:
-            print(f"Error loading checkpoint: {e}")
+            print(f"❌ Error loading checkpoint: {e}")
             import traceback
             traceback.print_exc()
         
@@ -1100,11 +1112,25 @@ class DeepfakeTrainer:
             print(f"[RANK {self.local_rank}] Starting training epoch {epoch+1} with {len(self.train_loader)} batches")
         
         for batch_idx, batch in enumerate(train_progress):
+            # Skip batches if resuming from a checkpoint
+            if hasattr(self, 'start_batch') and epoch == getattr(self, 'start_epoch', 0) and batch_idx < self.start_batch:
+                if self.is_main_process and batch_idx % 10 == 0:
+                    print(f"[RESUME] Skipping batch {batch_idx} (resuming from batch {self.start_batch})")
+                continue
+            
             # Debug: Print batch loading progress
             if self.is_main_process and batch_idx == 0:
                 print(f"[RANK {self.local_rank}] Processing first batch...")
             elif batch_idx % 10 == 0 and self.is_main_process:
                 print(f"[RANK {self.local_rank}] Processing batch {batch_idx}/{len(self.train_loader)}")
+                
+            # Reset start_batch after first epoch to avoid skipping in subsequent epochs
+            if epoch == getattr(self, 'start_epoch', 0) and batch_idx == getattr(self, 'start_batch', 0):
+                if self.is_main_process:
+                    print(f"🔄 Resumed training from epoch {epoch+1}, batch {batch_idx}")
+                # Clear the start_batch to avoid affecting subsequent epochs
+                if hasattr(self, 'start_batch'):
+                    delattr(self, 'start_batch')
             try:
                 # Add timeout protection for first batch
                 if batch_idx == 0:
@@ -1831,7 +1857,12 @@ class DeepfakeTrainer:
         
         # Start from the resumed epoch if checkpoint was loaded
         start_epoch = getattr(self, 'start_epoch', 0)
-        print(f"Starting from epoch {start_epoch+1}")
+        start_batch = getattr(self, 'start_batch', 0)
+        
+        if start_batch > 0:
+            print(f"🔄 Resuming from epoch {start_epoch+1}, batch {start_batch}")
+        else:
+            print(f"🚀 Starting from epoch {start_epoch+1}")
         
         for epoch in range(start_epoch, self.config.num_epochs):
             epoch_start_time = time.time()
