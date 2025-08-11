@@ -2063,7 +2063,8 @@ class MultiModalDeepfakeModel(nn.Module):
                  enable_explainability=True, fusion_type='attention', 
                  backbone_visual='efficientnet', backbone_audio='wav2vec2',
                  use_spectrogram=True, detect_deepfake_type=True, num_deepfake_types=7,
-                 debug=False, enable_skin_color_analysis=True, enable_advanced_physiological=True):
+                 debug=False, enable_skin_color_analysis=True, enable_advanced_physiological=True,
+                 dropout_rate=0.1):
                  
         super(MultiModalDeepfakeModel, self).__init__()
         self.debug = debug
@@ -2074,6 +2075,7 @@ class MultiModalDeepfakeModel(nn.Module):
         self.detect_deepfake_type = detect_deepfake_type
         self.enable_skin_color_analysis = enable_skin_color_analysis  # Memory optimization parameter
         self.enable_advanced_physiological = enable_advanced_physiological  # Advanced physiological analysis
+        self.dropout_rate = dropout_rate  # Store dropout rate for model components
         
         # Automatically adjust feature dimensions based on selected backbones
         if backbone_visual == 'efficientnet':
@@ -2308,10 +2310,10 @@ class MultiModalDeepfakeModel(nn.Module):
         self.classifier = nn.Sequential(
             nn.Linear(combined_dim, 512),
             nn.ReLU(),
-            nn.Dropout(0.5),
+            nn.Dropout(self.dropout_rate),
             nn.Linear(512, 256),
             nn.ReLU(),
-            nn.Dropout(0.3),
+            nn.Dropout(self.dropout_rate * 0.6),  # Slightly lower dropout for intermediate layer
             nn.Linear(256, num_classes)
         )
         
@@ -2320,7 +2322,7 @@ class MultiModalDeepfakeModel(nn.Module):
             self.deepfake_type_classifier = nn.Sequential(
                 nn.Linear(combined_dim, 256),
                 nn.ReLU(),
-                nn.Dropout(0.3),
+                nn.Dropout(self.dropout_rate),
                 nn.Linear(256, num_deepfake_types)
             )
 
