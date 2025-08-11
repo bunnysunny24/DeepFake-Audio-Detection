@@ -3,9 +3,15 @@ from dataset_loader import get_data_loaders, get_transforms, get_transforms_enha
 import torch
 from skin_analyzer import SkinColorAnalyzer
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.cuda.amp import GradScaler, autocast
 from sklearn.metrics import precision_recall_fscore_support, confusion_matrix, roc_auc_score, accuracy_score
+try:
+    from sklearn.utils.class_weight import compute_class_weight
+except ImportError:
+    print("Warning: sklearn not available, balanced class weights will be disabled")
+    compute_class_weight = None
 import matplotlib
 matplotlib.use('Agg')  # Set non-interactive backend for server environments
 import matplotlib.pyplot as plt
@@ -34,6 +40,43 @@ import subprocess
 import resource
 import threading
 import multiprocessing as mp_check
+
+# 🔥 FOCAL LOSS IMPLEMENTATION
+class FocalLoss(nn.Module):
+    """
+    Focal Loss implementation for addressing class imbalance.
+    
+    Focal Loss is designed to address the class imbalance problem by down-weighting
+    easy examples and focusing on hard examples.
+    
+    Args:
+        alpha (float): Weighting factor for rare class (default: 1.0)
+        gamma (float): Focusing parameter (default: 2.0)
+        reduction (str): Specifies the reduction to apply to the output
+    """
+    
+    def __init__(self, alpha=1.0, gamma=2.0, reduction='mean'):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+        
+    def forward(self, inputs, targets):
+        # Compute cross entropy
+        ce_loss = F.cross_entropy(inputs, targets, reduction='none')
+        
+        # Compute p_t
+        pt = torch.exp(-ce_loss)
+        
+        # Compute focal loss
+        focal_loss = self.alpha * (1 - pt) ** self.gamma * ce_loss
+        
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
 
 # 🧼 COMPREHENSIVE PROCESS AND GPU SAFETY MANAGEMENT
 # This prevents zombie processes and GPU monopolization that can get SSH access revoked
@@ -872,6 +915,10 @@ class DeepfakeTrainer:
         print("🚀 Single-threaded loading prevents zombie process creation")
         
         # Get data loaders with appropriate options
+        pin_memory_enabled = getattr(self.config, 'pin_memory', False) and self.device.type == 'cuda'
+        if pin_memory_enabled:
+            print("🚀 CUDA detected: Enabling pin_memory for faster GPU transfers")
+        
         self.train_loader, self.val_loader, self.test_loader, self.class_weights = get_data_loaders(
             json_path=self.config.json_path,
             data_dir=self.config.data_dir,
@@ -886,11 +933,66 @@ class DeepfakeTrainer:
             temporal_features=self.config.temporal_features,
             enhanced_preprocessing=getattr(self.config, 'enhanced_preprocessing', True),
             enhanced_augmentation=getattr(self.config, 'enhanced_augmentation', False),
-            multiprocessing_context=None  # 🧼 SAFETY: Use default context to prevent issues
+            multiprocessing_context=None,  # 🧼 SAFETY: Use default context to prevent issues
+            pin_memory=pin_memory_enabled,  # Enable pin memory for CUDA
+            reduce_frames=getattr(self.config, 'reduce_frames', 16)  # Frame reduction support
         )
         
         print(f"✅ Data loaders created: {len(self.train_loader)} train batches, "
               f"{len(self.val_loader)} validation batches, {len(self.test_loader)} test batches")
+        
+        # 🏛️ BALANCED CLASS WEIGHTS CALCULATION
+        if hasattr(self.config, 'class_weights_mode') and self.config.class_weights_mode == 'balanced':
+            print("🎯 Calculating balanced class weights...")
+            self._calculate_balanced_class_weights()
+        elif self.class_weights is not None:
+            print(f"✅ Using pre-calculated class weights: {self.class_weights}")
+        else:
+            print("ℹ️  No class weights applied")
+    
+    def _calculate_balanced_class_weights(self):
+        """Calculate balanced class weights from training data."""
+        if compute_class_weight is None:
+            print("⚠️  sklearn not available, cannot calculate balanced class weights")
+            self.class_weights = None
+            return
+            
+        try:
+            # Collect all labels from training dataset
+            all_labels = []
+            print("📊 Scanning training data for class distribution...")
+            
+            for batch_idx, batch in enumerate(self.train_loader):
+                if 'label' in batch:
+                    labels = batch['label']
+                    if isinstance(labels, torch.Tensor):
+                        labels = labels.cpu().numpy()
+                    all_labels.extend(labels)
+                
+                # Progress indicator for large datasets
+                if (batch_idx + 1) % 100 == 0:
+                    print(f"   Processed {batch_idx + 1}/{len(self.train_loader)} batches...")
+            
+            all_labels = np.array(all_labels)
+            unique_classes = np.unique(all_labels)
+            
+            # Calculate balanced weights
+            class_weights = compute_class_weight(
+                'balanced', 
+                classes=unique_classes, 
+                y=all_labels
+            )
+            
+            # Convert to tensor
+            self.class_weights = torch.FloatTensor(class_weights).to(self.device)
+            
+            print(f"✅ Calculated balanced class weights: {dict(zip(unique_classes, class_weights))}")
+            print(f"   Class distribution: {dict(zip(*np.unique(all_labels, return_counts=True)))}")
+            
+        except Exception as e:
+            print(f"⚠️  Failed to calculate balanced class weights: {e}")
+            print("   Falling back to uniform weights")
+            self.class_weights = None
     
     def setup_model(self):
         """Initialize model, loss function, optimizer, and scheduler."""
@@ -899,7 +1001,10 @@ class DeepfakeTrainer:
         # Move class weights to device
         self.class_weights = self.class_weights.to(self.device) if self.class_weights is not None else None
 
-        # Initialize model
+        # Initialize model with dropout configuration
+        dropout_rate = getattr(self.config, 'dropout_rate', 0.1)
+        print(f"🎯 Configuring model with dropout rate: {dropout_rate}")
+        
         self.model = MultiModalDeepfakeModel(
             num_classes=self.config.num_classes,
             video_feature_dim=self.config.video_feature_dim,
@@ -916,7 +1021,8 @@ class DeepfakeTrainer:
             num_deepfake_types=self.config.num_deepfake_types,
             debug=self.config.debug,
             enable_skin_color_analysis=getattr(self.config, 'enable_skin_color_analysis', False),
-            enable_advanced_physiological=getattr(self.config, 'enable_advanced_physiological', False)
+            enable_advanced_physiological=getattr(self.config, 'enable_advanced_physiological', False),
+            dropout_rate=dropout_rate  # Pass dropout rate to model
         )
 
         # Load pretrained weights if specified
@@ -946,7 +1052,15 @@ class DeepfakeTrainer:
             print(f"✅ Using single GPU: {self.device}")
 
         # Initialize loss function with class weights for imbalanced data
-        if self.class_weights is not None and self.config.use_weighted_loss:
+        loss_type = getattr(self.config, 'loss_type', 'crossentropy')
+        
+        if loss_type == 'focal':
+            # 🔥 FOCAL LOSS for handling class imbalance
+            focal_alpha = getattr(self.config, 'focal_alpha', 1.0)
+            focal_gamma = getattr(self.config, 'focal_gamma', 2.0)
+            self.criterion = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
+            print(f"🔥 Using Focal Loss with alpha={focal_alpha}, gamma={focal_gamma}")
+        elif self.class_weights is not None and self.config.use_weighted_loss:
             self.criterion = nn.CrossEntropyLoss(weight=self.class_weights, label_smoothing=self.config.label_smoothing)
             print(f"Using weighted CrossEntropyLoss with weights: {self.class_weights}, label_smoothing: {self.config.label_smoothing}")
         else:
@@ -2281,6 +2395,14 @@ def parse_args():
     parser.add_argument('--disable_skin_analysis', action='store_true', help='Disable memory-intensive skin color analysis for speed')
     parser.add_argument('--disable_advanced_physio', action='store_true', help='Disable advanced physiological analysis for speed')
     parser.add_argument('--fast_mode', action='store_true', help='Enable fast mode with reduced feature extraction')
+    
+    # Loss function parameters
+    parser.add_argument('--loss_type', type=str, default='crossentropy', choices=['crossentropy', 'focal'], help='Type of loss function to use')
+    parser.add_argument('--focal_gamma', type=float, default=2.0, help='Gamma parameter for focal loss')
+    parser.add_argument('--focal_alpha', type=float, default=1.0, help='Alpha parameter for focal loss')
+    
+    # Class weights parameters
+    parser.add_argument('--class_weights_mode', type=str, default='none', choices=['none', 'balanced', 'custom'], help='Class weights calculation mode')
     
     return parser.parse_args()
 
