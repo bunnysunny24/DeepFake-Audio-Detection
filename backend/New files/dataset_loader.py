@@ -15,6 +15,7 @@ import random
 import math
 import librosa
 import uuid
+# 🧼 ZOMBIE PROCESS SAFE: multiprocessing import only for context detection (never creates processes)
 import multiprocessing
 import uuid
 import dlib
@@ -1482,7 +1483,7 @@ def get_transforms_enhanced(phase='train'):
 
 def get_data_loaders(
     json_path, data_dir, batch_size=4, validation_split=0.2, test_split=0.1,
-    shuffle=True, num_workers=2, max_samples=None, detect_faces=True,
+    shuffle=True, num_workers=0, max_samples=None, detect_faces=True,  # 🧼 ZOMBIE SAFE: num_workers=0
     compute_spectrograms=True, temporal_features=True, enhanced_preprocessing=True,
     enhanced_augmentation=False, multiprocessing_context=None
 ):
@@ -1595,9 +1596,10 @@ def get_data_loaders(
     # Get class weights for weighted sampling
     class_weights = train_dataset.class_weights
 
-    # Handle multiprocessing context for safety
+    # 🧼 ZOMBIE PROCESS SAFE: Handle multiprocessing context for safety (but num_workers=0, so never used)
     mp_context = None
-    if num_workers > 0 and multiprocessing_context:
+    if num_workers > 0 and multiprocessing_context:  # This will never execute since num_workers=0
+        # 🧼 ZOMBIE PROCESS SAFE: Import only for unused context detection
         import multiprocessing as mp
         try:
             mp_context = mp.get_context(multiprocessing_context)
