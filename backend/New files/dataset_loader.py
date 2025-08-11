@@ -1485,7 +1485,7 @@ def get_data_loaders(
     json_path, data_dir, batch_size=4, validation_split=0.2, test_split=0.1,
     shuffle=True, num_workers=0, max_samples=None, detect_faces=True,  # 🧼 ZOMBIE SAFE: num_workers=0
     compute_spectrograms=True, temporal_features=True, enhanced_preprocessing=True,
-    enhanced_augmentation=False, multiprocessing_context=None
+    enhanced_augmentation=False, multiprocessing_context=None, pin_memory=False, reduce_frames=16
 ):
     """
     Load data loaders with an option to restrict the maximum number of samples.
@@ -1505,6 +1505,8 @@ def get_data_loaders(
         enhanced_preprocessing (bool): Whether to enable enhanced preprocessing features.
         enhanced_augmentation (bool): Whether to use enhanced data augmentation techniques.
         multiprocessing_context (str, optional): Multiprocessing context method ('spawn', 'fork', etc.) for safety.
+        pin_memory (bool): Whether to pin memory for faster GPU transfers.
+        reduce_frames (int): Maximum number of frames to extract from each video.
     
     Returns:
         tuple: Training, validation, and test data loaders, plus class weights.
@@ -1521,6 +1523,7 @@ def get_data_loaders(
     train_dataset = MultiModalDeepfakeDataset(
         json_path=json_path,
         data_dir=data_dir,
+        max_frames=reduce_frames,  # Use reduce_frames parameter
         transform=train_video_transform,
         audio_transform=train_audio_transform,
         logging=True,  # Enable logging for debugging
@@ -1535,6 +1538,22 @@ def get_data_loaders(
     val_dataset = MultiModalDeepfakeDataset(
         json_path=json_path,
         data_dir=data_dir,
+        max_frames=reduce_frames,  # Use reduce_frames parameter
+        transform=val_video_transform,
+        audio_transform=val_audio_transform,
+        logging=True,  # Enable logging for debugging
+        phase='val',
+        detect_faces=detect_faces,
+        compute_spectrograms=compute_spectrograms,
+        temporal_features=temporal_features,
+        enhanced_preprocessing=enhanced_preprocessing
+    )
+    
+    # Create test dataset
+    test_dataset = MultiModalDeepfakeDataset(
+        json_path=json_path,
+        data_dir=data_dir,
+        max_frames=reduce_frames,  # Use reduce_frames parameter
         transform=val_video_transform,
         audio_transform=val_audio_transform,
         logging=True,  # Enable logging for debugging
@@ -1613,7 +1632,7 @@ def get_data_loaders(
         'batch_size': batch_size,
         'sampler': train_sampler,
         'num_workers': num_workers,
-        'pin_memory': True,
+        'pin_memory': pin_memory,  # Use configurable pin_memory
         'drop_last': False,
         'collate_fn': collate_fn,
         'persistent_workers': True if num_workers > 0 else False,
@@ -1628,7 +1647,7 @@ def get_data_loaders(
         'batch_size': batch_size,
         'sampler': val_sampler,
         'num_workers': num_workers,
-        'pin_memory': True,
+        'pin_memory': pin_memory,  # Use configurable pin_memory
         'drop_last': False,
         'collate_fn': collate_fn,
         'persistent_workers': True if num_workers > 0 else False,
@@ -1643,7 +1662,7 @@ def get_data_loaders(
         'batch_size': batch_size,
         'sampler': test_sampler,
         'num_workers': num_workers,
-        'pin_memory': True,
+        'pin_memory': pin_memory,  # Use configurable pin_memory
         'drop_last': False,
         'collate_fn': collate_fn,
         'persistent_workers': True if num_workers > 0 else False,
