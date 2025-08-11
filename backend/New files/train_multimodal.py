@@ -230,6 +230,9 @@ limit_gpu_usage()
 set_process_limits()
 setup_graceful_shutdown()
 
+# 🧼 ULTIMATE SAFETY: Register cleanup at exit for any scenario
+atexit.register(cleanup_processes)
+
 
 def suppress_warnings():
     """Suppress all warnings and unnecessary logs."""
