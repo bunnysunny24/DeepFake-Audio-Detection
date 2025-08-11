@@ -21,27 +21,6 @@ try:
 except ImportError:
     print("Warning: Some optional dependencies (dlib, facenet_pytorch) not found, some features may be limited")
 
-# Import local skin analyzer
-try:
-    from skin_analyzer import SkinColorAnalyzer
-except ImportError:
-    print("Warning: SkinColorAnalyzer not found, using fallback implementation")
-    
-    # Fallback SkinColorAnalyzer implementation
-    class SkinColorAnalyzer(nn.Module):
-        def __init__(self, feature_dim=32):
-            super(SkinColorAnalyzer, self).__init__()
-            self.feature_dim = feature_dim
-            
-        def forward(self, frames):
-            """Fallback implementation that returns neutral scores."""
-            if isinstance(frames, torch.Tensor):
-                batch_size = frames.shape[0]
-                device = frames.device
-                return torch.ones(batch_size, 1, device=device) * 0.5
-            else:
-                return torch.tensor([0.5])
-
 
 def clear_gpu_memory():
     """Utility function to clear GPU memory and trigger garbage collection."""
@@ -160,88 +139,32 @@ class StatsPooling(nn.Module):
 
 class ForensicConsistencyModule(nn.Module):
     """Module that analyzes forensic consistency across frames."""
-    def __init__(self, input_dim, hidden_dim=256, debug=False):
+    def __init__(self, input_dim, hidden_dim=256):
         super(ForensicConsistencyModule, self).__init__()
         self.conv1 = nn.Conv2d(input_dim, hidden_dim, kernel_size=3, stride=1, padding=1)
         self.conv2 = nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, stride=1, padding=1)
         self.pool = nn.AdaptiveAvgPool2d((1, 1))
         self.fc = nn.Linear(hidden_dim, hidden_dim)
-        self.debug = debug
         
     def forward(self, x):
         # x shape: [batch, frames, channels, height, width]
         batch_size, num_frames = x.shape[:2]
         
-        # Memory optimization: process in chunks if batch size is large
-        if batch_size * num_frames > 32:  # Process in chunks to save memory
-            chunk_size = max(1, 32 // num_frames)
-            results = []
-            
-            if self.debug:
-                print(f"[FORENSIC] Processing in chunks: batch_size={batch_size}, num_frames={num_frames}, chunk_size={chunk_size}")
-            
-            for i in range(0, batch_size, chunk_size):
-                end_idx = min(i + chunk_size, batch_size)
-                chunk = x[i:end_idx]
-                chunk_batch_size = chunk.shape[0]
-                
-                if self.debug:
-                    print(f"[FORENSIC] Processing chunk {i}:{end_idx}, chunk_batch_size={chunk_batch_size}")
-                
-                # Reshape for convolutions
-                chunk_reshaped = chunk.view(chunk_batch_size * num_frames, *chunk.shape[2:])
-                
-                # Feature extraction with gradient checkpointing for memory efficiency
-                if self.training:
-                    from torch.utils.checkpoint import checkpoint
-                    # Use single checkpoint to avoid parameter reuse issues with DDP
-                    def checkpoint_block(x):
-                        conv1_out = F.relu(self.conv1(x))
-                        conv2_out = F.relu(self.conv2(conv1_out))
-                        return conv2_out
-                    conv2_out = checkpoint(checkpoint_block, chunk_reshaped)
-                    conv1_out = None  # Not needed for cleanup, set to None
-                else:
-                    conv1_out = F.relu(self.conv1(chunk_reshaped))
-                    conv2_out = F.relu(self.conv2(conv1_out))
-                
-                pooled = self.pool(conv2_out).squeeze(-1).squeeze(-1)
-                
-                # Reshape back to batch, frames, features
-                chunk_result = pooled.view(chunk_batch_size, num_frames, -1)
-                
-                # Project features
-                chunk_result = self.fc(chunk_result)
-                results.append(chunk_result)
-                
-                # Clear intermediate tensors (only delete variables that exist)
-                del chunk_reshaped, conv2_out, pooled, chunk_result
-                if conv1_out is not None:
-                    del conv1_out
-                
-            final_result = torch.cat(results, dim=0)
-            
-            if self.debug:
-                print(f"[FORENSIC] Final result shape: {final_result.shape}, expected batch_size: {batch_size}")
-            
-            return final_result
-        else:
-            # Original processing for smaller batches
-            # Reshape for convolutions
-            x = x.view(batch_size * num_frames, *x.shape[2:])
-            
-            # Feature extraction
-            x = F.relu(self.conv1(x))
-            x = F.relu(self.conv2(x))
-            x = self.pool(x).squeeze(-1).squeeze(-1)
-            
-            # Reshape back to batch, frames, features
-            x = x.view(batch_size, num_frames, -1)
-            
-            # Project features
-            x = self.fc(x)
-            
-            return x
+        # Reshape for convolutions
+        x = x.view(batch_size * num_frames, *x.shape[2:])
+        
+        # Feature extraction
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv2(x))
+        x = self.pool(x).squeeze(-1).squeeze(-1)
+        
+        # Reshape back to batch, frames, features
+        x = x.view(batch_size, num_frames, -1)
+        
+        # Project features
+        x = self.fc(x)
+        
+        return x
 
 
 class AudioVisualSyncDetector(nn.Module):
@@ -609,18 +532,14 @@ class EyeAnalysisModule(nn.Module):
     def _init_eye_encoder(self, landmark_dim):
         """Dynamically initialize the eye encoder based on input dimensions"""
         self.landmark_dim = landmark_dim
-        # Robustly get device for new layers
-        try:
-            device = next(self.blink_detector.parameters()).device
-        except (StopIteration, AttributeError):
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.eye_encoder = nn.Sequential(
             nn.Linear(landmark_dim, self.hidden_dim),
             nn.ReLU(),
             nn.Dropout(0.2),
             nn.Linear(self.hidden_dim, self.hidden_dim // 2),
             nn.ReLU()
-        ).to(device)
+        ).to(next(self.blink_detector.parameters()).device)
+        
         print(f"[INFO] Dynamically initialized eye encoder with input dim {landmark_dim}")
         
     def forward(self, eye_landmarks):
@@ -633,14 +552,12 @@ class EyeAnalysisModule(nn.Module):
         """
         # Handle None or empty input
         if eye_landmarks is None or eye_landmarks.numel() == 0:
-            try:
-                device = next(self.blink_detector.parameters()).device
-            except (StopIteration, AttributeError):
-                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            device = next(self.blink_detector.parameters()).device
             batch_size = 1
             seq_len = 1
             if eye_landmarks is not None and len(eye_landmarks.shape) >= 2:
                 batch_size, seq_len = eye_landmarks.shape[:2]
+            
             return (
                 torch.ones(batch_size, 1, device=device) * 0.5,  # naturalness
                 torch.zeros(batch_size, seq_len, device=device),  # blinks
@@ -795,16 +712,12 @@ class OculomotorDynamicsAnalyzer(nn.Module):
     def _init_movement_encoder(self, eye_feature_dim):
         """Dynamically initialize the movement encoder based on input dimensions"""
         self.eye_feature_dim = eye_feature_dim
-        # Robustly get device for new layers
-        try:
-            device = next(self.temporal_cnn.parameters()).device
-        except (StopIteration, AttributeError):
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.movement_encoder = nn.Sequential(
             nn.Linear(eye_feature_dim, self.hidden_dim),
             nn.ReLU(),
             nn.Linear(self.hidden_dim, self.hidden_dim)
-        ).to(device)
+        ).to(next(self.temporal_cnn.parameters()).device)
+        
         print(f"[INFO] Dynamically initialized oculomotor movement encoder with input dim {eye_feature_dim}")
         
     def forward(self, eye_movement_features):
@@ -817,13 +730,11 @@ class OculomotorDynamicsAnalyzer(nn.Module):
         """
         # Handle None or empty input
         if eye_movement_features is None or eye_movement_features.numel() == 0:
-            try:
-                device = next(self.temporal_cnn.parameters()).device
-            except (StopIteration, AttributeError):
-                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            device = next(self.temporal_cnn.parameters()).device
             batch_size = 1
             if eye_movement_features is not None and len(eye_movement_features.shape) > 0:
                 batch_size = eye_movement_features.shape[0]
+                
             return (
                 torch.ones(batch_size, 1, device=device) * 0.5,  # naturalness
                 torch.ones(batch_size, 3, device=device) / 3.0  # uniform distribution
@@ -2146,270 +2057,6 @@ class LightweightModelProcessor(nn.Module):
         return logits
 
 
-# =========================
-# MISSING MODULE DEFINITIONS 
-# =========================
-
-class RemotePhysiologicalAnalyzer(nn.Module):
-    """Basic physiological analyzer as fallback."""
-    def __init__(self, feature_dim=32):
-        super(RemotePhysiologicalAnalyzer, self).__init__()
-        self.feature_dim = feature_dim
-        
-    def forward(self, frames):
-        batch_size = frames.shape[0]
-        device = frames.device
-        return {
-            'naturalness': torch.ones(batch_size, 1, device=device) * 0.5
-        }
-
-class OculomotorDynamicsAnalyzer(nn.Module):
-    """Analyzes eye movement dynamics."""
-    def __init__(self, hidden_dim=64):
-        super(OculomotorDynamicsAnalyzer, self).__init__()
-        self.hidden_dim = hidden_dim
-        
-    def forward(self, eye_landmarks):
-        batch_size = eye_landmarks.shape[0]
-        device = eye_landmarks.device
-        naturalness = torch.ones(batch_size, 1, device=device) * 0.5
-        dynamics = torch.zeros(batch_size, self.hidden_dim, device=device)
-        return naturalness, dynamics
-
-class LightingConsistencyAnalyzer(nn.Module):
-    """Analyzes lighting consistency across frames."""
-    def __init__(self, feature_dim=64):
-        super(LightingConsistencyAnalyzer, self).__init__()
-        self.feature_dim = feature_dim
-        
-    def forward(self, frames):
-        batch_size = frames.shape[0]
-        device = frames.device
-        return torch.ones(batch_size, 1, device=device) * 0.5
-
-class TextureAnalyzer(nn.Module):
-    """Analyzes texture patterns for deepfake artifacts."""
-    def __init__(self, patch_size=32, feature_dim=64):
-        super(TextureAnalyzer, self).__init__()
-        self.patch_size = patch_size
-        self.feature_dim = feature_dim
-        
-    def forward(self, frames):
-        batch_size = frames.shape[0]
-        device = frames.device
-        consistency = torch.ones(batch_size, 1, device=device) * 0.5
-        features = torch.zeros(batch_size, self.feature_dim, device=device)
-        return consistency, features
-
-class FrequencyDomainAnalyzer(nn.Module):
-    """Analyzes frequency domain artifacts."""
-    def __init__(self, feature_dim=64):
-        super(FrequencyDomainAnalyzer, self).__init__()
-        self.feature_dim = feature_dim
-        
-    def forward(self, frames):
-        batch_size = frames.shape[0]
-        device = frames.device
-        return torch.ones(batch_size, 1, device=device) * 0.5
-
-class GANFingerprintDetector(nn.Module):
-    """Detects GAN fingerprints in images."""
-    def __init__(self, feature_dim=128):
-        super(GANFingerprintDetector, self).__init__()
-        self.feature_dim = feature_dim
-        
-    def forward(self, frames):
-        batch_size = frames.shape[0]
-        device = frames.device
-        return torch.ones(batch_size, 1, device=device) * 0.5
-
-class VoiceAnalysisModule(nn.Module):
-    """Analyzes voice authenticity."""
-    def __init__(self, audio_dim=768, feature_dim=128):
-        super(VoiceAnalysisModule, self).__init__()
-        self.feature_dim = feature_dim
-        
-    def forward(self, audio_features):
-        batch_size = audio_features.shape[0]
-        device = audio_features.device
-        return torch.ones(batch_size, 1, device=device) * 0.5
-
-class MFCCExtractor(nn.Module):
-    """Extracts MFCC features from audio."""
-    def __init__(self, num_mfcc=40, feature_dim=64):
-        super(MFCCExtractor, self).__init__()
-        self.num_mfcc = num_mfcc
-        self.feature_dim = feature_dim
-        
-    def forward(self, audio):
-        batch_size = audio.shape[0]
-        device = audio.device
-        consistency = torch.ones(batch_size, 1, device=device) * 0.5
-        features = torch.zeros(batch_size, self.feature_dim, device=device)
-        return consistency, features
-
-class PhonemeVisemeAnalyzer(nn.Module):
-    """Analyzes phoneme-viseme synchronization."""
-    def __init__(self, audio_dim=768, visual_dim=1024, hidden_dim=128):
-        super(PhonemeVisemeAnalyzer, self).__init__()
-        self.hidden_dim = hidden_dim
-        
-    def forward(self, audio_features, visual_features):
-        batch_size = audio_features.shape[0]
-        device = audio_features.device
-        return torch.ones(batch_size, 1, device=device) * 0.5
-
-class VoiceBiometricsVerifier(nn.Module):
-    """Verifies voice biometric consistency."""
-    def __init__(self, audio_dim=768, speaker_dim=256):
-        super(VoiceBiometricsVerifier, self).__init__()
-        self.speaker_dim = speaker_dim
-        
-    def forward(self, audio_features):
-        batch_size = audio_features.shape[0]
-        device = audio_features.device
-        return torch.ones(batch_size, 1, device=device) * 0.5
-
-class DualSpatioTemporalAttention(nn.Module):
-    """Dual spatio-temporal attention mechanism."""
-    def __init__(self, feature_dim=128, num_heads=4):
-        super(DualSpatioTemporalAttention, self).__init__()
-        self.feature_dim = feature_dim
-        self.num_heads = num_heads
-        
-    def forward(self, features):
-        batch_size = features.shape[0]
-        device = features.device
-        return torch.ones(batch_size, 1, device=device) * 0.5
-
-class EmotionRecognitionModule(nn.Module):
-    """Recognizes emotions from audio-visual features."""
-    def __init__(self, visual_dim=1024, audio_dim=768, feature_dim=128):
-        super(EmotionRecognitionModule, self).__init__()
-        self.feature_dim = feature_dim
-        
-    def forward(self, visual_features, audio_features):
-        batch_size = visual_features.shape[0]
-        device = visual_features.device
-        consistency = torch.ones(batch_size, 1, device=device) * 0.5
-        emotions = torch.zeros(batch_size, self.feature_dim, device=device)
-        return consistency, emotions
-
-class Autoencoder(nn.Module):
-    """Autoencoder for anomaly detection."""
-    def __init__(self, input_channels=3):
-        super(Autoencoder, self).__init__()
-        self.encoder = nn.Sequential(
-            nn.Conv2d(input_channels, 32, 3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-            nn.Conv2d(32, 64, 3, padding=1),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool2d((8, 8))
-        )
-        self.decoder = nn.Sequential(
-            nn.Upsample(scale_factor=2),
-            nn.Conv2d(64, 32, 3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(32, input_channels, 3, padding=1),
-            nn.Sigmoid()
-        )
-        
-    def forward(self, x):
-        # Store original shape for reconstruction
-        original_shape = x.shape
-        
-        encoded = self.encoder(x)
-        decoded = self.decoder(encoded)
-        
-        # Resize decoded to match original input
-        if decoded.shape != original_shape:
-            decoded = F.interpolate(decoded, size=original_shape[2:], mode='bilinear', align_corners=False)
-        
-        error = F.mse_loss(decoded, x, reduction='none').mean(dim=[1,2,3])
-        return decoded, error
-
-class EnhancedMetadataAnalyzer(nn.Module):
-    """Enhanced metadata analysis."""
-    def __init__(self, input_dim=10, hidden_dim=64):
-        super(EnhancedMetadataAnalyzer, self).__init__()
-        self.analyzer = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
-            nn.Sigmoid()
-        )
-        
-    def forward(self, metadata):
-        return self.analyzer(metadata)
-
-class DigitalArtifactDetector(nn.Module):
-    """Detects digital artifacts in images."""
-    def __init__(self, input_channels=3, feature_dim=64):
-        super(DigitalArtifactDetector, self).__init__()
-        self.detector = nn.Sequential(
-            nn.Conv2d(input_channels, 32, 3, padding=1),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Flatten(),
-            nn.Linear(32, 1),
-            nn.Sigmoid()
-        )
-        
-    def forward(self, frames):
-        return self.detector(frames)
-
-class CompressionAnalyzer(nn.Module):
-    """Analyzes compression artifacts."""
-    def __init__(self, input_channels=3, feature_dim=64):
-        super(CompressionAnalyzer, self).__init__()
-        self.analyzer = nn.Sequential(
-            nn.Conv2d(input_channels, 32, 3, padding=1),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Flatten(),
-            nn.Linear(32, 1),
-            nn.Sigmoid()
-        )
-        
-    def forward(self, frames):
-        return self.analyzer(frames)
-
-class LivenessDetectionModule(nn.Module):
-    """Detects liveness in video sequences."""
-    def __init__(self, visual_dim=1024, feature_dim=128):
-        super(LivenessDetectionModule, self).__init__()
-        self.detector = nn.Sequential(
-            nn.Linear(visual_dim, feature_dim),
-            nn.ReLU(),
-            nn.Linear(feature_dim, 1),
-            nn.Sigmoid()
-        )
-        
-    def forward(self, visual_features):
-        batch_size = visual_features.shape[0]
-        device = visual_features.device
-        liveness = self.detector(visual_features)
-        features = torch.zeros(batch_size, 128, device=device)
-        return liveness, features
-
-class LightweightModelProcessor(nn.Module):
-    """Lightweight model for efficient processing."""
-    def __init__(self, input_channels=3, feature_dim=32):
-        super(LightweightModelProcessor, self).__init__()
-        self.processor = nn.Sequential(
-            nn.Conv2d(input_channels, 16, 3, padding=1),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Flatten(),
-            nn.Linear(16, feature_dim)
-        )
-        
-    def forward(self, frames):
-        return self.processor(frames)
-
-
-
 class MultiModalDeepfakeModel(nn.Module):
     def __init__(self, num_classes=2, video_feature_dim=1024, audio_feature_dim=1024, 
                  transformer_dim=768, num_transformer_layers=4, enable_face_mesh=True,
@@ -2484,19 +2131,6 @@ class MultiModalDeepfakeModel(nn.Module):
         else:  # Default to Wav2Vec2
             self.audio_model = Wav2Vec2Model.from_pretrained("facebook/wav2vec2-base")
             audio_out_dim = 768
-        
-        # Disable gradient checkpointing in audio model to avoid DDP conflicts
-        if hasattr(self.audio_model, 'gradient_checkpointing_disable'):
-            self.audio_model.gradient_checkpointing_disable()
-        elif hasattr(self.audio_model, 'config') and hasattr(self.audio_model.config, 'gradient_checkpointing'):
-            self.audio_model.config.gradient_checkpointing = False
-        
-        # Also disable attention dropout during training to avoid parameter reuse issues
-        if hasattr(self.audio_model, 'config'):
-            if hasattr(self.audio_model.config, 'attention_dropout'):
-                self.audio_model.config.attention_dropout = 0.0
-            if hasattr(self.audio_model.config, 'activation_dropout'):
-                self.audio_model.config.activation_dropout = 0.0
             
         self.audio_projection = nn.Linear(audio_out_dim, self.actual_audio_feature_dim)
         
@@ -2543,7 +2177,7 @@ class MultiModalDeepfakeModel(nn.Module):
         self.temporal_attention = TemporalAttention(visual_out_dim)
         
         # Forensic consistency module
-        self.forensic_module = ForensicConsistencyModule(3, debug=debug)  # 3 channels for RGB
+        self.forensic_module = ForensicConsistencyModule(3)  # 3 channels for RGB
         
         # ELA analysis module
         self.ela_encoder = nn.Sequential(
@@ -2823,38 +2457,6 @@ class MultiModalDeepfakeModel(nn.Module):
                         else:
                             nn.init.constant_(param, 0)
 
-    def _ensure_batch_consistency(self, tensor, expected_batch_size, tensor_name="tensor"):
-        """Ensure tensor has the correct batch size while preserving gradients when possible."""
-        if tensor is None:
-            return None
-            
-        if not isinstance(tensor, torch.Tensor):
-            return tensor
-            
-        current_batch_size = tensor.shape[0]
-        if current_batch_size == expected_batch_size:
-            return tensor
-            
-        if self.debug:
-            print(f"[DEBUG] Fixing batch size for {tensor_name}: {current_batch_size} -> {expected_batch_size}")
-        
-        # If we have more samples than expected, just truncate (preserves gradients)
-        if current_batch_size > expected_batch_size:
-            return tensor[:expected_batch_size]
-        
-        # If we have fewer samples, we need to pad
-        # Create new tensor with correct batch size, preserving gradient requirements
-        requires_grad = tensor.requires_grad
-        corrected_tensor = torch.zeros(expected_batch_size, *tensor.shape[1:], 
-                                     device=tensor.device, dtype=tensor.dtype, 
-                                     requires_grad=requires_grad)
-        
-        if current_batch_size > 0:
-            # Copy available data (this preserves gradients for the copied portion)
-            corrected_tensor[:current_batch_size] = tensor
-        
-        return corrected_tensor
-
     def forward(self, inputs: Dict[str, Union[torch.Tensor, List, None]]) -> Tuple[torch.Tensor, Dict]:
         """
         Forward pass for the model.
@@ -2888,11 +2490,10 @@ class MultiModalDeepfakeModel(nn.Module):
                 'explanation': None,
                 'component_weights': None,
                 'component_contributions': {},
-                'detailed_results': {},
-                'error': None
+                'detailed_results': {}
             }
             
-            # Extract inputs with batch size validation
+            # Extract inputs
             video_frames = inputs.get('video_frames')           # [B, T, C, H, W]
             audio = inputs.get('audio')                         # [B, L]
             audio_spectrogram = inputs.get('audio_spectrogram') # [B, 1, H, W]
@@ -2909,33 +2510,11 @@ class MultiModalDeepfakeModel(nn.Module):
             if video_frames is None or audio is None:
                 raise ValueError("Missing required inputs: video_frames or audio")
             
-            # Get batch dimensions from video_frames (primary input)
+            # Get batch dimensions
             batch_size, num_frames, C, H, W = video_frames.size()
-            
-            # CRITICAL: Ensure all inputs have consistent batch sizes
-            audio = self._ensure_batch_consistency(audio, batch_size, "audio")
-            audio_spectrogram = self._ensure_batch_consistency(audio_spectrogram, batch_size, "audio_spectrogram")
-            face_embeddings = self._ensure_batch_consistency(face_embeddings, batch_size, "face_embeddings")
-            temporal_consistency = self._ensure_batch_consistency(temporal_consistency, batch_size, "temporal_consistency")
-            metadata_features = self._ensure_batch_consistency(metadata_features, batch_size, "metadata_features")
-            ela_features = self._ensure_batch_consistency(ela_features, batch_size, "ela_features")
-            audio_visual_sync = self._ensure_batch_consistency(audio_visual_sync, batch_size, "audio_visual_sync")
-            facial_landmarks = self._ensure_batch_consistency(facial_landmarks, batch_size, "facial_landmarks")
-            
-            # Handle original frames with more specific warnings
-            if original_video_frames is not None and original_video_frames.shape[0] != batch_size:
-                if self.debug:
-                    print(f"[WARNING] Batch size mismatch in original_video_frames: expected {batch_size}, got {original_video_frames.shape[0]}")
-                original_video_frames = self._ensure_batch_consistency(original_video_frames, batch_size, "original_video_frames")
-            
-            if original_audio is not None and original_audio.shape[0] != batch_size:
-                if self.debug:
-                    print(f"[WARNING] Batch size mismatch in original_audio: expected {batch_size}, got {original_audio.shape[0]}")
-                original_audio = self._ensure_batch_consistency(original_audio, batch_size, "original_audio")
 
             # Debugging shapes
             if self.debug:
-                print(f"[DEBUG] Initial batch size: {batch_size}")
                 print(f"Video frames shape: {video_frames.shape}")
                 print(f"Audio shape: {audio.shape}")
                 if audio_spectrogram is not None:
@@ -2943,9 +2522,6 @@ class MultiModalDeepfakeModel(nn.Module):
 
             # Visual features extraction with proper normalization
             video_frames_flat = video_frames.view(batch_size * num_frames, C, H, W)
-            
-            if self.debug:
-                print(f"[DEBUG] Video frames flat shape: {video_frames_flat.shape}")
             
             # Ensure input is in [0, 1] range
             video_frames_flat = torch.clamp(video_frames_flat, 0.0, 1.0)
@@ -2960,9 +2536,6 @@ class MultiModalDeepfakeModel(nn.Module):
             
             visual_features = self.visual_model(video_frames_normalized)
             visual_features = visual_features.view(batch_size, num_frames, -1)
-            
-            if self.debug:
-                print(f"[DEBUG] Visual features shape after reshape: {visual_features.shape}")
             
             # Check for NaN in visual features and replace with zeros
             if torch.isnan(visual_features).any():
@@ -3030,19 +2603,6 @@ class MultiModalDeepfakeModel(nn.Module):
 
             # Process forensic consistency
             forensic_features = self.forensic_module(video_frames)  # [B, T, hidden_dim]
-            
-            # CRITICAL FIX: Ensure forensic features match batch size
-            if forensic_features.shape[0] != batch_size:
-                if self.debug:
-                    print(f"[WARNING] Forensic module batch size mismatch: expected {batch_size}, got {forensic_features.shape[0]}")
-                # Always create new tensor with correct batch size
-                corrected_features = torch.zeros(batch_size, *forensic_features.shape[1:], device=forensic_features.device)
-                if forensic_features.shape[0] > 0:
-                    # Copy available features
-                    copy_size = min(batch_size, forensic_features.shape[0])
-                    corrected_features[:copy_size] = forensic_features[:copy_size]
-                forensic_features = corrected_features
-            
             forensic_features = torch.mean(forensic_features, dim=1)  # [B, hidden_dim]
 
             # Initialize explainability features
@@ -3057,8 +2617,6 @@ class MultiModalDeepfakeModel(nn.Module):
                     ela_features = ela_features.unsqueeze(1)
                 ela_output = self.ela_encoder(ela_features)
                 ela_output = self.ela_projection(ela_output)
-                # Ensure correct batch size
-                ela_output = self._ensure_batch_consistency(ela_output, batch_size, "ela_output")
                 explainability_features.append(ela_output)
                 component_contributions['ela'] = ela_output
             else:
@@ -3068,13 +2626,11 @@ class MultiModalDeepfakeModel(nn.Module):
             metadata_output = None
             if metadata_features is not None:
                 metadata_output = self.metadata_encoder(metadata_features)
-                metadata_output = self._ensure_batch_consistency(metadata_output, batch_size, "metadata_output")
                 explainability_features.append(metadata_output)
                 component_contributions['metadata'] = metadata_output
                 
                 # Enhanced metadata analysis
                 enhanced_metadata_score = self.enhanced_metadata_analyzer(metadata_features)
-                enhanced_metadata_score = self._ensure_batch_consistency(enhanced_metadata_score, batch_size, "enhanced_metadata_score")
                 component_contributions['enhanced_metadata'] = enhanced_metadata_score
             else:
                 explainability_features.append(torch.zeros(batch_size, 128, device=video_frames.device))
@@ -3088,9 +2644,7 @@ class MultiModalDeepfakeModel(nn.Module):
                 # Calculate sync between current video and audio if not provided
                 av_sync_score = self.sync_detector(video_features, audio_features)
                 av_sync_features = av_sync_score.view(batch_size, -1)
-            
-            # Ensure correct batch size for av_sync_features
-            av_sync_features = self._ensure_batch_consistency(av_sync_features, batch_size, "av_sync_features")
+                
             explainability_features.append(av_sync_features)
             component_contributions['av_sync'] = av_sync_features
             
@@ -3098,7 +2652,6 @@ class MultiModalDeepfakeModel(nn.Module):
             face_embedding_output = None
             if face_embeddings is not None:
                 face_embedding_output = self.face_embedding_processor(face_embeddings)
-                face_embedding_output = self._ensure_batch_consistency(face_embedding_output, batch_size, "face_embedding_output")
                 explainability_features.append(face_embedding_output)
                 component_contributions['face_embedding'] = face_embedding_output
             else:
@@ -3433,14 +2986,11 @@ class MultiModalDeepfakeModel(nn.Module):
                             normalized_features.append(torch.zeros(batch_size, target_dim, device=device))
                             continue
                     
-                    # Ensure it has batch dimension and flatten to 2D if needed
+                    # Ensure it has batch dimension
                     if feature.dim() == 1:
                         feature = feature.unsqueeze(0)
                     elif feature.dim() == 0:
                         feature = feature.unsqueeze(0).unsqueeze(0)
-                    elif feature.dim() > 2:
-                        # Flatten higher dimensions to 2D
-                        feature = feature.view(feature.shape[0], -1)
                     
                     # Handle batch size mismatches more robustly
                     current_batch_size = feature.shape[0]
@@ -3461,30 +3011,12 @@ class MultiModalDeepfakeModel(nn.Module):
                     # Normalize feature dimension
                     feat_dim = feature.shape[1] if feature.dim() > 1 else 1
                     if feat_dim < target_dim:
-                        # Pad with zeros - ensure padding has same dimensions as feature
-                        if feature.dim() == 2:
-                            padding = torch.zeros(batch_size, target_dim - feat_dim, device=device, dtype=feature.dtype)
-                        elif feature.dim() == 3:
-                            padding = torch.zeros(batch_size, feature.shape[1], target_dim - feat_dim, device=device, dtype=feature.dtype)
-                        else:
-                            # Flatten feature first if more than 3 dimensions
-                            feature = feature.view(batch_size, -1)
-                            feat_dim = feature.shape[1]
-                            if feat_dim < target_dim:
-                                padding = torch.zeros(batch_size, target_dim - feat_dim, device=device, dtype=feature.dtype)
-                            else:
-                                padding = None
-                        
-                        if padding is not None:
-                            feature = torch.cat([feature, padding], dim=-1)
+                        # Pad with zeros
+                        padding = torch.zeros(batch_size, target_dim - feat_dim, device=device, dtype=feature.dtype)
+                        feature = torch.cat([feature, padding], dim=1)
                     elif feat_dim > target_dim:
                         # Truncate
-                        if feature.dim() == 2:
-                            feature = feature[:, :target_dim]
-                        elif feature.dim() == 3:
-                            feature = feature[:, :, :target_dim]
-                        else:
-                            feature = feature.view(batch_size, -1)[:, :target_dim]
+                        feature = feature[:, :target_dim]
                     
                     normalized_features.append(feature)
 
@@ -3543,33 +3075,12 @@ class MultiModalDeepfakeModel(nn.Module):
                     # Normalize feature dimension
                     feat_dim = tensor.shape[1] if tensor.dim() > 1 else 1
                     if feat_dim < target_dim:
-                        # Pad with zeros - ensure correct dimensions
-                        if tensor.dim() == 1:
-                            # Convert 1D to 2D first
-                            tensor = tensor.unsqueeze(1)
-                            feat_dim = 1
-                        
-                        if tensor.dim() == 2:
-                            padding = torch.zeros(batch_size, target_dim - feat_dim, device=device, dtype=tensor.dtype)
-                            tensor = torch.cat([tensor, padding], dim=1)
-                        elif tensor.dim() == 3:
-                            padding = torch.zeros(batch_size, tensor.shape[1], target_dim - feat_dim, device=device, dtype=tensor.dtype)
-                            tensor = torch.cat([tensor, padding], dim=2)
-                        else:
-                            # Flatten and treat as 2D
-                            tensor = tensor.view(batch_size, -1)
-                            feat_dim = tensor.shape[1]
-                            if feat_dim < target_dim:
-                                padding = torch.zeros(batch_size, target_dim - feat_dim, device=device, dtype=tensor.dtype)
-                                tensor = torch.cat([tensor, padding], dim=1)
+                        # Pad with zeros
+                        padding = torch.zeros(batch_size, target_dim - feat_dim, device=device, dtype=tensor.dtype)
+                        tensor = torch.cat([tensor, padding], dim=1)
                     elif feat_dim > target_dim:
                         # Truncate
-                        if tensor.dim() == 2:
-                            tensor = tensor[:, :target_dim]
-                        elif tensor.dim() == 3:
-                            tensor = tensor[:, :, :target_dim]
-                        else:
-                            tensor = tensor.view(batch_size, -1)[:, :target_dim]
+                        tensor = tensor[:, :target_dim]
                     
                     normalized_tensors.append(tensor)
                 
@@ -3622,30 +3133,6 @@ class MultiModalDeepfakeModel(nn.Module):
             # Main classification
             output = self.classifier(final_features)
             
-            # CRITICAL: Ensure output batch size matches input batch size
-            if output.shape[0] != batch_size:
-                if self.debug:
-                    print(f"[ERROR] Classifier output batch size mismatch: expected {batch_size}, got {output.shape[0]}")
-                    print(f"[DEBUG] final_features shape: {final_features.shape}")
-                
-                # Emergency fix: truncate or pad output to match expected batch size
-                if output.shape[0] > batch_size:
-                    output = output[:batch_size]
-                else:
-                    # Pad with zeros while preserving gradient requirements
-                    padding_size = batch_size - output.shape[0]
-                    padding = torch.zeros(padding_size, output.shape[1], 
-                                        device=output.device, dtype=output.dtype,
-                                        requires_grad=output.requires_grad)
-                    output = torch.cat([output, padding], dim=0)
-                
-                if self.debug:
-                    print(f"[FIX] Corrected output shape: {output.shape}")
-            
-            if self.debug:
-                print(f"[DEBUG] Final classifier output shape: {output.shape}")
-                print(f"[DEBUG] Expected batch size: {batch_size}")
-            
             # Ensure gradients are maintained during training
             if self.training:
                 # Check if output requires gradients
@@ -3684,29 +3171,30 @@ class MultiModalDeepfakeModel(nn.Module):
             deepfake_check_results = None
             explanation_data = None
             if not self.training:
-                # Skip detailed forensic analysis during evaluation for now
-                # This can be implemented later if needed
-                deepfake_check_results = {
-                    'is_fake': torch.sigmoid(output[:, 1]) > 0.5,
-                    'confidence': torch.max(torch.softmax(output, dim=1), dim=1)[0],
-                    'fake_probability': torch.sigmoid(output[:, 1])
-                }
-                explanation_data = {
-                    'component_analysis': component_contributions,
-                    'primary_indicators': ['physiological', 'facial_dynamics', 'audio_visual_sync'],
-                    'confidence_factors': {}
-                }
+                # Run detailed forensic analysis
+                deepfake_check_results, explanation_data = self.deepfake_check_video(
+                    video_frames=video_frames, 
+                    original_video_frames=original_video_frames,
+                    fake_periods=inputs.get('fake_periods'),
+                    timestamps=inputs.get('timestamps'),
+                    original_audio=original_audio, 
+                    current_audio=audio,
+                    ela_features=ela_features,
+                    metadata_features=metadata_features,
+                    temporal_consistency=temporal_consistency,
+                    av_sync_features=audio_visual_sync,
+                    facial_landmarks=facial_landmarks,
+                    component_contributions=component_contributions
+                )
 
-            # Update results dictionary - ENSURE ALL KEYS ARE ALWAYS PRESENT
+            # Update results dictionary
             results.update({
                 'logits': output,
                 'deepfake_type': deepfake_type_output,
                 'deepfake_check': deepfake_check_results,
                 'explanation': explanation_data,
                 'component_weights': F.softmax(self.component_weights, dim=0) if self.enable_explainability else None,
-                'component_contributions': component_contributions,
-                'detailed_results': results.get('detailed_results', {}),  # Ensure this key always exists
-                'error': None  # Ensure error key exists when no error
+                'component_contributions': component_contributions
             })
 
             return output, results
@@ -3716,20 +3204,7 @@ class MultiModalDeepfakeModel(nn.Module):
             import traceback
             traceback.print_exc()
             # Return zero tensor with proper shape as fallback
-            # ENSURE CONSISTENT DICTIONARY KEYS EVEN IN ERROR CASE
-            error_results = {
-                'logits': None,
-                'deepfake_type': None,
-                'deepfake_check': None,
-                'explanation': None,
-                'component_weights': None,
-                'component_contributions': {},
-                'detailed_results': {},
-                'error': str(e)
-            }
-            # Create error tensor with gradients to prevent training crashes
-            error_tensor = torch.zeros((batch_size, 2), device=video_frames.device, requires_grad=True)
-            return error_tensor, error_results
+            return torch.zeros((batch_size, 2), device=video_frames.device), {"error": str(e)}
 
     def extract_facial_landmarks(self, video_frames):
         """Extract facial landmarks using mediapipe/dlib."""
