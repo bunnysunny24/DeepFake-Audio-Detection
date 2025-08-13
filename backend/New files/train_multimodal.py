@@ -81,25 +81,34 @@ class FocalLoss(nn.Module):
 # 🧼 COMPREHENSIVE PROCESS AND GPU SAFETY MANAGEMENT
 # This prevents zombie processes and GPU monopolization that can get SSH access revoked
 
-def limit_gpu_usage():
-    """Limit GPU usage to prevent monopolizing server resources - SINGLE GPU ONLY."""
+def setup_gpu_usage(use_all_gpus=True):
+    """Setup GPU usage - can use all GPUs on local system or limit for servers."""
     if torch.cuda.is_available():
-        # 🔒 STRICT: Use ONLY 1 GPU to be extremely server-friendly
-        if 'CUDA_VISIBLE_DEVICES' not in os.environ:
-            available_gpus = torch.cuda.device_count()
-            # Always limit to GPU 0 only
-            os.environ['CUDA_VISIBLE_DEVICES'] = '0'
-            print(f"🔒 SINGLE GPU ENFORCED: Using ONLY GPU 0 out of {available_gpus} available")
-            print("   This ensures minimal server resource usage")
-        else:
-            visible_gpus = os.environ['CUDA_VISIBLE_DEVICES']
-            # If multiple GPUs specified, force to first one only
-            if ',' in visible_gpus:
-                first_gpu = visible_gpus.split(',')[0]
-                os.environ['CUDA_VISIBLE_DEVICES'] = first_gpu
-                print(f"🔒 FORCED SINGLE GPU: Changed from '{visible_gpus}' to '{first_gpu}'")
+        available_gpus = torch.cuda.device_count()
+        
+        if use_all_gpus:
+            # � LOCAL SYSTEM: Use all available GPUs for maximum performance
+            if 'CUDA_VISIBLE_DEVICES' not in os.environ:
+                print(f"🚀 MULTI-GPU ENABLED: Using ALL {available_gpus} GPUs for maximum performance")
+                print(f"   GPUs: {', '.join([f'GPU {i}' for i in range(available_gpus)])}")
             else:
-                print(f"✅ Using single pre-configured GPU: {visible_gpus}")
+                visible_gpus = os.environ['CUDA_VISIBLE_DEVICES']
+                gpu_list = visible_gpus.split(',')
+                print(f"🚀 MULTI-GPU ENABLED: Using {len(gpu_list)} GPUs: {visible_gpus}")
+        else:
+            # 🔒 SERVER MODE: Use only single GPU for server safety
+            if 'CUDA_VISIBLE_DEVICES' not in os.environ:
+                os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+                print(f"🔒 SERVER MODE: Using ONLY GPU 0 out of {available_gpus} available")
+                print("   This ensures minimal server resource usage")
+            else:
+                visible_gpus = os.environ['CUDA_VISIBLE_DEVICES']
+                if ',' in visible_gpus:
+                    first_gpu = visible_gpus.split(',')[0]
+                    os.environ['CUDA_VISIBLE_DEVICES'] = first_gpu
+                    print(f"🔒 SERVER MODE: Changed from '{visible_gpus}' to '{first_gpu}'")
+                else:
+                    print(f"✅ Using single pre-configured GPU: {visible_gpus}")
     else:
         print("⚠️  No GPUs available, will use CPU")
 
@@ -226,7 +235,7 @@ def cleanup_processes():
         print(f"Process cleanup warning: {e}")
 
 # Apply safety measures immediately when module is imported
-limit_gpu_usage()
+# GPU usage will be configured in main() based on command line arguments
 set_process_limits()
 setup_graceful_shutdown()
 
@@ -785,8 +794,12 @@ class DeepfakeTrainer:
             # Load checkpoint on appropriate device
             checkpoint = torch.load(checkpoint_path, map_location=self.device)
             
-            # Load model weights (direct access, no DataParallel)
-            self.model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+            # Load model weights (handle DataParallel)
+            if hasattr(self.model, 'module'):
+                # DataParallel wraps model in .module
+                self.model.module.load_state_dict(checkpoint['model_state_dict'], strict=False)
+            else:
+                self.model.load_state_dict(checkpoint['model_state_dict'], strict=False)
             
             # Load optimizer state
             if 'optimizer_state_dict' in checkpoint:
@@ -1046,13 +1059,17 @@ class DeepfakeTrainer:
         # Move model to device
         self.model.to(self.device)
 
-        # 🔒 SINGLE GPU ENFORCED: No DataParallel - use only one GPU
+        # � MULTI-GPU SETUP: Enable DataParallel for local system performance
         visible_gpus = torch.cuda.device_count()
         if visible_gpus > 1:
-            print(f"🔒 SINGLE GPU ENFORCED: {visible_gpus} GPUs visible but using ONLY 1")
-            print("   DataParallel disabled to prevent multi-GPU usage")
+            self.model = nn.DataParallel(self.model)
+            print(f"� MULTI-GPU ENABLED: Using DataParallel across {visible_gpus} GPUs")
+            print(f"   Primary device: {self.device}")
+            print(f"   GPU devices: {list(range(visible_gpus))}")
+            self.is_multi_gpu = True
         else:
             print(f"✅ Using single GPU: {self.device}")
+            self.is_multi_gpu = False
 
         # Initialize loss function with class weights for imbalanced data
         loss_type = getattr(self.config, 'loss_type', 'crossentropy')
@@ -1245,8 +1262,12 @@ class DeepfakeTrainer:
                 f"checkpoint_epoch_{epoch+1}_batch_{batch_idx}.pth"
             )
             
-            # Direct model access (no DataParallel)
-            model_state_dict = self.model.state_dict()
+            # Get model state dict (handle DataParallel)
+            if hasattr(self.model, 'module'):
+                # DataParallel wraps model in .module
+                model_state_dict = self.model.module.state_dict()
+            else:
+                model_state_dict = self.model.state_dict()
             
             checkpoint = {
                 'epoch': epoch + 1,
@@ -2198,7 +2219,12 @@ class DeepfakeTrainer:
             f"checkpoint_epoch_{epoch+1}_acc_{accuracy:.4f}_f1_{f1_score:.4f}.pth"
         )
         
-        model_state_dict = self.model.state_dict()  # Direct access, no DataParallel
+        # Get model state dict (handle DataParallel)
+        if hasattr(self.model, 'module'):
+            # DataParallel wraps model in .module
+            model_state_dict = self.model.module.state_dict()
+        else:
+            model_state_dict = self.model.state_dict()
         
         checkpoint = {
             'epoch': epoch + 1,
@@ -2217,7 +2243,12 @@ class DeepfakeTrainer:
         """Save best model checkpoint."""
         best_model_path = os.path.join(self.run_checkpoint_dir, "best_model.pth")
         
-        model_state_dict = self.model.state_dict()  # Direct access, no DataParallel
+        # Get model state dict (handle DataParallel)
+        if hasattr(self.model, 'module'):
+            # DataParallel wraps model in .module
+            model_state_dict = self.model.module.state_dict()
+        else:
+            model_state_dict = self.model.state_dict()
         
         checkpoint = {
             'epoch': epoch + 1,
@@ -2355,7 +2386,6 @@ def parse_args():
     parser.add_argument('--learning_rate', type=float, default=5e-5, help='Learning rate (reduced to prevent overfitting)')  # Lowered
     parser.add_argument('--weight_decay', type=float, default=1e-4, help='Weight decay (increased for better regularization)')  # Increased
     parser.add_argument('--max_samples', type=int, default=1000, help='Maximum number of samples to use')
-    parser.add_argument('--num_workers', type=int, default=0, help='🧼 SAFETY: Number of data loader workers (default=0, optimal for complex multimodal datasets)')  # Reverted based on benchmark results
     parser.add_argument('--validation_split', type=float, default=0.2, help='Validation split ratio')
     parser.add_argument('--test_split', type=float, default=0.1, help='Test split ratio')
     parser.add_argument('--use_weighted_loss', action='store_true', help='Use class-weighted loss function')
@@ -2386,6 +2416,9 @@ def parse_args():
     # Misc parameters
     parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
     parser.add_argument('--device', type=str, default='cuda', help='Device to use (cuda or cpu)')
+    parser.add_argument('--use_all_gpus', action='store_true', default=True, help='🚀 Use all available GPUs with DataParallel (default: True for local systems)')
+    parser.add_argument('--single_gpu_mode', action='store_true', help='🔒 Force single GPU mode (for server environments)')
+    parser.add_argument('--num_workers', type=int, default=4, help='🚀 Number of data loader workers (default=4 for local systems)')
     parser.add_argument('--amp_enabled', action='store_true', default=True, help='Enable automatic mixed precision (default: True)')
     parser.add_argument('--debug', action='store_true', help='Enable debug mode')
     parser.add_argument('--pretrained_path', type=str, default=None, help='Path to pretrained model weights')
