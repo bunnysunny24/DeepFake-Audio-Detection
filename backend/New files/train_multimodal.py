@@ -28,6 +28,12 @@ import pandas as pd
 import wandb
 import argparse
 from datetime import datetime, timedelta
+import atexit
+import signal
+import threading
+import traceback
+import psutil
+import resource
 import shutil
 import traceback
 import glob
@@ -1178,7 +1184,7 @@ class DeepfakeTrainer:
         
         # Start monitoring thread
         # 🧼 ZOMBIE PROCESS SAFE: Start monitoring thread (daemon=True, no child processes)
-    monitor_thread = threading.Thread(target=monitor_worker, daemon=True)
+        monitor_thread = threading.Thread(target=monitor_worker, daemon=True)
         monitor_thread.start()
         print("🔍 Started background resource monitoring")
     
@@ -1812,34 +1818,34 @@ class DeepfakeTrainer:
         # Log component importance for feature analysis to WandB
         if self.config.use_wandb and all_component_contributions:
             component_importance = {}
-                for key, values in all_component_contributions.items():
-                    if values:
-                        avg_value = np.mean(values)
-                        component_importance[f"component_{key}"] = avg_value
+            for key, values in all_component_contributions.items():
+                if values:
+                    avg_value = np.mean(values)
+                    component_importance[f"component_{key}"] = avg_value
+            
+            wandb.log(component_importance)
+            
+            # Create feature importance chart
+            if component_importance:
+                plt.figure(figsize=(12, 6))
+                keys = sorted(component_importance.keys())
+                values = [component_importance[k] for k in keys]
                 
-                wandb.log(component_importance)
+                # Sort by value
+                sorted_indices = np.argsort(values)
+                sorted_keys = [keys[i] for i in sorted_indices]
+                sorted_values = [values[i] for i in sorted_indices]
                 
-                # Create feature importance chart
-                if component_importance:
-                    plt.figure(figsize=(12, 6))
-                    keys = sorted(component_importance.keys())
-                    values = [component_importance[k] for k in keys]
-                    
-                    # Sort by value
-                    sorted_indices = np.argsort(values)
-                    sorted_keys = [keys[i] for i in sorted_indices]
-                    sorted_values = [values[i] for i in sorted_indices]
-                    
-                    plt.barh(sorted_keys, sorted_values)
-                    plt.title("Feature Importance Scores")
-                    plt.xlabel("Average Contribution")
-                    plt.tight_layout()
-                    
-                    feature_importance_path = os.path.join(self.plot_dir, f"feature_importance_epoch_{epoch+1}.png")
-                    plt.savefig(feature_importance_path)
-                    plt.close()
-                    
-                    wandb.log({f"feature_importance_epoch_{epoch+1}": wandb.Image(feature_importance_path)})
+                plt.barh(sorted_keys, sorted_values)
+                plt.title("Feature Importance Scores")
+                plt.xlabel("Average Contribution")
+                plt.tight_layout()
+                
+                feature_importance_path = os.path.join(self.plot_dir, f"feature_importance_epoch_{epoch+1}.png")
+                plt.savefig(feature_importance_path)
+                plt.close()
+                
+                wandb.log({f"feature_importance_epoch_{epoch+1}": wandb.Image(feature_importance_path)})
         
         # Return metrics
         return avg_loss, accuracy, precision, recall, f1, auc_score
@@ -2002,41 +2008,41 @@ class DeepfakeTrainer:
         
         # Add component results to detailed analysis DataFrame
         for key, values in detailed_component_results.items():
-                if len(values) == len(results_data['file_path']):
-                    results_df[f"component_{key}"] = values
+            if len(values) == len(results_data['file_path']):
+                results_df[f"component_{key}"] = values
+        
+        # Save enhanced results with component details
+        enhanced_results_path = os.path.join(self.log_dir, "test_results_detailed.csv")
+        results_df.to_csv(enhanced_results_path, index=False)
+        print(f"Detailed test results with component analysis saved to: {enhanced_results_path}")
+        
+        # Create feature importance visualization
+        if detailed_component_results:
+            # Calculate average importance for each component
+            component_importance = {}
+            for key, values in detailed_component_results.items():
+                if values:
+                    component_importance[key] = np.mean(values)
             
-            # Save enhanced results with component details
-            enhanced_results_path = os.path.join(self.log_dir, "test_results_detailed.csv")
-            results_df.to_csv(enhanced_results_path, index=False)
-            print(f"Detailed test results with component analysis saved to: {enhanced_results_path}")
+            # Sort components by importance
+            sorted_components = sorted(component_importance.items(), key=lambda x: x[1], reverse=True)
             
-            # Create feature importance visualization
-            if detailed_component_results:
-                # Calculate average importance for each component
-                component_importance = {}
-                for key, values in detailed_component_results.items():
-                    if values:
-                        component_importance[key] = np.mean(values)
-                
-                # Sort components by importance
-                sorted_components = sorted(component_importance.items(), key=lambda x: x[1], reverse=True)
-                
-                # Create feature importance chart
-                plt.figure(figsize=(12, 8))
-                component_names = [item[0] for item in sorted_components]
-                component_values = [item[1] for item in sorted_components]
-                
-                plt.barh(component_names, component_values)
-                plt.title("Component Importance in Deepfake Detection")
-                plt.xlabel("Average Contribution")
-                plt.tight_layout()
-                
-                feature_importance_path = os.path.join(self.plot_dir, "feature_importance_test.png")
-                plt.savefig(feature_importance_path)
-                plt.close()
-                
-                if self.config.use_wandb:
-                    wandb.log({"feature_importance_test": wandb.Image(feature_importance_path)})
+            # Create feature importance chart
+            plt.figure(figsize=(12, 8))
+            component_names = [item[0] for item in sorted_components]
+            component_values = [item[1] for item in sorted_components]
+            
+            plt.barh(component_names, component_values)
+            plt.title("Component Importance in Deepfake Detection")
+            plt.xlabel("Average Contribution")
+            plt.tight_layout()
+            
+            feature_importance_path = os.path.join(self.plot_dir, "feature_importance_test.png")
+            plt.savefig(feature_importance_path)
+            plt.close()
+            
+            if self.config.use_wandb:
+                wandb.log({"feature_importance_test": wandb.Image(feature_importance_path)})
         
         return avg_loss, metrics_dict
     
@@ -2087,9 +2093,9 @@ class DeepfakeTrainer:
                 for metric_name, train_values, val_values in [
                     ('loss', self.metrics['train_losses'], self.metrics['val_losses']),
                     ('accuracy', self.metrics['train_accuracies'], self.metrics['val_accuracies']),
-                        ('f1', self.metrics['train_f1_scores'], self.metrics['val_f1_scores']),
-                        ('auc', self.metrics['train_auc_scores'], self.metrics['val_auc_scores'])
-                    ]:
+                    ('f1', self.metrics['train_f1_scores'], self.metrics['val_f1_scores']),
+                    ('auc', self.metrics['train_auc_scores'], self.metrics['val_auc_scores'])
+                ]:
                         print(f"[DEBUG] Plotting {metric_name} - Train: {len(train_values)} values, Val: {len(val_values)} values")
                         plot_path = plot_metrics(train_values, val_values, metric_name, epoch+1, self.plot_dir)
                         print(f"[DEBUG] Successfully saved {metric_name} plot to: {plot_path}")
@@ -2098,12 +2104,12 @@ class DeepfakeTrainer:
                         if self.config.use_wandb:
                             wandb.log({f"{metric_name}_plot": wandb.Image(plot_path)})
                     
-                    print("✅ All plots generated successfully!")
+                print("✅ All plots generated successfully!")
                     
-                except Exception as e:
-                    print(f"❌ Error generating plots: {e}")
-                    import traceback
-                    traceback.print_exc()
+            except Exception as e:
+                print(f"❌ Error generating plots: {e}")
+                import traceback
+                traceback.print_exc()
                 
                 # Log epoch metrics to WandB
                 if self.config.use_wandb:
@@ -2168,46 +2174,46 @@ class DeepfakeTrainer:
         
         # Test the model
         test_loss, test_metrics = self.test_model()
+        
+        # Save final results
+        final_results = {
+            'best_epoch': self.best_epoch,
+            'best_val_accuracy': float(self.best_val_accuracy),
+            'best_val_f1': float(self.best_val_f1),
+            'test_loss': float(test_loss),
+            'test_accuracy': float(test_metrics['accuracy']),
+            'test_precision': float(test_metrics['precision']),
+            'test_recall': float(test_metrics['recall']),
+            'test_f1': float(test_metrics['f1']),
+            'test_auc': float(test_metrics['auc']),
+            'training_time': time.time() - self.training_start_time if hasattr(self, 'training_start_time') else None,
+            'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            'config': vars(self.config)
+        }
+        
+        # Save as JSON
+        final_results_path = os.path.join(self.log_dir, "final_results.json")
+        with open(final_results_path, 'w') as f:
+            # Handle non-serializable values
+            serializable_results = {}
+            for key, value in final_results.items():
+                if key == 'config':
+                    # Convert config to serializable dict
+                    config_dict = {}
+                    for k, v in value.items():
+                        if isinstance(v, (int, float, str, bool, list, dict, type(None))):
+                            config_dict[k] = v
+                        else:
+                            config_dict[k] = str(v)
+                    serializable_results[key] = config_dict
+                elif isinstance(value, (int, float, str, bool, list, dict, type(None))):
+                    serializable_results[key] = value
+                else:
+                    serializable_results[key] = str(value)
             
-            # Save final results
-            final_results = {
-                'best_epoch': self.best_epoch,
-                'best_val_accuracy': float(self.best_val_accuracy),
-                'best_val_f1': float(self.best_val_f1),
-                'test_loss': float(test_loss),
-                'test_accuracy': float(test_metrics['accuracy']),
-                'test_precision': float(test_metrics['precision']),
-                'test_recall': float(test_metrics['recall']),
-                'test_f1': float(test_metrics['f1']),
-                'test_auc': float(test_metrics['auc']),
-                'training_time': time.time() - self.training_start_time if hasattr(self, 'training_start_time') else None,
-                'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                'config': vars(self.config)
-            }
-            
-            # Save as JSON
-            final_results_path = os.path.join(self.log_dir, "final_results.json")
-            with open(final_results_path, 'w') as f:
-                # Handle non-serializable values
-                serializable_results = {}
-                for key, value in final_results.items():
-                    if key == 'config':
-                        # Convert config to serializable dict
-                        config_dict = {}
-                        for k, v in value.items():
-                            if isinstance(v, (int, float, str, bool, list, dict, type(None))):
-                                config_dict[k] = v
-                            else:
-                                config_dict[k] = str(v)
-                        serializable_results[key] = config_dict
-                    elif isinstance(value, (int, float, str, bool, list, dict, type(None))):
-                        serializable_results[key] = value
-                    else:
-                        serializable_results[key] = str(value)
-                
-                json.dump(serializable_results, f, indent=4)
-            
-            print(f"Final results saved to: {final_results_path}")
+            json.dump(serializable_results, f, indent=4)
+        
+        print(f"Final results saved to: {final_results_path}")
     
     def save_checkpoint(self, epoch, accuracy, f1_score):
         """Save model checkpoint."""
