@@ -3004,21 +3004,48 @@ class MultiModalDeepfakeModel(nn.Module):
                             # Truncate to expected batch size
                             feature = feature[:batch_size]
                         else:
-                            # Pad with zeros for missing samples
+                            # Pad with zeros for missing samples - handle different dimensions
                             missing_samples = batch_size - current_batch_size
-                            feat_dim = feature.shape[1] if feature.dim() > 1 else 1
-                            padding = torch.zeros(missing_samples, feat_dim, device=device, dtype=feature.dtype)
+                            if feature.dim() == 2:
+                                feat_dim = feature.shape[1]
+                                padding = torch.zeros(missing_samples, feat_dim, device=device, dtype=feature.dtype)
+                            elif feature.dim() == 3:
+                                feat_dim1, feat_dim2 = feature.shape[1], feature.shape[2]
+                                padding = torch.zeros(missing_samples, feat_dim1, feat_dim2, device=device, dtype=feature.dtype)
+                            else:
+                                # For other dimensions, match the shape except for batch dimension
+                                padding_shape = [missing_samples] + list(feature.shape[1:])
+                                padding = torch.zeros(padding_shape, device=device, dtype=feature.dtype)
                             feature = torch.cat([feature, padding], dim=0)
                     
                     # Normalize feature dimension
                     feat_dim = feature.shape[1] if feature.dim() > 1 else 1
                     if feat_dim < target_dim:
-                        # Pad with zeros
-                        padding = torch.zeros(batch_size, target_dim - feat_dim, device=device, dtype=feature.dtype)
-                        feature = torch.cat([feature, padding], dim=1)
+                        # Pad with zeros - ensure padding tensor has same dimensions as feature
+                        if feature.dim() == 2:
+                            padding = torch.zeros(batch_size, target_dim - feat_dim, device=device, dtype=feature.dtype)
+                            feature = torch.cat([feature, padding], dim=1)
+                        elif feature.dim() == 3:
+                            padding = torch.zeros(batch_size, feature.shape[1], target_dim - feat_dim, device=device, dtype=feature.dtype)
+                            feature = torch.cat([feature, padding], dim=2)
+                        else:
+                            # For other dimensions, flatten and pad
+                            feature = feature.view(batch_size, -1)
+                            current_dim = feature.shape[1]
+                            if current_dim < target_dim:
+                                padding = torch.zeros(batch_size, target_dim - current_dim, device=device, dtype=feature.dtype)
+                                feature = torch.cat([feature, padding], dim=1)
+                            else:
+                                feature = feature[:, :target_dim]
                     elif feat_dim > target_dim:
-                        # Truncate
-                        feature = feature[:, :target_dim]
+                        # Truncate - handle different dimensions
+                        if feature.dim() == 2:
+                            feature = feature[:, :target_dim]
+                        elif feature.dim() == 3:
+                            feature = feature[:, :, :target_dim]
+                        else:
+                            # Flatten and truncate
+                            feature = feature.view(batch_size, -1)[:, :target_dim]
                     
                     normalized_features.append(feature)
 
