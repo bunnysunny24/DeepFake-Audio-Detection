@@ -100,3 +100,5 @@ python train_multimodal.py \
   --use_wandb \
   --wandb_project "deepfake-detection-improved" \
   --wandb_run_name "focal_loss_balanced_zombie_safe_v1"
+
+.\deepfake-env\Scripts\Activate.ps1
