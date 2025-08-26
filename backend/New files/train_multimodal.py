@@ -33,7 +33,11 @@ import signal
 import threading
 import traceback
 import psutil
-import resource
+try:
+    import resource  # Unix-only, not available on Windows
+    HAS_RESOURCE = True
+except ImportError:
+    HAS_RESOURCE = False
 import shutil
 import traceback
 import glob
@@ -43,7 +47,6 @@ import signal
 import sys
 import psutil
 import subprocess
-import resource
 import threading
 import multiprocessing as mp_check
 
@@ -172,11 +175,13 @@ def monitor_system_resources():
 def set_process_limits():
     """Set conservative process limits to prevent server overload."""
     try:
-        # Limit number of open files to prevent file descriptor exhaustion
-        resource.setrlimit(resource.RLIMIT_NOFILE, (1024, 1024))
+        # Limit number of open files to prevent file descriptor exhaustion (Unix only)
+        if HAS_RESOURCE:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (1024, 1024))
         
-        # Set nice value to lower priority (be respectful on shared servers)
-        os.nice(5)  # Lower priority
+        # Set nice value to lower priority (be respectful on shared servers) (Unix only)
+        if hasattr(os, 'nice'):
+            os.nice(5)  # Lower priority
         
         print("🔒 Set conservative process limits for server safety")
         
