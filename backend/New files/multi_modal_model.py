@@ -3050,7 +3050,18 @@ class MultiModalDeepfakeModel(nn.Module):
                     normalized_features.append(feature)
 
                 try:
-                    all_explainability = torch.cat(normalized_features, dim=-1)
+                    # Ensure all features are 2D before concatenation
+                    final_features = []
+                    for feature in normalized_features:
+                        if feature.dim() > 2:
+                            # Flatten to 2D (batch_size, -1)
+                            feature = feature.view(feature.shape[0], -1)
+                        elif feature.dim() == 1:
+                            # Add feature dimension
+                            feature = feature.unsqueeze(1)
+                        final_features.append(feature)
+                    
+                    all_explainability = torch.cat(final_features, dim=-1)
                 except Exception as e:
                     print(f"[WARNING] Error concatenating explainability features: {e}")
                     print(f"[DEBUG] Batch size: {batch_size}, Feature shapes: {[f.shape for f in normalized_features]}")
