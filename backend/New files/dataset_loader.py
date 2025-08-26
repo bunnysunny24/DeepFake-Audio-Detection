@@ -1483,9 +1483,9 @@ def get_transforms_enhanced(phase='train'):
 
 def get_data_loaders(
     json_path, data_dir, batch_size=4, validation_split=0.2, test_split=0.1,
-    shuffle=True, num_workers=0, max_samples=None, detect_faces=True,  # 🧼 ZOMBIE SAFE: num_workers=0
+    shuffle=True, num_workers=4, max_samples=None, detect_faces=True,  # 🚀 LOCAL SYSTEM: num_workers=4 for better performance
     compute_spectrograms=True, temporal_features=True, enhanced_preprocessing=True,
-    enhanced_augmentation=False, multiprocessing_context=None, pin_memory=False, reduce_frames=16
+    enhanced_augmentation=False, multiprocessing_context=None, pin_memory=True, reduce_frames=16  # 🚀 Enable pin_memory for GPU transfers
 ):
     """
     Load data loaders with an option to restrict the maximum number of samples.
@@ -1615,13 +1615,14 @@ def get_data_loaders(
     # Get class weights for weighted sampling
     class_weights = train_dataset.class_weights
 
-    # 🧼 ZOMBIE PROCESS SAFE: Handle multiprocessing context for safety (but num_workers=0, so never used)
+    # 🚀 LOCAL SYSTEM: Handle multiprocessing context for performance
     mp_context = None
-    if num_workers > 0 and multiprocessing_context:  # This will never execute since num_workers=0
-        # 🧼 ZOMBIE PROCESS SAFE: Import only for unused context detection
+    if num_workers > 0 and multiprocessing_context:
+        # 🚀 PERFORMANCE: Use multiprocessing for faster data loading on local system
         import multiprocessing as mp
         try:
             mp_context = mp.get_context(multiprocessing_context)
+            print(f"🚀 Using multiprocessing context: {multiprocessing_context}")
         except Exception as e:
             print(f"⚠️ Warning: Could not set multiprocessing context '{multiprocessing_context}': {e}")
             mp_context = None
