@@ -40,7 +40,7 @@ python train_multimodal.py `
   --data_dir "F:\deepfake\backup\LAV-DF" `
   --output_dir "F:\deepfake\backup\Models\memory_optimized_outputs" `
   --checkpoint_dir "F:\deepfake\backup\Models\memory_optimized_checkpoints" `
-  --max_samples 1500 `
+  --max_samples 2000 `
   --batch_size 6 `
   --num_epochs 15 `
   --learning_rate 2e-4 `
@@ -72,6 +72,8 @@ python train_multimodal.py `
   --focal_gamma 2.0 `
   --focal_alpha 1.0 `
   --use_wandb `
+  --save_intermediate `
+  --save_intermediate_interval 20 `
   --wandb_project "deepfake-detection-8gb-optimized" `
   --wandb_run_name "8gb_ultra_conservative_1500_samples_batch6"
 
