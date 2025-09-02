@@ -413,6 +413,30 @@ def calculate_metrics(y_true, y_pred, y_probs, epoch, return_dict=False):
     print(f"- AUC Score: {auc_score:.4f}")
     print(f"- Confusion Matrix:\n{confusion}")
     
+    # 🔧 PREDICTION DIAGNOSTICS: Check for constant predictions or problematic behavior
+    try:
+        unique_preds = np.unique(y_pred)
+        if unique_preds.size == 1:
+            print(f"🚨 [CRITICAL] Model predictions are CONSTANT (always predicting class {unique_preds[0]}) - model collapse detected!")
+            print(f"   This indicates: weights not updating, extreme class imbalance handling, or optimizer issues.")
+        
+        prob_std = np.array(y_probs).std()
+        prob_min, prob_max = np.array(y_probs).min(), np.array(y_probs).max()
+        if prob_std < 1e-3:
+            print(f"🚨 [CRITICAL] Predicted probabilities have very low variance (std={prob_std:.6f}) - model outputs are nearly constant!")
+            print(f"   Probability range: [{prob_min:.6f}, {prob_max:.6f}] - check model forward pass.")
+        
+        # Check for extreme class bias in confusion matrix
+        if confusion.shape == (2, 2):
+            total_pred_class_0 = confusion[0, 0] + confusion[1, 0]  # Real predictions (both correct and incorrect)
+            total_pred_class_1 = confusion[0, 1] + confusion[1, 1]  # Fake predictions (both correct and incorrect)
+            if total_pred_class_0 == 0:
+                print(f"🚨 [CRITICAL] Model NEVER predicts 'Real' class - severe prediction bias detected!")
+            elif total_pred_class_1 == 0:
+                print(f"🚨 [CRITICAL] Model NEVER predicts 'Fake' class - severe prediction bias detected!")
+    except Exception as e:
+        print(f"[WARNING] Could not run prediction diagnostics: {e}")
+    
     if return_dict:
         return {
             'accuracy': accuracy,
@@ -773,6 +797,9 @@ class DeepfakeTrainer:
         # Initialize memory management tracking
         self.memory_warnings = 0
         self.oom_errors = 0
+
+        # Track optimizer steps executed (helps detect scaler skipping steps)
+        self.optimizer_steps = 0
         
         # Initialize best model tracking with overfitting detection
         self.best_val_accuracy = 0.0
@@ -1096,6 +1123,20 @@ class DeepfakeTrainer:
 
         # Initialize loss function with class weights for imbalanced data
         loss_type = getattr(self.config, 'loss_type', 'crossentropy')
+        # Auto-enable weighted loss for heavily imbalanced datasets unless focal loss is explicitly chosen
+        try:
+            counts = self.train_loader.dataset.class_counts if hasattr(self.train_loader, 'dataset') else None
+            if counts and 'real' in counts and 'fake' in counts:
+                real_cnt = counts.get('real', 0)
+                fake_cnt = counts.get('fake', 0)
+                if real_cnt > 0 and fake_cnt > 0:
+                    ratio = max(real_cnt, fake_cnt) / min(real_cnt, fake_cnt)
+                    threshold = getattr(self.config, 'class_imbalance_threshold', 2.0)
+                    if ratio >= threshold and not getattr(self.config, 'use_weighted_loss', False) and loss_type != 'focal':
+                        print(f"⚠️ Class imbalance detected (ratio={ratio:.2f}) - enabling class-weighted loss automatically")
+                        self.config.use_weighted_loss = True
+        except Exception as e:
+            print(f"[INFO] Could not auto-detect class imbalance: {e}")
         
         if loss_type == 'focal':
             # 🔥 FOCAL LOSS for handling class imbalance
@@ -1119,6 +1160,10 @@ class DeepfakeTrainer:
             self.optimizer = optim.SGD(self.model.parameters(), lr=self.config.learning_rate, momentum=0.9, weight_decay=self.config.weight_decay)
         else:
             self.optimizer = optim.AdamW(self.model.parameters(), lr=self.config.learning_rate, weight_decay=self.config.weight_decay)
+
+        # 🔧 OPTIMIZER STEP TRACKING: Initialize step counter for debugging
+        self.optimizer_steps_taken = 0
+        self.scaler_skipped_steps = 0
 
         # Initialize learning rate scheduler with overfitting prevention
         if self.config.scheduler == 'step':
@@ -1554,9 +1599,15 @@ class DeepfakeTrainer:
                         
                         self.scaler.step(self.optimizer)
                         self.scaler.update()
+                        # 🔧 OPTIMIZER TRACKING: Count successful steps and check for AMP skipping
+                        self.optimizer_steps_taken += 1
+                        if self.optimizer_steps_taken % 50 == 0:
+                            print(f"[DEBUG] Optimizer steps taken so far: {self.optimizer_steps_taken}")
                         
                     except Exception as scaler_error:
+                        self.scaler_skipped_steps += 1
                         print(f"[ERROR] AMP scaler error at batch {batch_idx}: {scaler_error}")
+                        print(f"[DEBUG] Scaler skipped steps so far: {self.scaler_skipped_steps}")
                         # Reset optimizer and scaler state
                         self.optimizer.zero_grad()
                         # Recreate scaler to fix state issues
@@ -1629,6 +1680,10 @@ class DeepfakeTrainer:
                     elif self.config.gradient_clip > 0:
                         nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clip)
                     self.optimizer.step()
+                    # 🔧 OPTIMIZER TRACKING: Count successful steps (non-AMP path)
+                    self.optimizer_steps_taken += 1
+                    if self.optimizer_steps_taken % 50 == 0:
+                        print(f"[DEBUG] Optimizer steps taken so far: {self.optimizer_steps_taken}")
                 
                 # Update learning rate with warmup if enabled
                 if self.warmup_scheduler is not None and epoch < self.config.warmup_epochs:
