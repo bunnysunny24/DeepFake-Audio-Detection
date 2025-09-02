@@ -19,25 +19,18 @@ facenet-pytorch>=2.5.2
 pillow>=9.0.0
 dlib>=19.24.0  # Added for facial landmark detection
 
-# Scientific Computing
-scipy>=1.8.0
-
 # Data Handling
 numpy>=1.22.0
 pandas>=1.5.0
 matplotlib>=3.5.0
 seaborn>=0.12.0
 
-Pillow>=9.0.0  # For image handling
-
 # Utilities
 tqdm>=4.64.0
 pyyaml>=6.0.0
 wandb>=0.15.0
 python-dotenv>=1.0.0
-
-# Logging and miscellaneous
-absl-py>=1.4.0
+shutil  # Already in Python standard library
 
 # Optional for improved performance
 nvidia-ml-py>=11.525.84  # For GPU monitoring
@@ -55,17 +48,14 @@ grad-cam>=1.5.5         # Updated: Using grad-cam instead of pytorch-grad-cam
 # Note: torch.distributed is built into PyTorch; no separate package needed
 
 # CPU/GPU Optimization
-intel-openmp>=2024.2.1
-ninja>=1.0.0           # For faster custom CUDA op compilation
-
-# Typing (for type hints)
-typing-extensions>=4.0.0
+intel-openmp>=2025.1.1  # For improved CPU performance
+ninja>=1.10.0           # For faster custom CUDA op compilation
 
 # Path handling
-# Already in Python standard library
+pathlib  # Already in Python standard library
 
 # JSON handling
-# Already in Python standard library
+json  # Already in Python standard library
 
 # Try to install CUDA extensions if possible
 # cudatoolkit is not specified as it depends on your local CUDA version
