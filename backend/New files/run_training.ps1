@@ -1,11 +1,11 @@
-# DEFINITIVE FIX - FORCES BALANCED CLASS LEARNING
-# Solves the "always predict majority class" problem with aggressive balancing
+# STRATIFIED SAMPLING FIX - CONSISTENT TRAIN/VAL SPLITS
+# Ensures same class distribution in training and validation
 
-Write-Host "AGGRESSIVE CLASS BALANCE FIX" -ForegroundColor Red
-Write-Host "   PROBLEM: Model learned 'always predict FAKE' = 74% accuracy" -ForegroundColor Yellow
-Write-Host "   SOLUTION: Force 50/50 class importance with extreme weights" -ForegroundColor Green
-Write-Host "   METHOD: Undersample majority + oversample minority + heavy weights" -ForegroundColor Cyan
-Write-Host "   GOAL: Force model to learn BOTH classes equally" -ForegroundColor Magenta
+Write-Host "STRATIFIED SAMPLING FIX" -ForegroundColor Magenta
+Write-Host "   PROBLEM: Training learns, Validation always predicts Fake" -ForegroundColor Red
+Write-Host "   CAUSE: Different class distributions in train vs validation splits" -ForegroundColor Yellow
+Write-Host "   FIX: Force same class ratio in train/val + larger validation set" -ForegroundColor Green
+Write-Host "   RESULT: Consistent learning behavior across both sets" -ForegroundColor Cyan
 
 # Memory optimization
 $env:PYTORCH_CUDA_ALLOC_CONF = "expandable_segments:True,max_split_size_mb:64"
@@ -20,30 +20,32 @@ Set-Location "F:\deepfake\backup\Models"
 Write-Host "Activating Python 3.12 virtual environment..." -ForegroundColor Cyan
 .\deepfake-env-312\Scripts\Activate.ps1
 
-Write-Host "AGGRESSIVE BALANCE Configuration:" -ForegroundColor Red
-Write-Host "   Dataset: 73% fake, 27% real (severe imbalance)" -ForegroundColor Yellow
-Write-Host "   Strategy: Force 50/50 importance through sampling + weighting" -ForegroundColor Green
-Write-Host "   Learning Rate: 2e-4 (conservative for stability)" -ForegroundColor Yellow
-Write-Host "   Class Weights: FORCED BALANCED (not just calculated)" -ForegroundColor Yellow
-Write-Host "   Focal Loss: DISABLED (using pure weighted CrossEntropy)" -ForegroundColor Yellow
-Write-Host "   Expected: Model MUST predict both Real AND Fake" -ForegroundColor Magenta
+Write-Host "STRATIFIED CONFIGURATION:" -ForegroundColor Magenta
+Write-Host "   Validation Split: 0.2 (larger for stable statistics)" -ForegroundColor Yellow
+Write-Host "   Test Split: 0.1 (reasonable test set)" -ForegroundColor Yellow
+Write-Host "   Sampling: Stratified (same ratio in train/val)" -ForegroundColor Yellow
+Write-Host "   Learning Rate: 3e-4 (stable convergence)" -ForegroundColor Yellow
+Write-Host "   Batch Size: 8 (better gradient estimates)" -ForegroundColor Yellow
+Write-Host "   Loss: Pure weighted CrossEntropy (no focal complexity)" -ForegroundColor Yellow
 
 # Create output directories
-New-Item -ItemType Directory -Force -Path "F:\deepfake\backup\Models\aggressive_balance_outputs" | Out-Null
-New-Item -ItemType Directory -Force -Path "F:\deepfake\backup\Models\aggressive_balance_checkpoints" | Out-Null
+New-Item -ItemType Directory -Force -Path "F:\deepfake\backup\Models\stratified_outputs" | Out-Null
+New-Item -ItemType Directory -Force -Path "F:\deepfake\backup\Models\stratified_checkpoints" | Out-Null
 
-# AGGRESSIVE BALANCED training - NO focal loss, PURE class weights
+# STRATIFIED training - Consistent splits + stable parameters
 python train_multimodal.py `
   --json_path "F:\deepfake\backup\LAV-DF\metadata.json" `
   --data_dir "F:\deepfake\backup\LAV-DF" `
-  --output_dir "F:\deepfake\backup\Models\aggressive_balance_outputs" `
-  --checkpoint_dir "F:\deepfake\backup\Models\aggressive_balance_checkpoints" `
-  --max_samples 1200 `
+  --output_dir "F:\deepfake\backup\Models\stratified_outputs" `
+  --checkpoint_dir "F:\deepfake\backup\Models\stratified_checkpoints" `
+  --max_samples 2000 `
   --batch_size 8 `
+  --validation_split 0.2 `
+  --test_split 0.1 `
   --num_epochs 20 `
-  --learning_rate 2e-4 `
-  --weight_decay 5e-5 `
-  --dropout_rate 0.05 `
+  --learning_rate 3e-4 `
+  --weight_decay 1e-4 `
+  --dropout_rate 0.15 `
   --enable_face_mesh `
   --detect_deepfake_type `
   --detect_faces `
@@ -54,12 +56,12 @@ python train_multimodal.py `
   --enable_skin_color_analysis `
   --physiological_fps 12 `
   --optimizer adamw `
-  --scheduler plateau `
-  --scheduler_patience 3 `
+  --scheduler cosine `
+  --scheduler_patience 4 `
   --warmup_epochs 2 `
-  --early_stopping_patience 6 `
-  --gradient_clip 0.5 `
-  --label_smoothing 0.0 `
+  --early_stopping_patience 7 `
+  --gradient_clip 1.0 `
+  --label_smoothing 0.05 `
   --amp_enabled `
   --reduce_frames 3 `
   --num_workers 8 `
@@ -71,13 +73,14 @@ python train_multimodal.py `
   --class_weights_mode balanced `
   --use_wandb `
   --save_intermediate `
-  --save_intermediate_interval 25 `
-  --wandb_project "deepfake-detection-aggressive-balance" `
-  --wandb_run_name "pure_weighted_crossentropy"
+  --save_intermediate_interval 30 `
+  --wandb_project "deepfake-detection-stratified" `
+  --wandb_run_name "consistent_train_val_splits"
 
-Write-Host "AGGRESSIVE training completed!" -ForegroundColor Red
-Write-Host "CHECK RESULTS:" -ForegroundColor Magenta
-Write-Host "  1. Confusion matrix should show predictions in BOTH columns" -ForegroundColor Yellow
-Write-Host "  2. Training accuracy should VARY between epochs (not constant)" -ForegroundColor Yellow
-Write-Host "  3. Model should predict some Real samples (not all Fake)" -ForegroundColor Yellow
-Write-Host "  4. AUC should be > 0.6 (better than random)" -ForegroundColor Yellow
+Write-Host "STRATIFIED training completed!" -ForegroundColor Magenta
+Write-Host "EXPECTED CONSISTENT RESULTS:" -ForegroundColor Green
+Write-Host "  Training: Balanced predictions with steady improvement" -ForegroundColor Yellow
+Write-Host "  Validation: SAME pattern as training (not constant predictions)" -ForegroundColor Yellow
+Write-Host "  Both confusion matrices: Should have values in all 4 cells" -ForegroundColor Yellow
+Write-Host "  AUC progression: Should improve consistently on both sets" -ForegroundColor Yellow
+Write-Host "  Best models: Will save when both train/val improve together" -ForegroundColor Yellow
