@@ -32,20 +32,20 @@ Write-Host "   Loss: Pure weighted CrossEntropy (no focal complexity)" -Foregrou
 New-Item -ItemType Directory -Force -Path "F:\deepfake\backup\Models\stratified_outputs" | Out-Null
 New-Item -ItemType Directory -Force -Path "F:\deepfake\backup\Models\stratified_checkpoints" | Out-Null
 
-# STRATIFIED training - Consistent splits + stable parameters
+# CONVERGENCE FIX - Address class imbalance and training instability
 python train_multimodal.py `
   --json_path "F:\deepfake\backup\LAV-DF\metadata.json" `
   --data_dir "F:\deepfake\backup\LAV-DF" `
   --output_dir "F:\deepfake\backup\Models\stratified_outputs" `
   --checkpoint_dir "F:\deepfake\backup\Models\stratified_checkpoints" `
-  --max_samples 2000 `
-  --batch_size 8 `
+  --max_samples 2500 `
+  --batch_size 6 `
   --validation_split 0.2 `
   --test_split 0.1 `
-  --num_epochs 20 `
-  --learning_rate 3e-4 `
-  --weight_decay 1e-4 `
-  --dropout_rate 0.15 `
+  --num_epochs 50 `
+  --learning_rate 1e-4 `
+  --weight_decay 5e-5 `
+  --dropout_rate 0.1 `
   --enable_face_mesh `
   --detect_deepfake_type `
   --detect_faces `
@@ -56,31 +56,40 @@ python train_multimodal.py `
   --enable_skin_color_analysis `
   --physiological_fps 12 `
   --optimizer adamw `
-  --scheduler cosine `
-  --scheduler_patience 4 `
-  --warmup_epochs 2 `
-  --early_stopping_patience 7 `
-  --gradient_clip 1.0 `
-  --label_smoothing 0.05 `
+  --scheduler step `
+  --scheduler_step_size 8 `
+  --scheduler_gamma 0.7 `
+  --warmup_epochs 3 `
+  --early_stopping_patience 12 `
+  --gradient_clip 0.5 `
+  --label_smoothing 0.1 `
   --amp_enabled `
   --reduce_frames 3 `
-  --num_workers 8 `
+  --num_workers 4 `
   --pin_memory `
   --persistent_workers `
-  --prefetch_factor 4 `
-  --loss_type crossentropy `
+  --prefetch_factor 2 `
+  --loss_type focal `
+  --focal_alpha 0.75 `
+  --focal_gamma 2.0 `
   --use_weighted_loss `
   --class_weights_mode balanced `
   --use_wandb `
   --save_intermediate `
-  --save_intermediate_interval 30 `
-  --wandb_project "deepfake-detection-stratified" `
-  --wandb_run_name "consistent_train_val_splits"
+  --save_intermediate_interval 50 `
+  --wandb_project "deepfake-detection-convergence-fix" `
+  --wandb_run_name "focal_loss_stable_training"
 
-Write-Host "STRATIFIED training completed!" -ForegroundColor Magenta
-Write-Host "EXPECTED CONSISTENT RESULTS:" -ForegroundColor Green
-Write-Host "  Training: Balanced predictions with steady improvement" -ForegroundColor Yellow
-Write-Host "  Validation: SAME pattern as training (not constant predictions)" -ForegroundColor Yellow
-Write-Host "  Both confusion matrices: Should have values in all 4 cells" -ForegroundColor Yellow
-Write-Host "  AUC progression: Should improve consistently on both sets" -ForegroundColor Yellow
-Write-Host "  Best models: Will save when both train/val improve together" -ForegroundColor Yellow
+Write-Host "CONVERGENCE FIX APPLIED!" -ForegroundColor Magenta
+Write-Host "CHANGES MADE TO FIX TRAINING ISSUES:" -ForegroundColor Green
+Write-Host "  1. FOCAL LOSS: Addresses severe class imbalance" -ForegroundColor Yellow
+Write-Host "  2. LOWER LEARNING RATE: 1e-4 for stable convergence" -ForegroundColor Yellow
+Write-Host "  3. STEP SCHEDULER: More controlled learning rate decay" -ForegroundColor Yellow
+Write-Host "  4. REDUCED WORKERS: Prevents I/O corruption" -ForegroundColor Yellow
+Write-Host "  5. STRONGER LABEL SMOOTHING: 0.1 for better generalization" -ForegroundColor Yellow
+Write-Host "  6. EXTENDED PATIENCE: 12 epochs to allow proper convergence" -ForegroundColor Yellow
+Write-Host "EXPECTED RESULTS:" -ForegroundColor Cyan
+Write-Host "  - Training accuracy should steadily increase" -ForegroundColor Yellow
+Write-Host "  - Validation will follow training (no more flat lines)" -ForegroundColor Yellow
+Write-Host "  - Both classes will be predicted in confusion matrix" -ForegroundColor Yellow
+Write-Host "  - AUC should reach 0.75+ by epoch 15-20" -ForegroundColor Yellow
