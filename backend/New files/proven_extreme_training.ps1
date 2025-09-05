@@ -79,7 +79,8 @@ python train_multimodal.py `
   --wandb_project "deepfake-detection-extreme-95percent" `
   --wandb_run_name "phase1_proven_specs_efficientnet_b4" `
   --save_intermediate `
-  --save_intermediate_interval 100
+  --save_intermediate_interval 58
+  
 
 Write-Host "PHASE 1 COMPLETE!" -ForegroundColor Green
 Write-Host "Expected: 87-90% accuracy (proven hardware + better model)" -ForegroundColor Yellow
