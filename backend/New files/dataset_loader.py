@@ -1597,20 +1597,89 @@ def get_data_loaders(
             np.random.seed(42)
             np.random.shuffle(indices)
     
-    # Calculate split sizes
-    val_count = int(np.floor(validation_split * num_samples))
-    test_count = int(np.floor(test_split * num_samples))
-    train_count = num_samples - val_count - test_count
+    # 🎯 STRATIFIED SPLITTING: Ensure same class distribution in train/val/test
+    # Get labels for all samples to perform stratified split
+    print("🎯 Performing stratified split to ensure balanced class distribution...")
     
-    # Split indices
-    train_indices = indices[:train_count]
-    val_indices = indices[train_count:train_count+val_count]
-    test_indices = indices[train_count+val_count:]
+    labels = []
+    for idx in indices:
+        sample = train_dataset.data[idx]
+        # Extract label from n_fakes: 0 = real, >0 = fake
+        label = 1 if sample['n_fakes'] > 0 else 0
+        labels.append(label)
+    
+    labels = np.array(labels)
+    
+    # Get unique classes and their counts
+    unique_classes, class_counts = np.unique(labels, return_counts=True)
+    print(f"📊 Overall class distribution: {dict(zip(unique_classes, class_counts))}")
+    
+    # Perform stratified split for each class
+    train_indices = []
+    val_indices = []
+    test_indices = []
+    
+    for class_label in unique_classes:
+        # Get indices for this class
+        class_indices = np.array(indices)[labels == class_label]
+        class_size = len(class_indices)
+        
+        # Calculate splits for this class
+        val_class_count = int(np.floor(validation_split * class_size))
+        test_class_count = int(np.floor(test_split * class_size))
+        train_class_count = class_size - val_class_count - test_class_count
+        
+        # Shuffle class indices
+        np.random.seed(42 + int(class_label))  # Different seed per class for diversity
+        np.random.shuffle(class_indices)
+        
+        # Split this class
+        train_indices.extend(class_indices[:train_class_count])
+        val_indices.extend(class_indices[train_class_count:train_class_count+val_class_count])
+        test_indices.extend(class_indices[train_class_count+val_class_count:])
+        
+        print(f"   Class {class_label}: {train_class_count} train, {val_class_count} val, {test_class_count} test")
+    
+    # Shuffle the final indices to mix classes
+    np.random.seed(42)
+    np.random.shuffle(train_indices)
+    np.random.shuffle(val_indices)
+    np.random.shuffle(test_indices)
+    
+    print(f"✅ Stratified split completed: {len(train_indices)} train, {len(val_indices)} val, {len(test_indices)} test")
 
     # Create samplers
     train_sampler = SubsetRandomSampler(train_indices)
     val_sampler = SubsetRandomSampler(val_indices)
     test_sampler = SubsetRandomSampler(test_indices)
+    
+    # 🔍 VERIFY STRATIFIED SPLIT: Check class distributions
+    def verify_split_distribution(indices, split_name):
+        split_labels = []
+        for idx in indices:
+            sample = train_dataset.data[idx]
+            # Extract label from n_fakes: 0 = real, >0 = fake
+            label = 1 if sample['n_fakes'] > 0 else 0
+            split_labels.append(label)
+        
+        unique, counts = np.unique(split_labels, return_counts=True)
+        percentages = counts / len(split_labels) * 100
+        print(f"   {split_name}: {dict(zip(unique, [f'{count} ({pct:.1f}%)' for count, pct in zip(counts, percentages)]))}")
+        return dict(zip(unique, percentages))
+    
+    print("🔍 Verifying stratified split distributions:")
+    train_dist = verify_split_distribution(train_indices, "Training")
+    val_dist = verify_split_distribution(val_indices, "Validation") 
+    test_dist = verify_split_distribution(test_indices, "Test")
+    
+    # Check if distributions are similar (within 5% tolerance)
+    for class_label in unique_classes:
+        train_pct = train_dist.get(class_label, 0)
+        val_pct = val_dist.get(class_label, 0)
+        if abs(train_pct - val_pct) > 5:
+            print(f"⚠️  Warning: Class {class_label} distribution differs significantly between train ({train_pct:.1f}%) and val ({val_pct:.1f}%)")
+        else:
+            print(f"✅ Class {class_label} distribution is consistent: train ({train_pct:.1f}%) vs val ({val_pct:.1f}%)")
     
     # Get class weights for weighted sampling
     class_weights = train_dataset.class_weights
