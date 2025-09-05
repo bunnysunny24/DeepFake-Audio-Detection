@@ -22,10 +22,10 @@ Set-Location "F:\deepfake\backup\Models"
 New-Item -ItemType Directory -Force -Path "F:\deepfake\backup\Models\extreme_outputs" | Out-Null
 New-Item -ItemType Directory -Force -Path "F:\deepfake\backup\Models\extreme_checkpoints" | Out-Null
 
-Write-Host "USING YOUR PROVEN WORKING CONFIGURATION:" -ForegroundColor Green
-Write-Host "  Batch Size: 3 (conservative from your working batch 6)" -ForegroundColor Yellow
-Write-Host "  Workers: 4 (exactly what works on your system)" -ForegroundColor Yellow
-Write-Host "  Image Size: 352px (upgrade from your 224px)" -ForegroundColor Yellow
+Write-Host "USING YOUR OPTIMIZED CONFIGURATION:" -ForegroundColor Green
+Write-Host "  Batch Size: 12 (optimized for speed + accuracy)" -ForegroundColor Yellow
+Write-Host "  Workers: 8 (better CPU utilization)" -ForegroundColor Yellow
+Write-Host "  Image Size: 256px (optimal balance)" -ForegroundColor Yellow
 Write-Host "  EfficientNet-B4 (1792 features, larger model for better accuracy)" -ForegroundColor Yellow
 Write-Host "  Threads: 14 (your proven working config)" -ForegroundColor Yellow
 
@@ -155,18 +155,18 @@ Write-Host "  Phase 1 (Single Model): 87-90% accuracy" -ForegroundColor Yellow
 Write-Host "  Phase 2 (Ensemble): 92-95% accuracy" -ForegroundColor Yellow  
 Write-Host "  With TTA: 95-97% accuracy" -ForegroundColor Yellow
 Write-Host "" -ForegroundColor White
-Write-Host "PROVEN OPTIMIZATIONS APPLIED:" -ForegroundColor Magenta
-Write-Host "  Batch size 3: Safe for your RTX 4060" -ForegroundColor Cyan
-Write-Host "  Workers 4: Your proven working config" -ForegroundColor Cyan
+Write-Host "OPTIMIZATIONS APPLIED:" -ForegroundColor Magenta
+Write-Host "  Batch size 12: Optimized GPU utilization" -ForegroundColor Cyan
+Write-Host "  Workers 8: Better data loading" -ForegroundColor Cyan
 Write-Host "  14 threads: Your exact CPU config" -ForegroundColor Cyan
 Write-Host "  64MB segments: Your working memory config" -ForegroundColor Cyan
-Write-Host "  Higher resolution: 352px vs 224px" -ForegroundColor Cyan
+Write-Host "  Resolution: 256px (optimal balance)" -ForegroundColor Cyan
 Write-Host "  Better model: EfficientNet-B4" -ForegroundColor Cyan
 Write-Host "" -ForegroundColor White
 Write-Host "ESTIMATED TRAINING TIME:" -ForegroundColor Yellow
-Write-Host "  Phase 1: 8-10 hours" -ForegroundColor Cyan
-Write-Host "  Phase 2: 20-24 hours" -ForegroundColor Cyan
-Write-Host "  Total: ~1.5 days" -ForegroundColor Cyan
+Write-Host "  Phase 1: ~20 hours" -ForegroundColor Cyan
+Write-Host "  Phase 2: ~44 hours" -ForegroundColor Cyan
+Write-Host "  Total: ~2.7 days" -ForegroundColor Cyan
 Write-Host "" -ForegroundColor White
 Write-Host "THIS CONFIGURATION WILL WORK ON YOUR SYSTEM!" -ForegroundColor Green
 Write-Host "Based on your proven successful training run" -ForegroundColor Green
