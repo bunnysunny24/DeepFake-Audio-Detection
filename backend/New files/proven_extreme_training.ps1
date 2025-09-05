@@ -37,11 +37,11 @@ python train_multimodal.py `
   --output_dir "F:\deepfake\backup\Models\extreme_outputs" `
   --checkpoint_dir "F:\deepfake\backup\Models\extreme_checkpoints" `
   --max_samples 5000 `
-  --batch_size 9 `
-  --image_size 288 `
+  --batch_size 10 `
+  --image_size 256 `
   --validation_split 0.2 `
   --test_split 0.1 `
-  --num_epochs 25 `
+  --num_epochs 20 `
   --learning_rate 2e-6 `
   --weight_decay 5e-6 `
   --dropout_rate 0.05 `
@@ -65,8 +65,8 @@ python train_multimodal.py `
   --mixup_alpha 0.6 `
   --cutmix_alpha 0.4 `
   --amp_enabled `
-  --reduce_frames 4 `
-  --num_workers 7 `
+  --reduce_frames 6 `
+  --num_workers 5 `
   --pin_memory `
   --persistent_workers `
   --prefetch_factor 3 `
@@ -95,14 +95,14 @@ python train_multimodal.py `
   --output_dir "F:\deepfake\backup\Models\extreme_outputs\ensemble_model1" `
   --checkpoint_dir "F:\deepfake\backup\Models\extreme_checkpoints\ensemble_model1" `
   --max_samples 5000 `
-  --batch_size 9 `
-  --image_size 288 `
+  --batch_size 10 `
+  --image_size 256 `
   --backbone_visual efficientnet_b4 `
-  --num_epochs 20 `
+  --num_epochs 15 `
   --learning_rate 1.5e-6 `
   --dropout_rate 0.08 `
   --mixup_alpha 0.7 `
-  --num_workers 7 `
+  --num_workers 5 `
   --prefetch_factor 3 `
   --wandb_run_name "ensemble_model1_efficientnet_b4_proven_specs"
 
@@ -114,14 +114,14 @@ python train_multimodal.py `
   --output_dir "F:\deepfake\backup\Models\extreme_outputs\ensemble_model2" `
   --checkpoint_dir "F:\deepfake\backup\Models\extreme_checkpoints\ensemble_model2" `
   --max_samples 5000 `
-  --batch_size 9 `
-  --image_size 288 `
+  --batch_size 10 `
+  --image_size 256 `
   --backbone_visual efficientnet_b3 `
-  --num_epochs 20 `
+  --num_epochs 15 `
   --learning_rate 3e-6 `
   --dropout_rate 0.10 `
   --label_smoothing 0.05 `
-  --num_workers 7 `
+  --num_workers 5 `
   --prefetch_factor 3 `
   --wandb_run_name "ensemble_model2_efficientnet_b3_proven_specs"
 
@@ -133,14 +133,14 @@ python train_multimodal.py `
   --output_dir "F:\deepfake\backup\Models\extreme_outputs\ensemble_model3" `
   --checkpoint_dir "F:\deepfake\backup\Models\extreme_checkpoints\ensemble_model3" `
   --max_samples 5000 `
-  --batch_size 9 `
-  --image_size 288 `
+  --batch_size 10 `
+  --image_size 256 `
   --backbone_visual regnet `
-  --num_epochs 20 `
+  --num_epochs 15 `
   --learning_rate 2e-6 `
   --dropout_rate 0.12 `
   --cutmix_alpha 0.5 `
-  --num_workers 7 `
+  --num_workers 5 `
   --prefetch_factor 3 `
   --wandb_run_name "ensemble_model3_regnet_proven_specs"
 
