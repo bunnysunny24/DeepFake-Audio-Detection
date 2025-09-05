@@ -5,7 +5,7 @@
 Write-Host "RTX 4060 EXTREME TRAINING - PROVEN WORKING SPECS" -ForegroundColor Red
 Write-Host "Based on your successful training configuration" -ForegroundColor Green
 Write-Host "Target: 79.56% -> 95%+ accuracy" -ForegroundColor Yellow
-Write-Host "Dataset: 5000 samples, Higher resolution, Better model" -ForegroundColor Cyan
+Write-Host "Dataset: 4000 samples, 256px resolution, EfficientNet-B4 model" -ForegroundColor Cyan
 
 # Use YOUR proven working memory settings
 $env:PYTORCH_CUDA_ALLOC_CONF = "expandable_segments:True,max_split_size_mb:64"
@@ -79,8 +79,8 @@ python train_multimodal.py `
   --wandb_project "deepfake-detection-extreme-95percent" `
   --wandb_run_name "phase1_proven_specs_efficientnet_b4" `
   --save_intermediate `
-  --save_intermediate_interval 58
-  
+  --save_intermediate_interval 50
+
 
 Write-Host "PHASE 1 COMPLETE!" -ForegroundColor Green
 Write-Host "Expected: 87-90% accuracy (proven hardware + better model)" -ForegroundColor Yellow
@@ -98,15 +98,47 @@ python train_multimodal.py `
   --max_samples 4000 `
   --batch_size 12 `
   --image_size 256 `
+  --validation_split 0.2 `
+  --test_split 0.1 `
   --backbone_visual efficientnet_b4 `
+  --enable_face_mesh `
+  --detect_deepfake_type `
+  --detect_faces `
+  --compute_spectrograms `
+  --temporal_features `
+  --enhanced_preprocessing `
+  --enhanced_augmentation `
+  --enable_advanced_physiological `
+  --enable_skin_color_analysis `
+  --physiological_fps 8 `
   --num_epochs 20 `
   --learning_rate 1.5e-6 `
+  --weight_decay 5e-6 `
   --dropout_rate 0.08 `
+  --optimizer adamw `
+  --scheduler cosine `
+  --warmup_epochs 2 `
+  --early_stopping_patience 3 `
+  --gradient_clip 0.3 `
+  --label_smoothing 0.02 `
   --mixup_alpha 0.7 `
+  --cutmix_alpha 0.4 `
+  --amp_enabled `
   --reduce_frames 3 `
   --num_workers 8 `
+  --pin_memory `
+  --persistent_workers `
   --prefetch_factor 3 `
-  --wandb_run_name "ensemble_model1_efficientnet_b4_proven_specs"
+  --loss_type focal `
+  --focal_alpha 0.8 `
+  --focal_gamma 1.5 `
+  --use_weighted_loss `
+  --class_weights_mode balanced `
+  --use_wandb `
+  --wandb_project "deepfake-detection-extreme-95percent" `
+  --wandb_run_name "ensemble_model1_efficientnet_b4_proven_specs" `
+  --save_intermediate `
+  --save_intermediate_interval 50
 
 # Model 2: EfficientNet-B3 (Faster variant)
 Write-Host "Training Ensemble Model 2: EfficientNet-B3" -ForegroundColor Yellow
@@ -118,15 +150,47 @@ python train_multimodal.py `
   --max_samples 4000 `
   --batch_size 12 `
   --image_size 256 `
+  --validation_split 0.2 `
+  --test_split 0.1 `
   --backbone_visual efficientnet_b3 `
+  --enable_face_mesh `
+  --detect_deepfake_type `
+  --detect_faces `
+  --compute_spectrograms `
+  --temporal_features `
+  --enhanced_preprocessing `
+  --enhanced_augmentation `
+  --enable_advanced_physiological `
+  --enable_skin_color_analysis `
+  --physiological_fps 8 `
   --num_epochs 20 `
   --learning_rate 3e-6 `
+  --weight_decay 5e-6 `
   --dropout_rate 0.10 `
+  --optimizer adamw `
+  --scheduler cosine `
+  --warmup_epochs 2 `
+  --early_stopping_patience 3 `
+  --gradient_clip 0.3 `
   --label_smoothing 0.05 `
+  --mixup_alpha 0.6 `
+  --cutmix_alpha 0.4 `
+  --amp_enabled `
   --reduce_frames 3 `
   --num_workers 8 `
+  --pin_memory `
+  --persistent_workers `
   --prefetch_factor 3 `
-  --wandb_run_name "ensemble_model2_efficientnet_b3_proven_specs"
+  --loss_type focal `
+  --focal_alpha 0.8 `
+  --focal_gamma 1.5 `
+  --use_weighted_loss `
+  --class_weights_mode balanced `
+  --use_wandb `
+  --wandb_project "deepfake-detection-extreme-95percent" `
+  --wandb_run_name "ensemble_model2_efficientnet_b3_proven_specs" `
+  --save_intermediate `
+  --save_intermediate_interval 50
 
 # Model 3: RegNet (Different architecture family)
 Write-Host "Training Ensemble Model 3: RegNet" -ForegroundColor Yellow
@@ -138,17 +202,63 @@ python train_multimodal.py `
   --max_samples 4000 `
   --batch_size 12 `
   --image_size 256 `
+  --validation_split 0.2 `
+  --test_split 0.1 `
   --backbone_visual regnet `
+  --enable_face_mesh `
+  --detect_deepfake_type `
+  --detect_faces `
+  --compute_spectrograms `
+  --temporal_features `
+  --enhanced_preprocessing `
+  --enhanced_augmentation `
+  --enable_advanced_physiological `
+  --enable_skin_color_analysis `
+  --physiological_fps 8 `
   --num_epochs 20 `
   --learning_rate 2e-6 `
+  --weight_decay 5e-6 `
   --dropout_rate 0.12 `
+  --optimizer adamw `
+  --scheduler cosine `
+  --warmup_epochs 2 `
+  --early_stopping_patience 3 `
+  --gradient_clip 0.3 `
+  --label_smoothing 0.02 `
+  --mixup_alpha 0.6 `
   --cutmix_alpha 0.5 `
+  --amp_enabled `
   --reduce_frames 3 `
   --num_workers 8 `
+  --pin_memory `
+  --persistent_workers `
   --prefetch_factor 3 `
-  --wandb_run_name "ensemble_model3_regnet_proven_specs"
+  --loss_type focal `
+  --focal_alpha 0.8 `
+  --focal_gamma 1.5 `
+  --use_weighted_loss `
+  --class_weights_mode balanced `
+  --use_wandb `
+  --wandb_project "deepfake-detection-extreme-95percent" `
+  --wandb_run_name "ensemble_model3_regnet_proven_specs" `
+  --save_intermediate `
+  --save_intermediate_interval 50
 
 Write-Host "ENSEMBLE TRAINING COMPLETE!" -ForegroundColor Green
+
+Write-Host "" -ForegroundColor White
+Write-Host "TESTING ENSEMBLE PREDICTION ON SAMPLE VIDEOS..." -ForegroundColor Magenta
+
+# Test ensemble prediction on a few sample videos
+Write-Host "Running ensemble prediction test..." -ForegroundColor Yellow
+python batch_ensemble_predict.py `
+  --input_dir "F:\deepfake\backup\LAV-DF\test" `
+  --models_dir "F:\deepfake\backup\Models\extreme_outputs" `
+  --output "F:\deepfake\backup\Models\extreme_outputs\ensemble_test_results.csv" `
+  --threshold 0.5
+
+Write-Host "Ensemble prediction test complete!" -ForegroundColor Green
+Write-Host "Check ensemble_test_results.csv for results" -ForegroundColor Cyan
 
 Write-Host "FINAL RESULTS WITH YOUR PROVEN HARDWARE:" -ForegroundColor Red
 Write-Host "EXPECTED PERFORMANCE:" -ForegroundColor Green
