@@ -20,13 +20,12 @@ Set-Location "F:\deepfake\backup\Models"
 Write-Host "Activating Python 3.12 virtual environment..." -ForegroundColor Cyan
 .\deepfake-env-312\Scripts\Activate.ps1
 
-Write-Host "STRATIFIED CONFIGURATION:" -ForegroundColor Magenta
-Write-Host "   Validation Split: 0.2 (larger for stable statistics)" -ForegroundColor Yellow
-Write-Host "   Test Split: 0.1 (reasonable test set)" -ForegroundColor Yellow
-Write-Host "   Sampling: Stratified (same ratio in train/val)" -ForegroundColor Yellow
-Write-Host "   Learning Rate: 3e-4 (stable convergence)" -ForegroundColor Yellow
-Write-Host "   Batch Size: 8 (better gradient estimates)" -ForegroundColor Yellow
-Write-Host "   Loss: Pure weighted CrossEntropy (no focal complexity)" -ForegroundColor Yellow
+Write-Host "STABILITY CONFIGURATION:" -ForegroundColor Magenta
+Write-Host "   Learning Rate: 5e-5 (reduced for stability)" -ForegroundColor Yellow
+Write-Host "   Dropout: 0.2 (increased regularization)" -ForegroundColor Yellow
+Write-Host "   LR Schedule: 50% reduction every 3 epochs" -ForegroundColor Yellow
+Write-Host "   Early Stopping: 5 epochs (prevents collapse)" -ForegroundColor Yellow
+Write-Host "   Loss: Focal Loss (class imbalance solution)" -ForegroundColor Yellow
 
 # Create output directories
 New-Item -ItemType Directory -Force -Path "F:\deepfake\backup\Models\stratified_outputs" | Out-Null
@@ -43,9 +42,9 @@ python train_multimodal.py `
   --validation_split 0.2 `
   --test_split 0.1 `
   --num_epochs 50 `
-  --learning_rate 1e-4 `
-  --weight_decay 5e-5 `
-  --dropout_rate 0.1 `
+  --learning_rate 5e-5 `
+  --weight_decay 1e-4 `
+  --dropout_rate 0.2 `
   --enable_face_mesh `
   --detect_deepfake_type `
   --detect_faces `
@@ -57,10 +56,10 @@ python train_multimodal.py `
   --physiological_fps 12 `
   --optimizer adamw `
   --scheduler step `
-  --scheduler_step_size 8 `
-  --scheduler_gamma 0.7 `
+  --scheduler_step_size 3 `
+  --scheduler_gamma 0.5 `
   --warmup_epochs 3 `
-  --early_stopping_patience 12 `
+  --early_stopping_patience 5 `
   --gradient_clip 0.5 `
   --label_smoothing 0.1 `
   --amp_enabled `
@@ -80,16 +79,15 @@ python train_multimodal.py `
   --wandb_project "deepfake-detection-convergence-fix" `
   --wandb_run_name "focal_loss_stable_training"
 
-Write-Host "CONVERGENCE FIX APPLIED!" -ForegroundColor Magenta
-Write-Host "CHANGES MADE TO FIX TRAINING ISSUES:" -ForegroundColor Green
-Write-Host "  1. FOCAL LOSS: Addresses severe class imbalance" -ForegroundColor Yellow
-Write-Host "  2. LOWER LEARNING RATE: 1e-4 for stable convergence" -ForegroundColor Yellow
-Write-Host "  3. STEP SCHEDULER: More controlled learning rate decay" -ForegroundColor Yellow
-Write-Host "  4. REDUCED WORKERS: Prevents I/O corruption" -ForegroundColor Yellow
-Write-Host "  5. STRONGER LABEL SMOOTHING: 0.1 for better generalization" -ForegroundColor Yellow
-Write-Host "  6. EXTENDED PATIENCE: 12 epochs to allow proper convergence" -ForegroundColor Yellow
+Write-Host "STABILITY FIX APPLIED!" -ForegroundColor Magenta
+Write-Host "CHANGES MADE TO PREVENT EPOCH 7 COLLAPSE:" -ForegroundColor Green
+Write-Host "  1. LOWER LEARNING RATE: 5e-5 (was 1e-4) - prevents overshooting" -ForegroundColor Yellow
+Write-Host "  2. STRONGER REGULARIZATION: dropout=0.2, weight_decay=1e-4" -ForegroundColor Yellow
+Write-Host "  3. AGGRESSIVE LR SCHEDULE: 50% reduction every 3 epochs" -ForegroundColor Yellow
+Write-Host "  4. EARLY STOPPING: 5 epochs (prevents training collapse)" -ForegroundColor Yellow
+Write-Host "  5. FOCAL LOSS: Still addresses class imbalance" -ForegroundColor Yellow
 Write-Host "EXPECTED RESULTS:" -ForegroundColor Cyan
-Write-Host "  - Training accuracy should steadily increase" -ForegroundColor Yellow
-Write-Host "  - Validation will follow training (no more flat lines)" -ForegroundColor Yellow
-Write-Host "  - Both classes will be predicted in confusion matrix" -ForegroundColor Yellow
-Write-Host "  - AUC should reach 0.75+ by epoch 15-20" -ForegroundColor Yellow
+Write-Host "  - Stable training through all epochs (no collapse)" -ForegroundColor Yellow
+Write-Host "  - Sustained 80%+ F1 scores after epoch 3" -ForegroundColor Yellow
+Write-Host "  - Best model saved around epoch 5-8" -ForegroundColor Yellow
+Write-Host "  - Final performance: 85-90% F1 score" -ForegroundColor Yellow
