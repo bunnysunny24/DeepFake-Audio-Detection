@@ -1784,7 +1784,20 @@ class DeepfakeTrainer:
     
     def validate_epoch(self, epoch):
         """Validate the model for one epoch."""
-        self.model.eval()
+        print(f"\n🔍 [DEBUG] Starting validation epoch {epoch+1}")
+        print(f"🔍 [DEBUG] Model is in eval mode: {not self.model.training}")
+        
+        # RADICAL FIX: Keep model in training mode during validation to force BatchNorm to use batch stats
+        # This should eliminate the split personality issue caused by running averages
+        print(f"🔍 [DEBUG] FORCING MODEL TO STAY IN TRAINING MODE DURING VALIDATION")
+        self.model.train()  # Keep in training mode!
+        
+        # ADDITIONAL FIX: Force dropout layers to eval mode to prevent randomness during validation
+        print(f"🔍 [DEBUG] SETTING DROPOUT LAYERS TO EVAL MODE FOR CONSISTENT VALIDATION")
+        for module in self.model.modules():
+            if isinstance(module, torch.nn.Dropout):
+                module.eval()  # Disable dropout during validation
+        
         epoch_loss = 0
         y_true, y_pred, y_probs = [], [], []
         
@@ -1793,7 +1806,7 @@ class DeepfakeTrainer:
         # Track component contributions to analyze feature importance
         all_component_contributions = {}
         
-        with torch.no_grad():
+        with torch.no_grad():  # Still disable gradients to prevent weight updates
             for batch_idx, batch in enumerate(val_progress):
                 try:
                     # Clear GPU cache periodically during validation
@@ -1806,7 +1819,9 @@ class DeepfakeTrainer:
                     # Get labels
                     labels = batch['label']
                     
-                    # Forward pass
+                    # Forward pass - MODEL STAYS IN TRAINING MODE, DROPOUT IN EVAL MODE
+                    print(f"[DEBUG] Batch {batch_idx}: Model training mode: {self.model.training}")
+                    
                     if self.amp_enabled:
                         with autocast():
                             outputs, results = self.model(batch)
@@ -1823,9 +1838,24 @@ class DeepfakeTrainer:
                     
                     # Accumulate predictions and labels for metrics calculation
                     y_true.extend(labels.cpu().numpy())
+                    
+                    # DEBUG: Check for validation prediction issues
+                    if batch_idx == 0:  # First batch debugging
+                        print(f"\n[DEBUG] Validation Batch 0 Analysis:")
+                        print(f"  Raw outputs shape: {outputs.shape}")
+                        print(f"  Raw outputs sample: {outputs[0].detach().cpu().numpy()}")
+                        print(f"  Softmax probs sample: {torch.softmax(outputs, dim=1)[0].detach().cpu().numpy()}")
+                        print(f"  Labels sample: {labels[0].cpu().numpy()}")
+                    
                     predictions = outputs.argmax(1).cpu().numpy()
                     y_pred.extend(predictions)
                     y_probs.extend(torch.softmax(outputs, dim=1)[:, 1].detach().cpu().numpy())
+                    
+                    # DEBUG: Check prediction distribution in first batch
+                    if batch_idx == 0:
+                        unique_preds, counts = np.unique(predictions, return_counts=True)
+                        print(f"  Predictions in batch 0: {dict(zip(unique_preds, counts))}")
+                        print(f"  Probability range: [{np.min(torch.softmax(outputs, dim=1)[:, 1].detach().cpu().numpy()):.4f}, {np.max(torch.softmax(outputs, dim=1)[:, 1].detach().cpu().numpy()):.4f}]")
                     
                     # Visualize sample predictions periodically
                     if (batch_idx + 1) % self.config.visualization_interval == 0:
@@ -1883,9 +1913,13 @@ class DeepfakeTrainer:
         # Plot confusion matrix
         cm_path = plot_confusion_matrix(y_true, y_pred, epoch+1, self.plot_dir)
         
-        # Log confusion matrix to WandB
-        if self.config.use_wandb:
-            wandb.log({f"confusion_matrix_epoch_{epoch+1}": wandb.Image(cm_path)})
+        # Log confusion matrix to WandB (with error handling)
+        if self.config.use_wandb and cm_path is not None:
+            try:
+                wandb.log({f"confusion_matrix_epoch_{epoch+1}": wandb.Image(cm_path)})
+            except Exception as e:
+                if self.debug:
+                    print(f"[WARNING] Failed to log confusion matrix to wandb: {e}")
             
         # Log component importance for feature analysis to WandB
         if self.config.use_wandb and all_component_contributions:
@@ -1918,6 +1952,10 @@ class DeepfakeTrainer:
                 plt.close()
                 
                 wandb.log({f"feature_importance_epoch_{epoch+1}": wandb.Image(feature_importance_path)})
+        
+        # IMPORTANT: Set model back to eval mode after validation
+        self.model.eval()
+        print(f"🔍 [DEBUG] Validation complete - model set back to eval mode: {not self.model.training}")
         
         # Return metrics
         return avg_loss, accuracy, precision, recall, f1, auc_score
