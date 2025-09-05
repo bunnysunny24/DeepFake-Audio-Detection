@@ -36,12 +36,12 @@ python train_multimodal.py `
   --data_dir "F:\deepfake\backup\LAV-DF" `
   --output_dir "F:\deepfake\backup\Models\extreme_outputs" `
   --checkpoint_dir "F:\deepfake\backup\Models\extreme_checkpoints" `
-  --max_samples 5000 `
-  --batch_size 10 `
+  --max_samples 4000 `
+  --batch_size 12 `
   --image_size 256 `
   --validation_split 0.2 `
   --test_split 0.1 `
-  --num_epochs 20 `
+  --num_epochs 25 `
   --learning_rate 2e-6 `
   --weight_decay 5e-6 `
   --dropout_rate 0.05 `
@@ -55,18 +55,18 @@ python train_multimodal.py `
   --enhanced_augmentation `
   --enable_advanced_physiological `
   --enable_skin_color_analysis `
-  --physiological_fps 12 `
+  --physiological_fps 8 `
   --optimizer adamw `
   --scheduler cosine `
   --warmup_epochs 3 `
-  --early_stopping_patience 5 `
+  --early_stopping_patience 3 `
   --gradient_clip 0.3 `
   --label_smoothing 0.02 `
   --mixup_alpha 0.6 `
   --cutmix_alpha 0.4 `
   --amp_enabled `
-  --reduce_frames 6 `
-  --num_workers 5 `
+  --reduce_frames 3 `
+  --num_workers 8 `
   --pin_memory `
   --persistent_workers `
   --prefetch_factor 3 `
@@ -94,15 +94,16 @@ python train_multimodal.py `
   --data_dir "F:\deepfake\backup\LAV-DF" `
   --output_dir "F:\deepfake\backup\Models\extreme_outputs\ensemble_model1" `
   --checkpoint_dir "F:\deepfake\backup\Models\extreme_checkpoints\ensemble_model1" `
-  --max_samples 5000 `
-  --batch_size 10 `
+  --max_samples 4000 `
+  --batch_size 12 `
   --image_size 256 `
   --backbone_visual efficientnet_b4 `
-  --num_epochs 15 `
+  --num_epochs 20 `
   --learning_rate 1.5e-6 `
   --dropout_rate 0.08 `
   --mixup_alpha 0.7 `
-  --num_workers 5 `
+  --reduce_frames 3 `
+  --num_workers 8 `
   --prefetch_factor 3 `
   --wandb_run_name "ensemble_model1_efficientnet_b4_proven_specs"
 
@@ -113,15 +114,16 @@ python train_multimodal.py `
   --data_dir "F:\deepfake\backup\LAV-DF" `
   --output_dir "F:\deepfake\backup\Models\extreme_outputs\ensemble_model2" `
   --checkpoint_dir "F:\deepfake\backup\Models\extreme_checkpoints\ensemble_model2" `
-  --max_samples 5000 `
-  --batch_size 10 `
+  --max_samples 4000 `
+  --batch_size 12 `
   --image_size 256 `
   --backbone_visual efficientnet_b3 `
-  --num_epochs 15 `
+  --num_epochs 20 `
   --learning_rate 3e-6 `
   --dropout_rate 0.10 `
   --label_smoothing 0.05 `
-  --num_workers 5 `
+  --reduce_frames 3 `
+  --num_workers 8 `
   --prefetch_factor 3 `
   --wandb_run_name "ensemble_model2_efficientnet_b3_proven_specs"
 
@@ -132,15 +134,16 @@ python train_multimodal.py `
   --data_dir "F:\deepfake\backup\LAV-DF" `
   --output_dir "F:\deepfake\backup\Models\extreme_outputs\ensemble_model3" `
   --checkpoint_dir "F:\deepfake\backup\Models\extreme_checkpoints\ensemble_model3" `
-  --max_samples 5000 `
-  --batch_size 10 `
+  --max_samples 4000 `
+  --batch_size 12 `
   --image_size 256 `
   --backbone_visual regnet `
-  --num_epochs 15 `
+  --num_epochs 20 `
   --learning_rate 2e-6 `
   --dropout_rate 0.12 `
   --cutmix_alpha 0.5 `
-  --num_workers 5 `
+  --reduce_frames 3 `
+  --num_workers 8 `
   --prefetch_factor 3 `
   --wandb_run_name "ensemble_model3_regnet_proven_specs"
 
