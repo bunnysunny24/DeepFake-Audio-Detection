@@ -1,7 +1,11 @@
 import torch
 import torch.nn as nn
 from transformers import Wav2Vec2Model, AutoModel
-from torchvision.models import efficientnet_b0, EfficientNet_B0_Weights, swin_v2_b
+from torchvision.models import (efficientnet_b0, EfficientNet_B0_Weights, 
+                               efficientnet_b3, EfficientNet_B3_Weights,
+                               efficientnet_b4, EfficientNet_B4_Weights,
+                               regnet_y_8gf, RegNet_Y_8GF_Weights,
+                               swin_v2_b)
 from torch.nn import TransformerEncoder, TransformerEncoderLayer
 import mediapipe as mp
 import numpy as np
@@ -2080,6 +2084,12 @@ class MultiModalDeepfakeModel(nn.Module):
         # Automatically adjust feature dimensions based on selected backbones
         if backbone_visual == 'efficientnet':
             self.actual_video_feature_dim = 1280  # EfficientNet-B0 outputs 1280 features
+        elif backbone_visual == 'efficientnet_b3':
+            self.actual_video_feature_dim = 1536  # EfficientNet-B3 outputs 1536 features
+        elif backbone_visual == 'efficientnet_b4':
+            self.actual_video_feature_dim = 1792  # EfficientNet-B4 outputs 1792 features
+        elif backbone_visual == 'regnet':
+            self.actual_video_feature_dim = 2016  # RegNet-Y-8GF outputs 2016 features
         elif backbone_visual == 'swin':
             self.actual_video_feature_dim = 1024  # Swin outputs 1024 features
         else:
@@ -2099,6 +2109,36 @@ class MultiModalDeepfakeModel(nn.Module):
             # Freeze early layers to prevent gradient issues during initial training
             for i, (name, param) in enumerate(self.visual_model.named_parameters()):
                 if i < 20:  # Freeze first 20 layers
+                    param.requires_grad = False
+                    
+        elif backbone_visual == 'efficientnet_b3':
+            self.visual_model = efficientnet_b3(weights=EfficientNet_B3_Weights.IMAGENET1K_V1)
+            self.visual_model.classifier = nn.Identity()
+            visual_out_dim = 1536
+            
+            # Freeze early layers to prevent gradient issues during initial training
+            for i, (name, param) in enumerate(self.visual_model.named_parameters()):
+                if i < 30:  # Freeze first 30 layers for larger model
+                    param.requires_grad = False
+                    
+        elif backbone_visual == 'efficientnet_b4':
+            self.visual_model = efficientnet_b4(weights=EfficientNet_B4_Weights.IMAGENET1K_V1)
+            self.visual_model.classifier = nn.Identity()
+            visual_out_dim = 1792
+            
+            # Freeze early layers to prevent gradient issues during initial training
+            for i, (name, param) in enumerate(self.visual_model.named_parameters()):
+                if i < 40:  # Freeze first 40 layers for larger model
+                    param.requires_grad = False
+                    
+        elif backbone_visual == 'regnet':
+            self.visual_model = regnet_y_8gf(weights=RegNet_Y_8GF_Weights.IMAGENET1K_V2)
+            self.visual_model.fc = nn.Identity()
+            visual_out_dim = 2016
+            
+            # Freeze early layers to prevent gradient issues during initial training
+            for i, (name, param) in enumerate(self.visual_model.named_parameters()):
+                if i < 35:  # Freeze first 35 layers
                     param.requires_grad = False
                     
         elif backbone_visual == 'swin':
