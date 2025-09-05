@@ -2,10 +2,10 @@
 # Your system successfully runs: batch_size 6, workers 4, 14 threads
 # This is optimized for 95%+ accuracy using your proven hardware capabilities
 
-Write-Host "🚀 RTX 4060 EXTREME TRAINING - PROVEN WORKING SPECS" -ForegroundColor Red
-Write-Host "✅ Based on your successful training configuration" -ForegroundColor Green
-Write-Host "🎯 Target: 79.56% → 95%+ accuracy" -ForegroundColor Yellow
-Write-Host "📊 Dataset: 5000 samples, Higher resolution, Better model" -ForegroundColor Cyan
+Write-Host "RTX 4060 EXTREME TRAINING - PROVEN WORKING SPECS" -ForegroundColor Red
+Write-Host "Based on your successful training configuration" -ForegroundColor Green
+Write-Host "Target: 79.56% -> 95%+ accuracy" -ForegroundColor Yellow
+Write-Host "Dataset: 5000 samples, Higher resolution, Better model" -ForegroundColor Cyan
 
 # Use YOUR proven working memory settings
 $env:PYTORCH_CUDA_ALLOC_CONF = "expandable_segments:True,max_split_size_mb:64"
@@ -22,15 +22,15 @@ Set-Location "F:\deepfake\backup\Models"
 New-Item -ItemType Directory -Force -Path "F:\deepfake\backup\Models\extreme_outputs" | Out-Null
 New-Item -ItemType Directory -Force -Path "F:\deepfake\backup\Models\extreme_checkpoints" | Out-Null
 
-Write-Host "✅ USING YOUR PROVEN WORKING CONFIGURATION:" -ForegroundColor Green
-Write-Host "  📦 Batch Size: 3 (conservative from your working batch 6)" -ForegroundColor Yellow
-Write-Host "  🧠 Workers: 4 (exactly what works on your system)" -ForegroundColor Yellow
-Write-Host "  📐 Image Size: 352px (upgrade from your 224px)" -ForegroundColor Yellow
-Write-Host "  ⚡ EfficientNet-B4 (larger model for better accuracy)" -ForegroundColor Yellow
-Write-Host "  🧠 Threads: 14 (your proven working config)" -ForegroundColor Yellow
+Write-Host "USING YOUR PROVEN WORKING CONFIGURATION:" -ForegroundColor Green
+Write-Host "  Batch Size: 3 (conservative from your working batch 6)" -ForegroundColor Yellow
+Write-Host "  Workers: 4 (exactly what works on your system)" -ForegroundColor Yellow
+Write-Host "  Image Size: 352px (upgrade from your 224px)" -ForegroundColor Yellow
+Write-Host "  EfficientNet-B4 (1792 features, larger model for better accuracy)" -ForegroundColor Yellow
+Write-Host "  Threads: 14 (your proven working config)" -ForegroundColor Yellow
 
 # PHASE 1: EXTREME ACCURACY TRAINING
-Write-Host "🚀 PHASE 1: EXTREME ACCURACY TRAINING" -ForegroundColor Cyan
+Write-Host "PHASE 1: EXTREME ACCURACY TRAINING" -ForegroundColor Cyan
 python train_multimodal.py `
   --json_path "F:\deepfake\backup\LAV-DF\metadata.json" `
   --data_dir "F:\deepfake\backup\LAV-DF" `
@@ -80,16 +80,16 @@ python train_multimodal.py `
   --wandb_project "deepfake-detection-extreme-95percent" `
   --wandb_run_name "phase1_proven_specs_efficientnet_b4" `
   --save_intermediate `
-  --save_intermediate_interval 25
+  --save_intermediate_interval 50
 
-Write-Host "✅ PHASE 1 COMPLETE!" -ForegroundColor Green
-Write-Host "📊 Expected: 87-90% accuracy (proven hardware + better model)" -ForegroundColor Yellow
+Write-Host "PHASE 1 COMPLETE!" -ForegroundColor Green
+Write-Host "Expected: 87-90% accuracy (proven hardware + better model)" -ForegroundColor Yellow
 
 # PHASE 2: ENSEMBLE FOR 95%+ ACCURACY
-Write-Host "🔄 PHASE 2: ENSEMBLE TRAINING FOR 95%+" -ForegroundColor Cyan
+Write-Host "PHASE 2: ENSEMBLE TRAINING FOR 95%+" -ForegroundColor Cyan
 
 # Model 1: EfficientNet-B4 (Your proven working config)
-Write-Host "🚀 Training Ensemble Model 1: EfficientNet-B4" -ForegroundColor Yellow
+Write-Host "Training Ensemble Model 1: EfficientNet-B4" -ForegroundColor Yellow
 python train_multimodal.py `
   --json_path "F:\deepfake\backup\LAV-DF\metadata.json" `
   --data_dir "F:\deepfake\backup\LAV-DF" `
@@ -108,7 +108,7 @@ python train_multimodal.py `
   --wandb_run_name "ensemble_model1_efficientnet_b4_proven_specs"
 
 # Model 2: EfficientNet-B3 (Faster variant)
-Write-Host "🚀 Training Ensemble Model 2: EfficientNet-B3" -ForegroundColor Yellow
+Write-Host "Training Ensemble Model 2: EfficientNet-B3" -ForegroundColor Yellow
 python train_multimodal.py `
   --json_path "F:\deepfake\backup\LAV-DF\metadata.json" `
   --data_dir "F:\deepfake\backup\LAV-DF" `
@@ -127,7 +127,7 @@ python train_multimodal.py `
   --wandb_run_name "ensemble_model2_efficientnet_b3_proven_specs"
 
 # Model 3: RegNet (Different architecture family)
-Write-Host "🚀 Training Ensemble Model 3: RegNet" -ForegroundColor Yellow
+Write-Host "Training Ensemble Model 3: RegNet" -ForegroundColor Yellow
 python train_multimodal.py `
   --json_path "F:\deepfake\backup\LAV-DF\metadata.json" `
   --data_dir "F:\deepfake\backup\LAV-DF" `
@@ -145,26 +145,26 @@ python train_multimodal.py `
   --prefetch_factor 2 `
   --wandb_run_name "ensemble_model3_regnet_proven_specs"
 
-Write-Host "✅ ENSEMBLE TRAINING COMPLETE!" -ForegroundColor Green
+Write-Host "ENSEMBLE TRAINING COMPLETE!" -ForegroundColor Green
 
-Write-Host "🎯 FINAL RESULTS WITH YOUR PROVEN HARDWARE:" -ForegroundColor Red
+Write-Host "FINAL RESULTS WITH YOUR PROVEN HARDWARE:" -ForegroundColor Red
 Write-Host "EXPECTED PERFORMANCE:" -ForegroundColor Green
-Write-Host "  📈 Phase 1 (Single Model): 87-90% accuracy" -ForegroundColor Yellow
-Write-Host "  🔄 Phase 2 (Ensemble): 92-95% accuracy" -ForegroundColor Yellow  
-Write-Host "  🚀 With TTA: 95-97% accuracy" -ForegroundColor Yellow
+Write-Host "  Phase 1 (Single Model): 87-90% accuracy" -ForegroundColor Yellow
+Write-Host "  Phase 2 (Ensemble): 92-95% accuracy" -ForegroundColor Yellow  
+Write-Host "  With TTA: 95-97% accuracy" -ForegroundColor Yellow
 Write-Host "" -ForegroundColor White
 Write-Host "PROVEN OPTIMIZATIONS APPLIED:" -ForegroundColor Magenta
-Write-Host "  ✅ Batch size 3: Safe for your RTX 4060" -ForegroundColor Cyan
-Write-Host "  ✅ Workers 4: Your proven working config" -ForegroundColor Cyan
-Write-Host "  ✅ 14 threads: Your exact CPU config" -ForegroundColor Cyan
-Write-Host "  ✅ 64MB segments: Your working memory config" -ForegroundColor Cyan
-Write-Host "  ✅ Higher resolution: 352px vs 224px" -ForegroundColor Cyan
-Write-Host "  ✅ Better model: EfficientNet-B4" -ForegroundColor Cyan
+Write-Host "  Batch size 3: Safe for your RTX 4060" -ForegroundColor Cyan
+Write-Host "  Workers 4: Your proven working config" -ForegroundColor Cyan
+Write-Host "  14 threads: Your exact CPU config" -ForegroundColor Cyan
+Write-Host "  64MB segments: Your working memory config" -ForegroundColor Cyan
+Write-Host "  Higher resolution: 352px vs 224px" -ForegroundColor Cyan
+Write-Host "  Better model: EfficientNet-B4" -ForegroundColor Cyan
 Write-Host "" -ForegroundColor White
 Write-Host "ESTIMATED TRAINING TIME:" -ForegroundColor Yellow
-Write-Host "  ⏱️ Phase 1: 8-10 hours" -ForegroundColor Cyan
-Write-Host "  ⏱️ Phase 2: 20-24 hours" -ForegroundColor Cyan
-Write-Host "  ⏱️ Total: ~1.5 days" -ForegroundColor Cyan
+Write-Host "  Phase 1: 8-10 hours" -ForegroundColor Cyan
+Write-Host "  Phase 2: 20-24 hours" -ForegroundColor Cyan
+Write-Host "  Total: ~1.5 days" -ForegroundColor Cyan
 Write-Host "" -ForegroundColor White
-Write-Host "🚀 THIS CONFIGURATION WILL WORK ON YOUR SYSTEM!" -ForegroundColor Green
-Write-Host "✅ Based on your proven successful training run" -ForegroundColor Green
+Write-Host "THIS CONFIGURATION WILL WORK ON YOUR SYSTEM!" -ForegroundColor Green
+Write-Host "Based on your proven successful training run" -ForegroundColor Green
