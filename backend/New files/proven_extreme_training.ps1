@@ -36,13 +36,12 @@ python train_multimodal.py `
   --data_dir "F:\deepfake\backup\LAV-DF" `
   --output_dir "F:\deepfake\backup\Models\extreme_outputs" `
   --checkpoint_dir "F:\deepfake\backup\Models\extreme_checkpoints" `
-  --resume_checkpoint "F:\deepfake\backup\Models\stratified_checkpoints\run_20250904_165625\regular\checkpoint_epoch_11_acc_0.7956_f1_0.8651.pth" `
   --max_samples 5000 `
-  --batch_size 3 `
-  --image_size 352 `
+  --batch_size 9 `
+  --image_size 288 `
   --validation_split 0.2 `
   --test_split 0.1 `
-  --num_epochs 40 `
+  --num_epochs 25 `
   --learning_rate 2e-6 `
   --weight_decay 5e-6 `
   --dropout_rate 0.05 `
@@ -60,17 +59,17 @@ python train_multimodal.py `
   --optimizer adamw `
   --scheduler cosine `
   --warmup_epochs 3 `
-  --early_stopping_patience 8 `
+  --early_stopping_patience 5 `
   --gradient_clip 0.3 `
   --label_smoothing 0.02 `
   --mixup_alpha 0.6 `
   --cutmix_alpha 0.4 `
   --amp_enabled `
-  --reduce_frames 2 `
-  --num_workers 4 `
+  --reduce_frames 4 `
+  --num_workers 7 `
   --pin_memory `
   --persistent_workers `
-  --prefetch_factor 2 `
+  --prefetch_factor 3 `
   --loss_type focal `
   --focal_alpha 0.8 `
   --focal_gamma 1.5 `
@@ -80,7 +79,7 @@ python train_multimodal.py `
   --wandb_project "deepfake-detection-extreme-95percent" `
   --wandb_run_name "phase1_proven_specs_efficientnet_b4" `
   --save_intermediate `
-  --save_intermediate_interval 50
+  --save_intermediate_interval 100
 
 Write-Host "PHASE 1 COMPLETE!" -ForegroundColor Green
 Write-Host "Expected: 87-90% accuracy (proven hardware + better model)" -ForegroundColor Yellow
@@ -96,15 +95,15 @@ python train_multimodal.py `
   --output_dir "F:\deepfake\backup\Models\extreme_outputs\ensemble_model1" `
   --checkpoint_dir "F:\deepfake\backup\Models\extreme_checkpoints\ensemble_model1" `
   --max_samples 5000 `
-  --batch_size 3 `
-  --image_size 352 `
+  --batch_size 9 `
+  --image_size 288 `
   --backbone_visual efficientnet_b4 `
-  --num_epochs 30 `
+  --num_epochs 20 `
   --learning_rate 1.5e-6 `
   --dropout_rate 0.08 `
   --mixup_alpha 0.7 `
-  --num_workers 4 `
-  --prefetch_factor 2 `
+  --num_workers 7 `
+  --prefetch_factor 3 `
   --wandb_run_name "ensemble_model1_efficientnet_b4_proven_specs"
 
 # Model 2: EfficientNet-B3 (Faster variant)
@@ -115,15 +114,15 @@ python train_multimodal.py `
   --output_dir "F:\deepfake\backup\Models\extreme_outputs\ensemble_model2" `
   --checkpoint_dir "F:\deepfake\backup\Models\extreme_checkpoints\ensemble_model2" `
   --max_samples 5000 `
-  --batch_size 4 `
-  --image_size 320 `
+  --batch_size 9 `
+  --image_size 288 `
   --backbone_visual efficientnet_b3 `
-  --num_epochs 30 `
+  --num_epochs 20 `
   --learning_rate 3e-6 `
   --dropout_rate 0.10 `
   --label_smoothing 0.05 `
-  --num_workers 4 `
-  --prefetch_factor 2 `
+  --num_workers 7 `
+  --prefetch_factor 3 `
   --wandb_run_name "ensemble_model2_efficientnet_b3_proven_specs"
 
 # Model 3: RegNet (Different architecture family)
@@ -134,15 +133,15 @@ python train_multimodal.py `
   --output_dir "F:\deepfake\backup\Models\extreme_outputs\ensemble_model3" `
   --checkpoint_dir "F:\deepfake\backup\Models\extreme_checkpoints\ensemble_model3" `
   --max_samples 5000 `
-  --batch_size 3 `
-  --image_size 352 `
+  --batch_size 9 `
+  --image_size 288 `
   --backbone_visual regnet `
-  --num_epochs 30 `
+  --num_epochs 20 `
   --learning_rate 2e-6 `
   --dropout_rate 0.12 `
   --cutmix_alpha 0.5 `
-  --num_workers 4 `
-  --prefetch_factor 2 `
+  --num_workers 7 `
+  --prefetch_factor 3 `
   --wandb_run_name "ensemble_model3_regnet_proven_specs"
 
 Write-Host "ENSEMBLE TRAINING COMPLETE!" -ForegroundColor Green
