@@ -24,7 +24,7 @@ New-Item -ItemType Directory -Force -Path "F:\deepfake\backup\Models\extreme_che
 
 Write-Host "USING YOUR OPTIMIZED CONFIGURATION:" -ForegroundColor Green
 Write-Host "  Batch Size: 12 (optimized for speed + accuracy)" -ForegroundColor Yellow
-Write-Host "  Workers: 8 (better CPU utilization)" -ForegroundColor Yellow
+Write-Host "  Workers: 0 (single-threaded, memory-safe)" -ForegroundColor Yellow
 Write-Host "  Image Size: 256px (optimal balance)" -ForegroundColor Yellow
 Write-Host "  EfficientNet-B4 (1792 features, larger model for better accuracy)" -ForegroundColor Yellow
 Write-Host "  Threads: 14 (your proven working config)" -ForegroundColor Yellow
@@ -37,14 +37,15 @@ python train_multimodal.py `
   --output_dir "F:\deepfake\backup\Models\extreme_outputs" `
   --checkpoint_dir "F:\deepfake\backup\Models\extreme_checkpoints" `
   --max_samples 4000 `
-  --batch_size 12 `
+  --batch_size 4 `
+  --gradient_accumulation_steps 4 `
   --image_size 256 `
-  --validation_split 0.2 `
-  --test_split 0.1 `
+  --validation_split 0.15 `
+  --test_split 0.05 `
   --num_epochs 25 `
-  --learning_rate 2e-6 `
-  --weight_decay 5e-6 `
-  --dropout_rate 0.05 `
+  --learning_rate 5e-5 `
+  --weight_decay 1e-5 `
+  --dropout_rate 0.2 `
   --backbone_visual efficientnet_b4 `
   --enable_face_mesh `
   --detect_deepfake_type `
@@ -58,23 +59,26 @@ python train_multimodal.py `
   --physiological_fps 8 `
   --optimizer adamw `
   --scheduler cosine `
-  --warmup_epochs 3 `
+  --warmup_epochs 2 `
   --early_stopping_patience 3 `
-  --gradient_clip 0.3 `
-  --label_smoothing 0.02 `
-  --mixup_alpha 0.6 `
-  --cutmix_alpha 0.4 `
+  --gradient_clip 1.0 `
+  --label_smoothing 0.0 `
+  --mixup_alpha 0.2 `
+  --cutmix_alpha 0.15 `
+  --gradient_checkpointing `
+  --loss_type crossentropy `
+  --use_ema `
+  --ema_decay 0.999 `
+  --progressive_resize `
+  --progressive_resize_epochs 5 10 15 `
   --amp_enabled `
   --reduce_frames 3 `
-  --num_workers 8 `
+  --num_workers 4 `
   --pin_memory `
   --persistent_workers `
-  --prefetch_factor 3 `
-  --loss_type focal `
-  --focal_alpha 0.8 `
-  --focal_gamma 1.5 `
+  --prefetch_factor 4 `
   --use_weighted_loss `
-  --class_weights_mode balanced `
+  --class_weights_mode none `
   --use_wandb `
   --wandb_project "deepfake-detection-extreme-95percent" `
   --wandb_run_name "phase1_proven_specs_efficientnet_b4" `
@@ -96,10 +100,15 @@ python train_multimodal.py `
   --output_dir "F:\deepfake\backup\Models\extreme_outputs\ensemble_model1" `
   --checkpoint_dir "F:\deepfake\backup\Models\extreme_checkpoints\ensemble_model1" `
   --max_samples 4000 `
-  --batch_size 12 `
+  --batch_size 4 `
+  --gradient_accumulation_steps 4 `
   --image_size 256 `
-  --validation_split 0.2 `
-  --test_split 0.1 `
+  --validation_split 0.15 `
+  --test_split 0.05 `
+  --num_epochs 20 `
+  --learning_rate 5e-5 `
+  --weight_decay 1e-5 `
+  --dropout_rate 0.2 `
   --backbone_visual efficientnet_b4 `
   --enable_face_mesh `
   --detect_deepfake_type `
@@ -111,29 +120,28 @@ python train_multimodal.py `
   --enable_advanced_physiological `
   --enable_skin_color_analysis `
   --physiological_fps 8 `
-  --num_epochs 20 `
-  --learning_rate 1.5e-6 `
-  --weight_decay 5e-6 `
-  --dropout_rate 0.08 `
   --optimizer adamw `
   --scheduler cosine `
   --warmup_epochs 2 `
   --early_stopping_patience 3 `
-  --gradient_clip 0.3 `
-  --label_smoothing 0.02 `
-  --mixup_alpha 0.7 `
-  --cutmix_alpha 0.4 `
+  --gradient_clip 1.0 `
+  --label_smoothing 0.0 `
+  --mixup_alpha 0.2 `
+  --cutmix_alpha 0.15 `
+  --gradient_checkpointing `
+  --loss_type crossentropy `
+  --use_ema `
+  --ema_decay 0.9999 `
+  --progressive_resize `
+  --progressive_resize_epochs 8 16 24 `
   --amp_enabled `
   --reduce_frames 3 `
-  --num_workers 8 `
+  --num_workers 4 `
   --pin_memory `
   --persistent_workers `
-  --prefetch_factor 3 `
-  --loss_type focal `
-  --focal_alpha 0.8 `
-  --focal_gamma 1.5 `
+  --prefetch_factor 4 `
   --use_weighted_loss `
-  --class_weights_mode balanced `
+  --class_weights_mode none `
   --use_wandb `
   --wandb_project "deepfake-detection-extreme-95percent" `
   --wandb_run_name "ensemble_model1_efficientnet_b4_proven_specs" `
@@ -148,10 +156,15 @@ python train_multimodal.py `
   --output_dir "F:\deepfake\backup\Models\extreme_outputs\ensemble_model2" `
   --checkpoint_dir "F:\deepfake\backup\Models\extreme_checkpoints\ensemble_model2" `
   --max_samples 4000 `
-  --batch_size 12 `
+  --batch_size 4 `
+  --gradient_accumulation_steps 4 `
   --image_size 256 `
-  --validation_split 0.2 `
-  --test_split 0.1 `
+  --validation_split 0.15 `
+  --test_split 0.05 `
+  --num_epochs 20 `
+  --learning_rate 5e-5 `
+  --weight_decay 1e-5 `
+  --dropout_rate 0.2 `
   --backbone_visual efficientnet_b3 `
   --enable_face_mesh `
   --detect_deepfake_type `
@@ -163,29 +176,28 @@ python train_multimodal.py `
   --enable_advanced_physiological `
   --enable_skin_color_analysis `
   --physiological_fps 8 `
-  --num_epochs 20 `
-  --learning_rate 3e-6 `
-  --weight_decay 5e-6 `
-  --dropout_rate 0.10 `
   --optimizer adamw `
   --scheduler cosine `
   --warmup_epochs 2 `
   --early_stopping_patience 3 `
-  --gradient_clip 0.3 `
-  --label_smoothing 0.05 `
-  --mixup_alpha 0.6 `
-  --cutmix_alpha 0.4 `
+  --gradient_clip 1.0 `
+  --label_smoothing 0.0 `
+  --mixup_alpha 0.3 `
+  --cutmix_alpha 0.2 `
+  --gradient_checkpointing `
+  --loss_type crossentropy `
+  --use_ema `
+  --ema_decay 0.9999 `
+  --progressive_resize `
+  --progressive_resize_epochs 6 12 18 `
   --amp_enabled `
   --reduce_frames 3 `
-  --num_workers 8 `
+  --num_workers 4 `
   --pin_memory `
   --persistent_workers `
-  --prefetch_factor 3 `
-  --loss_type focal `
-  --focal_alpha 0.8 `
-  --focal_gamma 1.5 `
+  --prefetch_factor 4 `
   --use_weighted_loss `
-  --class_weights_mode balanced `
+  --class_weights_mode none `
   --use_wandb `
   --wandb_project "deepfake-detection-extreme-95percent" `
   --wandb_run_name "ensemble_model2_efficientnet_b3_proven_specs" `
@@ -200,10 +212,15 @@ python train_multimodal.py `
   --output_dir "F:\deepfake\backup\Models\extreme_outputs\ensemble_model3" `
   --checkpoint_dir "F:\deepfake\backup\Models\extreme_checkpoints\ensemble_model3" `
   --max_samples 4000 `
-  --batch_size 12 `
+  --batch_size 4 `
+  --gradient_accumulation_steps 4 `
   --image_size 256 `
-  --validation_split 0.2 `
-  --test_split 0.1 `
+  --validation_split 0.15 `
+  --test_split 0.05 `
+  --num_epochs 20 `
+  --learning_rate 5e-5 `
+  --weight_decay 1e-5 `
+  --dropout_rate 0.2 `
   --backbone_visual regnet `
   --enable_face_mesh `
   --detect_deepfake_type `
@@ -215,29 +232,28 @@ python train_multimodal.py `
   --enable_advanced_physiological `
   --enable_skin_color_analysis `
   --physiological_fps 8 `
-  --num_epochs 20 `
-  --learning_rate 2e-6 `
-  --weight_decay 5e-6 `
-  --dropout_rate 0.12 `
   --optimizer adamw `
   --scheduler cosine `
   --warmup_epochs 2 `
   --early_stopping_patience 3 `
-  --gradient_clip 0.3 `
-  --label_smoothing 0.02 `
-  --mixup_alpha 0.6 `
-  --cutmix_alpha 0.5 `
+  --gradient_clip 1.0 `
+  --label_smoothing 0.0 `
+  --mixup_alpha 0.3 `
+  --cutmix_alpha 0.2 `
+  --gradient_checkpointing `
+  --loss_type crossentropy `
+  --use_ema `
+  --ema_decay 0.9999 `
+  --progressive_resize `
+  --progressive_resize_epochs 7 14 21 `
   --amp_enabled `
   --reduce_frames 3 `
-  --num_workers 8 `
+  --num_workers 4 `
   --pin_memory `
   --persistent_workers `
-  --prefetch_factor 3 `
-  --loss_type focal `
-  --focal_alpha 0.8 `
-  --focal_gamma 1.5 `
+  --prefetch_factor 4 `
   --use_weighted_loss `
-  --class_weights_mode balanced `
+  --class_weights_mode none `
   --use_wandb `
   --wandb_project "deepfake-detection-extreme-95percent" `
   --wandb_run_name "ensemble_model3_regnet_proven_specs" `
