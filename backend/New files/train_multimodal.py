@@ -2473,7 +2473,9 @@ def parse_args():
     parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints', help='Directory to save checkpoints')
     
     # Model parameters
-    parser.add_argument('--backbone_visual', type=str, default='efficientnet', choices=['efficientnet', 'swin'], help='Visual backbone architecture')
+    parser.add_argument('--backbone_visual', type=str, default='efficientnet', 
+                       choices=['efficientnet', 'efficientnet_b3', 'efficientnet_b4', 'regnet', 'swin'], 
+                       help='Visual backbone architecture')
     parser.add_argument('--backbone_audio', type=str, default='wav2vec2', choices=['wav2vec2', 'hubert'], help='Audio backbone architecture')
     parser.add_argument('--fusion_type', type=str, default='attention', choices=['attention', 'concat'], help='Fusion type for multimodal features')
     parser.add_argument('--video_feature_dim', type=int, default=1024, help='Dimension of video features')
@@ -2517,6 +2519,8 @@ def parse_args():
     # 🔧 OVERFITTING PREVENTION TECHNIQUES
     parser.add_argument('--label_smoothing', type=float, default=0.1, help='Label smoothing factor (0.0-0.2) to prevent overfitting')
     parser.add_argument('--mixup_alpha', type=float, default=0.2, help='Mixup alpha parameter for data augmentation')
+    parser.add_argument('--cutmix_alpha', type=float, default=0.0, help='CutMix alpha parameter for data augmentation')
+    parser.add_argument('--image_size', type=int, default=224, help='Image size for preprocessing (224, 320, 352, etc.)')
     parser.add_argument('--dropout_rate', type=float, default=0.3, help='Global dropout rate for regularization')
     parser.add_argument('--min_lr', type=float, default=1e-6, help='Minimum learning rate for scheduler')
     
@@ -2566,7 +2570,7 @@ def main():
     """
     trainer = None
     try:
-        print("� STARTING OPTIMIZED LOCAL TRAINING")
+        print("STARTING OPTIMIZED LOCAL TRAINING")
         print("   - High-performance multiprocessing enabled")
         print("   - Full GPU utilization for maximum speed") 
         print("   - Optimized settings for local training environment")
@@ -2595,14 +2599,14 @@ def main():
         print("✅ Training completed successfully without server issues")
         
     except KeyboardInterrupt:
-        print("🧼 Training interrupted by user, performing safe cleanup...")
+        print("Training interrupted by user, performing safe cleanup...")
         if trainer:
             trainer._stop_resource_monitor()
         kill_zombie_processes()
         cleanup_processes()
         
     except Exception as e:
-        print(f"❌ Training failed with error: {e}")
+        print(f"Training failed with error: {e}")
         traceback.print_exc()
         if trainer:
             trainer._stop_resource_monitor()
@@ -2612,7 +2616,7 @@ def main():
         
     finally:
         # 🧼 COMPREHENSIVE FINAL CLEANUP FOR SERVER SAFETY
-        print("🧼 Performing final server-safe cleanup...")
+        print("Performing final server-safe cleanup...")
         
         if trainer:
             trainer._stop_resource_monitor()
