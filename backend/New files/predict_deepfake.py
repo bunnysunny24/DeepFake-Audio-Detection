@@ -76,35 +76,69 @@ def main(model_path, video_path):
     model = load_model(model_path, device)
     video_frames = extract_video_frames(video_path)  # [num_frames, C, H, W]
     audio_tensor = extract_audio_tensor(video_path)  # [audio_length]
+    
+    # Create complete inputs dictionary matching training format
+    batch_size = 1
+    num_frames = video_frames.shape[0]
+    
     inputs = {
         "video_frames": video_frames.unsqueeze(0).to('cuda'),  # [1, num_frames, C, H, W]
         "audio": audio_tensor.unsqueeze(0).to('cuda'),         # [1, audio_length]
+        "audio_spectrogram": None,  # Will be computed by model
+        "original_video_frames": video_frames.unsqueeze(0).to('cuda'),
+        "original_audio": audio_tensor.unsqueeze(0).to('cuda'),
+        "fake_periods": [None],  # List for batch
+        "timestamps": [None],
+        "fake_mask": [None],
+        "face_embeddings": None,
+        "temporal_consistency": torch.zeros((batch_size,), device='cuda'),
+        "metadata_features": torch.zeros((batch_size, 10), device='cuda'),  # Default metadata
+        "ela_features": None,  # Will be computed by model
+        "audio_visual_sync": torch.zeros((batch_size, 5), device='cuda'),
+        "facial_landmarks": None,  # Will be computed by model
+        "head_pose": None,
+        "eye_blink_features": None,
+        "pulse_signal": None,
+        "skin_color_features": None,
+        "skin_color_variations": None,
+        "mfcc_features": None,
+        "frequency_features": None,
+        "file_path": [video_path],
+        "deepfake_type": [None],
+        "transcript": [None]
     }
+    
     with torch.no_grad():
-        output, results = model(inputs)
-        pred = torch.softmax(output, dim=-1) if output.shape[-1] > 1 else torch.sigmoid(output)
-        print("Raw Output:", output)
-        print("Prediction:", pred)
-        print("Explainability/Results:", results)
+        try:
+            output, results = model(inputs)
+            pred = torch.softmax(output, dim=-1) if output.shape[-1] > 1 else torch.sigmoid(output)
+            print("Raw Output:", output)
+            print("Prediction:", pred)
+            print("Explainability/Results:", results)
 
-        # Determine label and confidence
-        if pred.shape[-1] > 1:
-            fake_prob = float(pred[0, 1])
-            if fake_prob >= 0.5:
-                label = "Fake"
-                confidence_value = fake_prob
+            # Determine label and confidence
+            if pred.shape[-1] > 1:
+                fake_prob = float(pred[0, 1])
+                if fake_prob >= 0.5:
+                    label = "Fake"
+                    confidence_value = fake_prob
+                else:
+                    label = "Real"
+                    confidence_value = 1 - fake_prob
             else:
-                label = "Real"
-                confidence_value = 1 - fake_prob
-        else:
-            raw_confidence = float(pred.item())
-            if raw_confidence >= 0.5:
-                label = "Fake"
-                confidence_value = raw_confidence
-            else:
-                label = "Real"
-                confidence_value = 1 - raw_confidence
-        print(f"Prediction: {label} (Confidence: {confidence_value:.2f})")
+                raw_confidence = float(pred.item())
+                if raw_confidence >= 0.5:
+                    label = "Fake"
+                    confidence_value = raw_confidence
+                else:
+                    label = "Real"
+                    confidence_value = 1 - raw_confidence
+            print(f"Prediction: {label} (Confidence: {confidence_value:.2f})")
+            
+        except Exception as e:
+            print(f"Error during prediction: {e}")
+            import traceback
+            traceback.print_exc()
 
 if __name__ == "__main__":
     import sys
