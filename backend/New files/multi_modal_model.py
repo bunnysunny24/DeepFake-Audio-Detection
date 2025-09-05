@@ -2803,18 +2803,19 @@ class MultiModalDeepfakeModel(nn.Module):
                         if 'naturalness' in advanced_physio_results:
                             component_contributions['advanced_physiological'] = advanced_physio_results['naturalness']
                         
-                        # Store detailed results for explainability (only during evaluation)
-                        if not self.training:
-                            if 'detailed_results' not in results:
-                                results['detailed_results'] = {}
-                            
-                            results['detailed_results']['advanced_physiology'] = {
-                                'heart_rate_bpm': heartbeat_results.get('heart_rate', torch.tensor([0.0])).detach().cpu().numpy(),
-                                'breathing_rate_bpm': breathing_results.get('breathing_rate', torch.tensor([0.0])).detach().cpu().numpy(),
-                                'hrv_score': heartbeat_results.get('hrv_score', torch.tensor([0.0])).detach().cpu().numpy(),
-                                'breathing_regularity': breathing_results.get('regularity_score', torch.tensor([0.0])).detach().cpu().numpy(),
-                                'coherence_score': advanced_physio_results.get('coherence_score', torch.tensor([0.0])).detach().cpu().numpy()
-                            }
+                        # Store detailed results for explainability (ALWAYS, not just during eval)
+                        # VALIDATION FIX: Remove training mode dependency
+                        # if not self.training:
+                        if 'detailed_results' not in results:
+                            results['detailed_results'] = {}
+                        
+                        results['detailed_results']['advanced_physiology'] = {
+                            'heart_rate_bpm': heartbeat_results.get('heart_rate', torch.tensor([0.0])).detach().cpu().numpy(),
+                            'breathing_rate_bpm': breathing_results.get('breathing_rate', torch.tensor([0.0])).detach().cpu().numpy(),
+                            'hrv_score': heartbeat_results.get('hrv_score', torch.tensor([0.0])).detach().cpu().numpy(),
+                            'breathing_regularity': breathing_results.get('regularity_score', torch.tensor([0.0])).detach().cpu().numpy(),
+                            'coherence_score': advanced_physio_results.get('coherence_score', torch.tensor([0.0])).detach().cpu().numpy()
+                        }
                     else:
                         if self.debug:
                             print("[WARNING] Advanced physiological analyzer not available")
@@ -3240,23 +3241,24 @@ class MultiModalDeepfakeModel(nn.Module):
             output = self.classifier(final_features)
             
             # Ensure gradients are maintained during training
-            if self.training:
-                # Check if output requires gradients
-                if not output.requires_grad:
-                    if self.debug:
-                        print(f"[WARNING] Output tensor does not require gradients! Adding gradient path...")
-                    # Create a learnable parameter to maintain gradient flow
-                    if not hasattr(self, '_gradient_enabler'):
-                        self._gradient_enabler = nn.Parameter(torch.zeros(1, device=output.device), requires_grad=True)
-                    # Add a tiny learnable component to maintain gradients
-                    output = output + self._gradient_enabler * 1e-8
-                
-                # Verify the output still requires gradients
-                if not output.requires_grad:
-                    if self.debug:
-                        print(f"[ERROR] Failed to maintain gradients in output tensor")
-                    # Force gradient requirement
-                    output.requires_grad_(True)
+            # VALIDATION FIX: Remove training-specific gradient manipulation
+            # if self.training:
+            #     # Check if output requires gradients
+            #     if not output.requires_grad:
+            #         if self.debug:
+            #             print(f"[WARNING] Output tensor does not require gradients! Adding gradient path...")
+            #         # Create a learnable parameter to maintain gradient flow
+            #         if not hasattr(self, '_gradient_enabler'):
+            #             self._gradient_enabler = nn.Parameter(torch.zeros(1, device=output.device), requires_grad=True)
+            #         # Add a tiny learnable component to maintain gradients
+            #         output = output + self._gradient_enabler * 1e-8
+            #     
+            #     # Verify the output still requires gradients
+            #     if not output.requires_grad:
+            #         if self.debug:
+            #             print(f"[ERROR] Failed to maintain gradients in output tensor")
+            #         # Force gradient requirement
+            #         output.requires_grad_(True)
             
             # Additional output stability check
             if torch.isnan(output).any() or torch.isinf(output).any():
@@ -3273,31 +3275,32 @@ class MultiModalDeepfakeModel(nn.Module):
             if self.detect_deepfake_type:
                 deepfake_type_output = self.deepfake_type_classifier(final_features)
             
-            # Deepfake check during evaluation
+            # Deepfake check during evaluation - DISABLED FOR TRAINING
             deepfake_check_results = None
             explanation_data = None
-            if not self.training:
-                # Run detailed forensic analysis
-                try:
-                    deepfake_check_results, explanation_data = self.deepfake_check_video(
-                        video_frames=video_frames, 
-                        original_video_frames=original_video_frames,
-                        fake_periods=inputs.get('fake_periods'),
-                        timestamps=inputs.get('timestamps'),
-                        original_audio=original_audio, 
-                        current_audio=audio,
-                        ela_features=ela_features,
-                        metadata_features=metadata_features,
-                        temporal_consistency=temporal_consistency,
-                        av_sync_features=audio_visual_sync,
-                        facial_landmarks=facial_landmarks,
-                        component_contributions=component_contributions
-                    )
-                except Exception as e:
-                    if self.debug:
-                        print(f"[WARNING] Error in deepfake_check_video: {e}")
-                    deepfake_check_results = {'authenticity_score': torch.zeros(batch_size, 1, device=video_frames.device)}
-                    explanation_data = {'error': str(e)}
+            # TEMPORARILY DISABLED TO FIX VALIDATION BIAS ISSUE
+            # if not self.training:
+            #     # Run detailed forensic analysis
+            #     try:
+            #         deepfake_check_results, explanation_data = self.deepfake_check_video(
+            #             video_frames=video_frames, 
+            #             original_video_frames=original_video_frames,
+            #             fake_periods=inputs.get('fake_periods'),
+            #             timestamps=inputs.get('timestamps'),
+            #             original_audio=original_audio, 
+            #             current_audio=audio,
+            #             ela_features=ela_features,
+            #             metadata_features=metadata_features,
+            #             temporal_consistency=temporal_consistency,
+            #             av_sync_features=audio_visual_sync,
+            #             facial_landmarks=facial_landmarks,
+            #             component_contributions=component_contributions
+            #         )
+            #     except Exception as e:
+            #         if self.debug:
+            #             print(f"[WARNING] Error in deepfake_check_video: {e}")
+            #         deepfake_check_results = {'authenticity_score': torch.zeros(batch_size, 1, device=video_frames.device)}
+            #         explanation_data = {'error': str(e)}
 
             # Update results dictionary
             results.update({
