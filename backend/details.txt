@@ -109,6 +109,10 @@ cd "F:\deepfake\backup\Models"; .\run_training_optimized.ps1
 
 Let me analyze the core issue differently. Since you're still getting model collapse in validation even after:
 
-✅ Fixing BatchNorm momentum
-✅ Disabling EMA
-✅ Removing forced validation balancing
+At this point, we've eliminated:
+
+✅ Dropout layers (AdaptiveDropout + reduced rates)
+✅ BatchNorm layers (completely disabled)
+✅ EMA (disabled during validation)
+✅ Forced validation balancing (removed)
+✅ BatchNorm momentum manipulation (removed)
