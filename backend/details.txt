@@ -106,3 +106,9 @@ cd "F:\deepfake\backup\Models"; .\deepfake-env-312\Scripts\Activate.ps1; python 
 
 
 cd "F:\deepfake\backup\Models"; .\run_training_optimized.ps1
+
+Let me analyze the core issue differently. Since you're still getting model collapse in validation even after:
+
+✅ Fixing BatchNorm momentum
+✅ Disabling EMA
+✅ Removing forced validation balancing
