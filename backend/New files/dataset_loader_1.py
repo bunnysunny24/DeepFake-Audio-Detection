@@ -1522,7 +1522,7 @@ def get_transforms_enhanced(phase='train'):
 
 def get_data_loaders(
     json_path, data_dir, batch_size=4, validation_split=0.2, test_split=0.1,
-    shuffle=True, num_workers=2, max_samples=None, detect_faces=True,
+    shuffle=True, num_workers=0, max_samples=None, detect_faces=True,
     compute_spectrograms=True, temporal_features=True, enhanced_preprocessing=True,
     enhanced_augmentation=False, multiprocessing_context=None
 ):
@@ -1635,61 +1635,40 @@ def get_data_loaders(
     # Get class weights for weighted sampling
     class_weights = train_dataset.class_weights
 
-    # Handle multiprocessing context for safety
+    # Disable multiprocessing context for Windows/PowerShell
     mp_context = None
-    if num_workers > 0 and multiprocessing_context:
-        import multiprocessing as mp
-        try:
-            mp_context = mp.get_context(multiprocessing_context)
-        except Exception as e:
-            print(f"⚠️ Warning: Could not set multiprocessing context '{multiprocessing_context}': {e}")
-            mp_context = None
 
     # Create data loaders
-    train_loader_kwargs = {
-        'dataset': train_dataset,
-        'batch_size': batch_size,
-        'sampler': train_sampler,
-        'num_workers': num_workers,
-        'pin_memory': True,
-        'drop_last': False,
-        'collate_fn': collate_fn,
-        'persistent_workers': True if num_workers > 0 else False,
-    }
-    if mp_context is not None:
-        train_loader_kwargs['multiprocessing_context'] = mp_context
-    
-    train_loader = DataLoader(**train_loader_kwargs)
-    
-    val_loader_kwargs = {
-        'dataset': val_dataset,
-        'batch_size': batch_size,
-        'sampler': val_sampler,
-        'num_workers': num_workers,
-        'pin_memory': True,
-        'drop_last': False,
-        'collate_fn': collate_fn,
-        'persistent_workers': True if num_workers > 0 else False,
-    }
-    if mp_context is not None:
-        val_loader_kwargs['multiprocessing_context'] = mp_context
-    
-    val_loader = DataLoader(**val_loader_kwargs)
-    
-    test_loader_kwargs = {
-        'dataset': test_dataset,
-        'batch_size': batch_size,
-        'sampler': test_sampler,
-        'num_workers': num_workers,
-        'pin_memory': True,
-        'drop_last': False,
-        'collate_fn': collate_fn,
-        'persistent_workers': True if num_workers > 0 else False,
-    }
-    if mp_context is not None:
-        test_loader_kwargs['multiprocessing_context'] = mp_context
-    
-    test_loader = DataLoader(**test_loader_kwargs)
+    train_loader = DataLoader(
+        dataset=train_dataset,
+        batch_size=batch_size,
+        sampler=train_sampler,
+        num_workers=0,
+        pin_memory=True,
+        drop_last=False,
+        collate_fn=collate_fn,
+        persistent_workers=False
+    )
+    val_loader = DataLoader(
+        dataset=val_dataset,
+        batch_size=batch_size,
+        sampler=val_sampler,
+        num_workers=0,
+        pin_memory=True,
+        drop_last=False,
+        collate_fn=collate_fn,
+        persistent_workers=False
+    )
+    test_loader = DataLoader(
+        dataset=test_dataset,
+        batch_size=batch_size,
+        sampler=test_sampler,
+        num_workers=0,
+        pin_memory=True,
+        drop_last=False,
+        collate_fn=collate_fn,
+        persistent_workers=False
+    )
 
     print(f"✅ Dataset loaded with {len(train_indices)} training, {len(val_indices)} validation, and {len(test_indices)} test samples.")
     return train_loader, val_loader, test_loader, class_weights
