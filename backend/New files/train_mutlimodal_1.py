@@ -63,7 +63,74 @@ import glob
 import atexit
 import gc
 import signal
-import sys
+import sys.80GB allocated, 3.51GB reserved
+[DEBUG] Final classifier output shape: torch.Size([4, 2])
+[DEBUG] Expected batch size: 4
+Epoch 1/30 [Val]: 100%|███████████████████████████████████████████████████████████████████████████████████████████████| 5/5 [00:58<00:00, 11.78s/it, loss=0.2222] 
+Epoch 1 Metrics:
+- Accuracy    : 0.8500
+- Precision   : 0.8500
+- Recall      : 1.0000
+- F1 Score    : 0.9189
+- Macro F1    : 0.4595 ⭐
+- AUC Score   : 0.3725
+- Real (0): P=0.0000, R=0.0000, F1=0.0000
+- Fake (1): P=0.8500, R=1.0000, F1=0.9189
+- Confusion Matrix:
+[[ 0  3]
+ [ 0 17]]
+[DEBUG] Confusion matrix saved successfully: F:\deepfake\backup\Models\server_outputs\run_20250922_154657\plots\confusion_matrix_epoch_1.png
+
+Epoch 1/30 completed in 321.21s
+Train - Loss: 0.4399, Accuracy: 0.3143, F1: 0.1724, Macro F1: 0.2935 ⭐, AUC: 0.5114
+Val   - Loss: 0.1700, Accuracy: 0.8500, F1: 0.9189, Macro F1: 0.4595 ⭐, AUC: 0.3725
+Checkpoint saved: F:\deepfake\backup\Models\server_checkpoints\run_20250922_155308\regular\checkpoint_epoch_1_acc_0.8500_f1_0.4595.pth
+[DEBUG] Starting to generate plots...
+[DEBUG] Plotting loss - Train: 1 values, Val: 1 values
+[DEBUG] Plot saved successfully: F:\deepfake\backup\Models\server_outputs\run_20250922_154657\plots\loss_epoch_1.png
+[DEBUG] Successfully saved loss plot to: F:\deepfake\backup\Models\server_outputs\run_20250922_154657\plots\loss_epoch_1.png
+[DEBUG] Plotting accuracy - Train: 1 values, Val: 1 values
+[DEBUG] Plot saved successfully: F:\deepfake\backup\Models\server_outputs\run_20250922_154657\plots\accuracy_epoch_1.png
+[DEBUG] Successfully saved accuracy plot to: F:\deepfake\backup\Models\server_outputs\run_20250922_154657\plots\accuracy_epoch_1.png
+[DEBUG] Plotting f1 - Train: 1 values, Val: 1 values
+[DEBUG] Plot saved successfully: F:\deepfake\backup\Models\server_outputs\run_20250922_154657\plots\f1_epoch_1.png
+[DEBUG] Successfully saved f1 plot to: F:\deepfake\backup\Models\server_outputs\run_20250922_154657\plots\f1_epoch_1.png
+[DEBUG] Plotting macro_f1 - Train: 1 values, Val: 1 values
+[DEBUG] Plot saved successfully: F:\deepfake\backup\Models\server_outputs\run_20250922_154657\plots\macro_f1_epoch_1.png
+[DEBUG] Successfully saved macro_f1 plot to: F:\deepfake\backup\Models\server_outputs\run_20250922_154657\plots\macro_f1_epoch_1.png
+[DEBUG] Plotting auc - Train: 1 values, Val: 1 values
+[DEBUG] Plot saved successfully: F:\deepfake\backup\Models\server_outputs\run_20250922_154657\plots\auc_epoch_1.png
+[DEBUG] Successfully saved auc plot to: F:\deepfake\backup\Models\server_outputs\run_20250922_154657\plots\auc_epoch_1.png
+✅ All plots generated successfully!
+Best model saved: F:\deepfake\backup\Models\server_checkpoints\run_20250922_155308\best_model.pth
+Epoch 2/30 [Train]:   0%|                                                                                                                 | 0/18 [00:00<?, ?it/s][RANK 0] Starting training epoch 2 with 18 batches
+✅ Sample 69528: pulse+skin+pose+blink+freq+landmarks
+✅ Sample 42512: pulse+skin+pose+blink+freq+landmarks
+✅ Sample 33271: pulse+skin+pose+blink+freq+landmarks
+✅ Sample 76341: pulse+skin+pose+blink+freq+landmarks
+[RANK 0] Processing first batch...
+[RANK 0] Loading first batch, this may take time...
+[RANK 0] Moving batch 0 to device...
+[RANK 0] First batch loaded in 0.00 seconds
+[DEBUG] Batch 0 - Initial labels shape: torch.Size([4])
+[DEBUG] Batch 0 - label shape: torch.Size([4])
+[DEBUG] Batch 0 - facial_landmarks shape: torch.Size([4, 16, 136])
+[DEBUG] Batch 0 - original_audio shape: torch.Size([4, 8000])
+[DEBUG] Batch 0 - audio_visual_sync shape: torch.Size([4, 5])
+[DEBUG] Batch 0 - original_video_frames shape: torch.Size([4, 16, 3, 224, 224])
+[DEBUG] Batch 0 - fake_periods length: 4
+[DEBUG] Batch 0 - skin_color_variations shape: torch.Size([4, 16, 3])
+[DEBUG] Batch 0 - deepfake_type length: 4
+[DEBUG] Batch 0 - ela_features shape: torch.Size([4, 112, 112])
+[DEBUG] Batch 0 - file_path length: 4
+[DEBUG] Batch 0 - face_embeddings shape: torch.Size([4, 1, 256])
+[DEBUG] Batch 0 - pulse_signal shape: torch.Size([4, 16])
+[DEBUG] Batch 0 - frequency_features shape: torch.Size([4, 1, 16, 16])
+[DEBUG] Batch 0 - eye_blink_features shape: torch.Size([4, 16])
+[DEBUG] Batch 0 - video_frames shape: torch.Size([4, 16, 3, 224, 224])
+[DEBUG] Batch 0 - metadata_features shape: torch.Size([4, 10])
+[DEBUG] Batch 0 - timestamps length: 4
+[DEBUG] Batch 0 - head_pose shape: torch.Size([4, 16, 3])
 
 # 🧼 PROCESS SAFETY: Set multiprocessing method early and force it
 try:
@@ -1247,22 +1314,23 @@ class DeepfakeTrainer:
             print(f"[INFO] Using DataParallel on {torch.cuda.device_count()} GPUs.")
             self.model = torch.nn.DataParallel(self.model)
 
-        # Initialize loss function with class weights for imbalanced data
+        # Force class-balanced weighted loss and oversampling for class imbalance
         loss_type = getattr(self.config, 'loss_type', 'ce')  # Default to cross-entropy
-        
+        self.config.use_weighted_loss = True
+        self.config.class_weights_mode = 'balanced'
+        self.config.oversample_minority = True
+        if self.class_weights is not None:
+            print(f"[IMBALANCE FIX] Using class weights: {self.class_weights}")
         if loss_type == 'focal':
-            # Use Focal Loss for better handling of class imbalance
             focal_alpha = getattr(self.config, 'focal_alpha', 1.0)
             focal_gamma = getattr(self.config, 'focal_gamma', 2.0)
             self.criterion = FocalLoss(
-                alpha=focal_alpha, 
-                gamma=focal_gamma, 
-                class_weights=self.class_weights if self.config.use_weighted_loss else None
+                alpha=focal_alpha,
+                gamma=focal_gamma,
+                class_weights=self.class_weights
             )
             print(f"Using Focal Loss (alpha={focal_alpha}, gamma={focal_gamma}) with weights: {self.class_weights}")
-        
-        elif self.class_weights is not None and self.config.use_weighted_loss:
-            # Use class-balanced Cross Entropy Loss
+        elif self.class_weights is not None:
             self.criterion = nn.CrossEntropyLoss(weight=self.class_weights)
             print(f"Using weighted CrossEntropyLoss with weights: {self.class_weights}")
         else:
@@ -1500,7 +1568,7 @@ class DeepfakeTrainer:
                 
                 # For first few batches, reduce effective batch size to prevent hanging
                 if batch_idx < 3 and labels.shape[0] > 40:
-                    print(f"[RANK {self.local_rank}] Reducing batch size for initial batches: {labels.shape[0]} -> 40")
+                    print(f"[RANK {local_rank}] Reducing batch size for initial batches: {labels.shape[0]} -> 40")
                     # Truncate all batch elements to smaller size
                     for key, value in batch.items():
                         if isinstance(value, torch.Tensor) and value.shape[0] == labels.shape[0]:
@@ -1786,6 +1854,12 @@ class DeepfakeTrainer:
                 # Save intermediate checkpoint if enabled (before any exception handling)
                 if self.is_main_process:
                     self.save_intermediate_checkpoint(epoch, batch_idx)
+                # Clear GPU cache after each batch
+                torch.cuda.empty_cache()
+                # Print memory usage after each batch
+                mem_alloc = torch.cuda.memory_allocated() / (1024 ** 2)
+                mem_reserved = torch.cuda.memory_reserved() / (1024 ** 2)
+                print(f"[GPU] Allocated: {mem_alloc:.2f} MB, Reserved: {mem_reserved:.2f} MB after batch {batch_idx}")
                 
                 # Visualize sample predictions periodically
                 if (batch_idx + 1) % self.config.visualization_interval == 0 and self.is_main_process:
@@ -2130,7 +2204,7 @@ class DeepfakeTrainer:
                     "test_auc": metrics_dict['auc']
                 })
         
-        # Save detailed results to CSV
+        # Save final results
         if self.is_main_process:
             # Basic results
             results_df = pd.DataFrame(results_data)
@@ -2542,7 +2616,7 @@ def parse_args():
     parser.add_argument('--num_epochs', type=int, default=30, help='Number of training epochs')
     parser.add_argument('--learning_rate', type=float, default=1e-4, help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=1e-5, help='Weight decay')
-    parser.add_argument('--max_samples', type=int, default=1000, help='Maximum number of samples to use')
+    parser.add_argument('--max_samples', type=int, default=100, help='Maximum number of samples to use')
     parser.add_argument('--num_workers', type=int, default=0, help='🧼 SAFETY: Number of data loader workers (default=0, optimal for complex multimodal datasets)')  # Reverted based on benchmark results
     parser.add_argument('--validation_split', type=float, default=0.2, help='Validation split ratio')
     parser.add_argument('--test_split', type=float, default=0.1, help='Test split ratio')
@@ -2708,4 +2782,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
