@@ -27,31 +27,51 @@ def extract_video_frames(video_path, num_frames=32, resize=(224, 224)):
 def extract_audio_tensor(video_path, audio_length=8000):
     """
     Extract audio from video file using ffmpeg and librosa.
+    Handles Windows path issues safely.
     """
     import subprocess
     import tempfile
     import librosa
+    import shlex
 
     # Create a temporary wav file
-    with tempfile.NamedTemporaryFile(suffix=".wav") as temp_wav:
-        # Use ffmpeg to extract audio
-        cmd = [
-            "ffmpeg", "-y", "-i", video_path,
-            "-ar", "16000", "-ac", "1", "-vn", temp_wav.name
-        ]
-        try:
-            subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
-            audio, sample_rate = librosa.load(temp_wav.name, sr=16000, mono=True)
-        except Exception as e:
-            raise RuntimeError(f"Failed to extract audio with ffmpeg: {e}")
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_wav:
+        temp_wav_path = temp_wav.name
 
-    # Center crop or pad
+    # Build the FFmpeg command safely
+    cmd = f'ffmpeg -y -i "{video_path}" -ar 16000 -ac 1 -vn "{temp_wav_path}"'
+
+    try:
+        # Use shlex.split for safe argument parsing
+        result = subprocess.run(
+            shlex.split(cmd),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True
+        )
+        # Load the extracted audio
+        audio, sample_rate = librosa.load(temp_wav_path, sr=16000, mono=True)
+    except subprocess.CalledProcessError as e:
+        error_msg = e.stderr.decode(errors="ignore")[:500]
+        raise RuntimeError(f"Failed to extract audio with ffmpeg.\nCommand: {cmd}\nError: {error_msg}")
+    except Exception as e:
+        raise RuntimeError(f"Unexpected error during audio extraction: {e}")
+    finally:
+        # Cleanup temp file safely
+        try:
+            os.remove(temp_wav_path)
+        except Exception:
+            pass
+
+    # Center crop or pad the audio to a fixed length
     if len(audio) > audio_length:
         start = (len(audio) - audio_length) // 2
         audio = audio[start:start + audio_length]
     else:
         audio = np.pad(audio, (0, audio_length - len(audio)), mode='constant')
+
     return torch.tensor(audio, dtype=torch.float32, device='cuda')  # [audio_length]
+
 
 def load_model(model_path, device):
     checkpoint = torch.load(model_path, map_location='cuda')
