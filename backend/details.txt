@@ -129,3 +129,5 @@ You have enough RAM for deep learning (at least 16GB+)
 You run training scripts with multiprocessing disabled (num_workers=0 for safety)
 
 
+
+python f:\deepfake\backup\Models\predict_deepfake.py f:\deepfake\backup\Models\server_checkpoints\best_model.pth f:\deepfake\backup\LAV-DF\fake_014.mp4
