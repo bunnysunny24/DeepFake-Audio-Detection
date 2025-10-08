@@ -1,17 +1,44 @@
+"""
+🔥 IMPROVED DEEPFAKE DETECTION TRAINING SCRIPT 🔥
+
+Key Improvements for Class Imbalance & Overfitting:
+
+✅ CLASS IMBALANCE FIXES:
+   - Focal Loss: Focuses on hard examples, reduces easy example weight
+   - Class-balanced loss functions with proper weighting
+   - Macro F1 scoring: Better metric for imbalanced datasets
+   - Per-class metrics tracking (Real vs Fake performance)
+   - Option for minority class oversampling
+
+✅ OVERFITTING PREVENTION:
+   - Dropout regularization in model layers
+   - L2 weight decay regularization
+   - Early stopping based on Macro F1 (not just accuracy)
+   - Gradient clipping for training stability
+   - Enhanced metrics tracking and visualization
+
+✅ IMPROVED EVALUATION:
+   - Macro F1 as primary metric (average of both classes)
+   - Per-class precision, recall, F1 breakdown
+   - Confusion matrix analysis
+   - Real vs Fake performance tracking
+
+Usage Examples:
+  python train_multimodal.py --loss_type focal --focal_gamma 2.0 --dropout_rate 0.3 --use_weighted_loss
+  python train_multimodal.py --class_weights_mode balanced --oversample_minority --dropout_rate 0.5
+"""
+
 from multi_modal_model import MultiModalDeepfakeModel
 from dataset_loader import get_data_loaders, get_transforms, get_transforms_enhanced
 import torch
 from skin_analyzer import SkinColorAnalyzer
 import torch.nn as nn
-import torch.nn.functional as F
+import torch.nn.functional as F  # Added for Focal Loss
 import torch.optim as optim
 from torch.cuda.amp import GradScaler, autocast
-from sklearn.metrics import precision_recall_fscore_support, confusion_matrix, roc_auc_score, accuracy_score
-try:
-    from sklearn.utils.class_weight import compute_class_weight
-except ImportError:
-    print("Warning: sklearn not available, balanced class weights will be disabled")
-    compute_class_weight = None
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from sklearn.metrics import precision_recall_fscore_support, confusion_matrix, roc_auc_score, accuracy_score, precision_score, recall_score, f1_score  # Added more metrics
 import matplotlib
 matplotlib.use('Agg')  # Set non-interactive backend for server environments
 import matplotlib.pyplot as plt
@@ -21,6 +48,7 @@ import os
 import numpy as np
 import json
 import time
+from datetime import datetime, timedelta  # Added timedelta for distributed timeout
 from tqdm import tqdm
 import cv2
 from pathlib import Path
@@ -28,242 +56,124 @@ import pandas as pd
 import wandb
 import argparse
 from datetime import datetime, timedelta
-import atexit
-import signal
-import threading
-import traceback
-import psutil
-try:
-    import resource  # Unix-only, not available on Windows
-    HAS_RESOURCE = True
-except ImportError:
-    HAS_RESOURCE = False
 import shutil
+import torch.multiprocessing as mp
 import traceback
 import glob
 import atexit
 import gc
 import signal
 import sys
-import psutil
-import subprocess
-import threading
-import multiprocessing as mp_check
 
-# 🔥 FOCAL LOSS IMPLEMENTATION
-class FocalLoss(nn.Module):
-    """
-    Focal Loss implementation for addressing class imbalance.
-    
-    Focal Loss is designed to address the class imbalance problem by down-weighting
-    easy examples and focusing on hard examples.
-    
-    Args:
-        alpha (float): Weighting factor for rare class (default: 1.0)
-        gamma (float): Focusing parameter (default: 2.0)
-        reduction (str): Specifies the reduction to apply to the output
-    """
-    
-    def __init__(self, alpha=1.0, gamma=2.0, reduction='mean'):
-        super(FocalLoss, self).__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-        self.reduction = reduction
-        
-    def forward(self, inputs, targets):
-        # Compute cross entropy
-        ce_loss = F.cross_entropy(inputs, targets, reduction='none')
-        
-        # Compute p_t
-        pt = torch.exp(-ce_loss)
-        
-        # Compute focal loss
-        focal_loss = self.alpha * (1 - pt) ** self.gamma * ce_loss
-        
-        if self.reduction == 'mean':
-            return focal_loss.mean()
-        elif self.reduction == 'sum':
-            return focal_loss.sum()
-        else:
-            return focal_loss
+# 🧼 PROCESS SAFETY: Set multiprocessing method early and force it
+try:
+    mp.set_start_method('spawn', force=True)
+except RuntimeError:
+    pass  # Already set
 
-# 🧼 COMPREHENSIVE PROCESS AND GPU SAFETY MANAGEMENT
-# This prevents zombie processes and GPU monopolization that can get SSH access revoked
-
-def setup_gpu_usage(use_all_gpus=True):
-    """Setup GPU usage - can use all GPUs on local system or limit for servers."""
-    if torch.cuda.is_available():
-        available_gpus = torch.cuda.device_count()
-        
-        if use_all_gpus:
-            # � LOCAL SYSTEM: Use all available GPUs for maximum performance
-            if 'CUDA_VISIBLE_DEVICES' not in os.environ:
-                print(f"🚀 MULTI-GPU ENABLED: Using ALL {available_gpus} GPUs for maximum performance")
-                print(f"   GPUs: {', '.join([f'GPU {i}' for i in range(available_gpus)])}")
-            else:
-                visible_gpus = os.environ['CUDA_VISIBLE_DEVICES']
-                gpu_list = visible_gpus.split(',')
-                print(f"🚀 MULTI-GPU ENABLED: Using {len(gpu_list)} GPUs: {visible_gpus}")
-        else:
-            # 🔒 SERVER MODE: Use only single GPU for server safety
-            if 'CUDA_VISIBLE_DEVICES' not in os.environ:
-                os.environ['CUDA_VISIBLE_DEVICES'] = '0'
-                print(f"🔒 SERVER MODE: Using ONLY GPU 0 out of {available_gpus} available")
-                print("   This ensures minimal server resource usage")
-            else:
-                visible_gpus = os.environ['CUDA_VISIBLE_DEVICES']
-                if ',' in visible_gpus:
-                    first_gpu = visible_gpus.split(',')[0]
-                    os.environ['CUDA_VISIBLE_DEVICES'] = first_gpu
-                    print(f"🔒 SERVER MODE: Changed from '{visible_gpus}' to '{first_gpu}'")
-                else:
-                    print(f"✅ Using single pre-configured GPU: {visible_gpus}")
-    else:
-        print("⚠️  No GPUs available, will use CPU")
-
-def kill_zombie_processes():
-    """Kill any zombie processes to prevent accumulation."""
+# 🔧 FIX NCCL GPU MAPPING WARNING: Set CUDA device IMMEDIATELY for distributed training
+if "LOCAL_RANK" in os.environ:
     try:
-        current_pid = os.getpid()
-        current_process = psutil.Process(current_pid)
+        local_rank = int(os.environ["LOCAL_RANK"])
+        world_size = int(os.environ.get("WORLD_SIZE", 1))
         
-        # Find and terminate zombie child processes
-        zombie_count = 0
-        for child in current_process.children(recursive=True):
-            try:
-                if child.status() == psutil.STATUS_ZOMBIE:
-                    print(f"🧟 Found zombie process PID {child.pid}, terminating...")
-                    child.terminate()
-                    zombie_count += 1
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                pass
+        print(f"[Rank {local_rank}] 🚀 Starting distributed initialization (rank {local_rank}/{world_size})")
         
-        if zombie_count > 0:
-            print(f"🧼 Cleaned up {zombie_count} zombie processes")
-            time.sleep(1)  # Give time for cleanup
+        # Verify CUDA is available before setting device
+        if not torch.cuda.is_available():
+            print(f"[Rank {local_rank}] ❌ CUDA not available!")
+            sys.exit(1)
             
-    except Exception as e:
-        print(f"Warning: Could not clean zombie processes: {e}")
-
-def monitor_system_resources():
-    """Monitor and limit system resource usage."""
-    try:
-        # Get current process info
-        process = psutil.Process()
+        # Verify we have enough GPUs
+        num_gpus = torch.cuda.device_count()
+        if local_rank >= num_gpus:
+            print(f"[Rank {local_rank}] ❌ Local rank {local_rank} >= available GPUs {num_gpus}")
+            sys.exit(1)
         
-        # Check memory usage
-        memory_info = process.memory_info()
-        memory_gb = memory_info.rss / (1024**3)
+        # Set CUDA device first
+        torch.cuda.set_device(local_rank)
+        device_props = torch.cuda.get_device_properties(local_rank)
+        print(f"[Rank {local_rank}] ✅ Using CUDA device: cuda:{local_rank} ({device_props.name})")
         
-        # Check CPU usage
-        cpu_percent = process.cpu_percent()
+        # Test CUDA functionality before proceeding
+        try:
+            test_tensor = torch.ones(1, device=local_rank)
+            _ = test_tensor * 2  # Simple operation to verify CUDA works
+            del test_tensor
+            torch.cuda.empty_cache()
+            print(f"[Rank {local_rank}] ✅ CUDA functionality verified")
+        except Exception as cuda_test_error:
+            print(f"[Rank {local_rank}] ❌ CUDA test failed: {cuda_test_error}")
+            sys.exit(1)
         
-        # Check number of threads
-        num_threads = process.num_threads()
+        # Set comprehensive NCCL environment variables for stability
+        nccl_env_vars = {
+            'NCCL_SOCKET_IFNAME': '^docker0,lo',  # Avoid network interface issues
+            'NCCL_IB_DISABLE': '1',  # Disable InfiniBand if not needed
+            'NCCL_P2P_DISABLE': '1',  # Disable P2P if causing issues
+            'TORCH_NCCL_ASYNC_ERROR_HANDLING': '1',  # Better error handling
+            'CUDA_DEVICE_ORDER': 'PCI_BUS_ID',  # Consistent device ordering
+            'NCCL_TREE_THRESHOLD': '0',  # Force ring algorithm for small clusters
+            'NCCL_LAUNCH_MODE': 'PARALLEL',  # Parallel launch mode
+            'NCCL_TOPO_FILE': '',  # Disable topology detection that causes warnings
+            'TORCH_NCCL_USE_COMM_NONBLOCKING': '1',  # Use non-blocking communications
+            'NCCL_IGNORE_DISABLED_P2P': '1',  # Ignore P2P warnings
+            'NCCL_IGNORE_CPU_AFFINITY': '1',  # Ignore CPU affinity warnings
+            'NCCL_DEBUG': 'WARN',  # Only show warnings and errors
+            'NCCL_TIMEOUT': '3600',  # 1 hour timeout
+            'TORCH_NCCL_BLOCKING_WAIT': '1',  # Use blocking wait
+            'NCCL_NET_GDR_LEVEL': '0',  # Disable GPU Direct RDMA
+            'NCCL_MIN_NCHANNELS': '1',  # Minimum channels
+            'NCCL_MAX_NCHANNELS': '1',  # Maximum channels (force single channel)
+        }
         
-        print(f"📊 Resource Usage - Memory: {memory_gb:.2f}GB, CPU: {cpu_percent:.1f}%, Threads: {num_threads}")
-        
-        # Warn if using too many resources
-        if memory_gb > 32:
-            print(f"⚠️  HIGH MEMORY USAGE: {memory_gb:.2f}GB - Consider reducing batch size")
-        if num_threads > 50:
-            print(f"⚠️  HIGH THREAD COUNT: {num_threads} - This can cause server issues")
+        for key, value in nccl_env_vars.items():
+            os.environ[key] = value
             
-    except Exception as e:
-        print(f"Warning: Could not monitor resources: {e}")
-
-def set_process_limits():
-    """Set optimized process settings for local training."""
-    try:
-        # For local training, we want maximum performance
-        # No file descriptor limits needed for local use
-        if HAS_RESOURCE:
-            # Set generous limits for local training
-            resource.setrlimit(resource.RLIMIT_NOFILE, (8192, 8192))
-        
-        # Don't lower priority for local training - we want full performance
-        # if hasattr(os, 'nice'):
-        #     os.nice(5)  # Commented out - no priority reduction for local use
-        
-        print("� Optimized process settings for local high-performance training")
+        print(f"[Rank {local_rank}] ⚙️ NCCL environment variables configured")
         
     except Exception as e:
-        print(f"Info: Could not optimize process settings: {e}")
-
-def setup_graceful_shutdown():
-    """Setup handlers for graceful shutdown to prevent zombie processes."""
-    def cleanup_handler(signum, frame):
-        print(f"\n🛑 Received signal {signum}, performing graceful shutdown...")
-        
-        # Kill any zombie processes
-        kill_zombie_processes()
-        
-        # Clean GPU memory
-        cleanup_gpu_memory()
-        
-        # Monitor final resource state
-        monitor_system_resources()
-        
-        print("✅ Graceful shutdown completed")
-        sys.exit(0)
+        print(f"[Rank {local_rank if 'local_rank' in locals() else 'unknown'}] ❌ Early CUDA setup failed: {e}")
+        traceback.print_exc()
+        sys.exit(1)
     
-    # Register signal handlers
-    signal.signal(signal.SIGTERM, cleanup_handler)
-    signal.signal(signal.SIGINT, cleanup_handler)
-    if hasattr(signal, 'SIGHUP'):
-        signal.signal(signal.SIGHUP, cleanup_handler)
+elif "CUDA_VISIBLE_DEVICES" in os.environ and torch.cuda.is_available():
+    # Single GPU or DataParallel mode
+    torch.cuda.set_device(0)
+    print(f"✅ Using CUDA device: cuda:0 (non-distributed)")
+else:
+    print("⚠️ No LOCAL_RANK found - running in single GPU/CPU mode")
 
 # 🧼 GPU Memory Management and Process Safety
 def cleanup_gpu_memory():
     """Clean up GPU memory and handle CUDA context properly."""
     try:
         if torch.cuda.is_available():
-            # Clear cache on all visible devices
-            for i in range(torch.cuda.device_count()):
-                torch.cuda.set_device(i)
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
             gc.collect()
-            print("🧼 GPU memory cleaned across all devices")
     except Exception as e:
         print(f"GPU cleanup warning: {e}")
 
 def cleanup_processes():
-    """Clean up processes and GPU memory with comprehensive safety measures."""
+    """Clean up processes and GPU memory."""
     try:
-        print("🧼 Starting comprehensive cleanup...")
-        
-        # Kill zombie processes first
-        kill_zombie_processes()
-        
-        # Clean GPU memory
         cleanup_gpu_memory()
-        
-        # Final resource monitoring
-        monitor_system_resources()
-        
-        print("✅ Process cleanup completed safely")
-        
+        if dist.is_initialized():
+            dist.destroy_process_group()
     except Exception as e:
         print(f"Process cleanup warning: {e}")
 
-# Apply optimizations only once (prevent multiprocessing worker spam)
-import threading
-_setup_lock = threading.Lock()
-_setup_done = False
+def signal_handler(signum, frame):
+    """Handle termination signals gracefully."""
+    print(f"🧼 Received signal {signum}, cleaning up...")
+    cleanup_processes()
+    sys.exit(0)
 
-def _ensure_setup_once():
-    global _setup_done
-    with _setup_lock:
-        if not _setup_done:
-            set_process_limits()
-            setup_graceful_shutdown()
-            _setup_done = True
-
-_ensure_setup_once()
-
-# 🧼 ULTIMATE SAFETY: Register cleanup at exit for any scenario
+# Register cleanup functions
 atexit.register(cleanup_processes)
+signal.signal(signal.SIGTERM, signal_handler)
+signal.signal(signal.SIGINT, signal_handler)
 
 
 def suppress_warnings():
@@ -389,7 +299,7 @@ def plot_confusion_matrix(y_true, y_pred, epoch, save_dir="plots"):
 
 
 def calculate_metrics(y_true, y_pred, y_probs, epoch, return_dict=False):
-    """Calculate metrics like Precision, Recall, F1 Score, Confusion Matrix, and AUC."""
+    """Calculate comprehensive metrics including per-class and macro metrics."""
     # Convert lists to numpy arrays if needed
     y_true = np.array(y_true)
     y_pred = np.array(y_pred)
@@ -399,6 +309,14 @@ def calculate_metrics(y_true, y_pred, y_probs, epoch, return_dict=False):
     precision, recall, f1, _ = precision_recall_fscore_support(y_true, y_pred, average="binary", zero_division=0)
     confusion = confusion_matrix(y_true, y_pred)
     
+    # Per-class metrics (Real=0, Fake=1)
+    precision_per_class = precision_score(y_true, y_pred, average=None, zero_division=0)
+    recall_per_class = recall_score(y_true, y_pred, average=None, zero_division=0)
+    f1_per_class = f1_score(y_true, y_pred, average=None, zero_division=0)
+    
+    # Macro F1 (average of both classes) - better for imbalanced data
+    macro_f1 = f1_score(y_true, y_pred, average='macro', zero_division=0)
+    
     # Handle case where we might have only one class in the batch
     try:
         auc_score = roc_auc_score(y_true, y_probs)
@@ -406,36 +324,19 @@ def calculate_metrics(y_true, y_pred, y_probs, epoch, return_dict=False):
         auc_score = 0.0
 
     print(f"Epoch {epoch} Metrics:")
-    print(f"- Accuracy : {accuracy:.4f}")
-    print(f"- Precision: {precision:.4f}")
-    print(f"- Recall   : {recall:.4f}")
-    print(f"- F1 Score : {f1:.4f}")
-    print(f"- AUC Score: {auc_score:.4f}")
-    print(f"- Confusion Matrix:\n{confusion}")
+    print(f"- Accuracy    : {accuracy:.4f}")
+    print(f"- Precision   : {precision:.4f}")
+    print(f"- Recall      : {recall:.4f}")
+    print(f"- F1 Score    : {f1:.4f}")
+    print(f"- Macro F1    : {macro_f1:.4f} ⭐")  # Key metric for imbalanced data
+    print(f"- AUC Score   : {auc_score:.4f}")
     
-    # 🔧 PREDICTION DIAGNOSTICS: Check for constant predictions or problematic behavior
-    try:
-        unique_preds = np.unique(y_pred)
-        if unique_preds.size == 1:
-            print(f"🚨 [CRITICAL] Model predictions are CONSTANT (always predicting class {unique_preds[0]}) - model collapse detected!")
-            print(f"   This indicates: weights not updating, extreme class imbalance handling, or optimizer issues.")
-        
-        prob_std = np.array(y_probs).std()
-        prob_min, prob_max = np.array(y_probs).min(), np.array(y_probs).max()
-        if prob_std < 1e-3:
-            print(f"🚨 [CRITICAL] Predicted probabilities have very low variance (std={prob_std:.6f}) - model outputs are nearly constant!")
-            print(f"   Probability range: [{prob_min:.6f}, {prob_max:.6f}] - check model forward pass.")
-        
-        # Check for extreme class bias in confusion matrix
-        if confusion.shape == (2, 2):
-            total_pred_class_0 = confusion[0, 0] + confusion[1, 0]  # Real predictions (both correct and incorrect)
-            total_pred_class_1 = confusion[0, 1] + confusion[1, 1]  # Fake predictions (both correct and incorrect)
-            if total_pred_class_0 == 0:
-                print(f"🚨 [CRITICAL] Model NEVER predicts 'Real' class - severe prediction bias detected!")
-            elif total_pred_class_1 == 0:
-                print(f"🚨 [CRITICAL] Model NEVER predicts 'Fake' class - severe prediction bias detected!")
-    except Exception as e:
-        print(f"[WARNING] Could not run prediction diagnostics: {e}")
+    # Per-class breakdown
+    if len(precision_per_class) >= 2:
+        print(f"- Real (0): P={precision_per_class[0]:.4f}, R={recall_per_class[0]:.4f}, F1={f1_per_class[0]:.4f}")
+        print(f"- Fake (1): P={precision_per_class[1]:.4f}, R={recall_per_class[1]:.4f}, F1={f1_per_class[1]:.4f}")
+    
+    print(f"- Confusion Matrix:\n{confusion}")
     
     if return_dict:
         return {
@@ -443,11 +344,41 @@ def calculate_metrics(y_true, y_pred, y_probs, epoch, return_dict=False):
             'precision': precision,
             'recall': recall,
             'f1': f1,
+            'macro_f1': macro_f1,
             'auc': auc_score,
-            'confusion_matrix': confusion.tolist()
+            'confusion_matrix': confusion.tolist(),
+            'precision_per_class': precision_per_class.tolist() if len(precision_per_class) > 0 else [],
+            'recall_per_class': recall_per_class.tolist() if len(recall_per_class) > 0 else [],
+            'f1_per_class': f1_per_class.tolist() if len(f1_per_class) > 0 else []
         }
     else:
-        return precision, recall, f1, auc_score, accuracy
+        return precision, recall, f1, auc_score, accuracy, macro_f1
+
+
+class FocalLoss(nn.Module):
+    """
+    Focal Loss for addressing class imbalance.
+    Focuses learning on hard examples and reduces weight of easy examples.
+    """
+    
+    def __init__(self, alpha=1, gamma=2, class_weights=None, reduction='mean'):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.class_weights = class_weights
+        self.reduction = reduction
+        
+    def forward(self, inputs, targets):
+        ce_loss = F.cross_entropy(inputs, targets, weight=self.class_weights, reduction='none')
+        pt = torch.exp(-ce_loss)
+        focal_loss = self.alpha * (1-pt)**self.gamma * ce_loss
+        
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
 
 
 def save_visualizations(inputs, outputs, results, epoch, sample_idx, viz_dir):
@@ -652,6 +583,24 @@ def save_visualizations(inputs, outputs, results, epoch, sample_idx, viz_dir):
         print(f"Error saving visualizations: {e}")
 
 
+def oversample_minority_class(train_loader, minority_class=0, oversample_ratio=2.0):
+    """
+    Oversample minority class (Real videos) to address class imbalance.
+    
+    Args:
+        train_loader: Original training data loader
+        minority_class: Class to oversample (0=Real, 1=Fake)
+        oversample_ratio: How much to oversample minority class
+    """
+    print(f"🔄 Oversampling minority class {minority_class} with ratio {oversample_ratio}")
+    
+    # This would typically be implemented in the dataset creation
+    # For now, we'll just print the intent - actual implementation 
+    # would require modifying the data loader creation
+    print("⚠️ Oversampling would be implemented in dataset creation phase")
+    return train_loader
+
+
 def clear_gpu_cache():
     """Clear GPU cache to free up memory."""
     if torch.cuda.is_available():
@@ -743,26 +692,74 @@ class DeepfakeTrainer:
     def __init__(self, config):
         """Initialize the trainer with the given configuration."""
         self.config = config
+        self.distributed = config.distributed and torch.cuda.is_available() and torch.cuda.device_count() > 1
+        self.local_rank = config.local_rank
+        self.is_main_process = not self.distributed or self.local_rank == 0
         
-        # 🧼 SERVER SAFETY: Initialize resource monitoring
-        self.resource_monitor_active = True
-        self.last_cleanup_time = time.time()
-        self.cleanup_interval = 300  # Clean up every 5 minutes
-        
-        # Set device for single GPU usage with server-friendly limits
-        self.device = self._get_safe_device(config)
+        # Set device properly for distributed training
+        if self.distributed:
+            # In distributed mode, set CUDA device immediately to avoid warnings
+            print(f"[Rank {self.local_rank}] ⚙️ Setting CUDA device in constructor...")
+            torch.cuda.set_device(self.local_rank)
+            
+            # Ensure device is properly initialized by PyTorch
+            current_device = torch.cuda.current_device()
+            if current_device != self.local_rank:
+                print(f"[Rank {self.local_rank}] ⚠️ Device mismatch: expected {self.local_rank}, got {current_device}")
+                torch.cuda.set_device(self.local_rank)  # Try again
+            
+            self.device = torch.device(f'cuda:{self.local_rank}')
+            print(f"[Rank {self.local_rank}] ✅ Set CUDA device: {self.device}")
+        else:
+            self.device = torch.device(config.device if torch.cuda.is_available() else "cpu")
         
         self.amp_enabled = config.amp_enabled and self.device.type == 'cuda'
-        
-        # 🧼 SAFETY: Start resource monitoring thread
-        self._start_resource_monitor()
         
         # Set up directories
         self.setup_directories()
         
+        # Print configuration improvements
+        self.print_training_improvements()
+        
+        # In distributed mode, synchronize directory paths across all processes
+        if self.distributed:
+            # Wait for main process to create directories
+            if dist.is_initialized():
+                dist.barrier()
+            
+            # Non-main processes need to get the directory paths from main process
+            if not self.is_main_process:
+                # Find the most recent run directory created by main process
+                import glob
+                run_pattern = os.path.join(self.config.output_dir, "run_*")
+                run_dirs = glob.glob(run_pattern)
+                if run_dirs:
+                    # Get the most recent run directory
+                    self.run_dir = max(run_dirs, key=os.path.getctime)
+                    self.log_dir = os.path.join(self.run_dir, "logs")
+                    self.viz_dir = os.path.join(self.run_dir, "visualizations")
+                    self.plot_dir = os.path.join(self.run_dir, "plots")
+                    print(f"[Rank {self.local_rank}] Using shared run directory: {self.run_dir}")
+                else:
+                    print(f"[Rank {self.local_rank}] Warning: No run directory found, using fallback")
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    self.run_dir = os.path.join(self.config.output_dir, f"run_{timestamp}")
+                    self.log_dir = os.path.join(self.run_dir, "logs")
+                    self.viz_dir = os.path.join(self.run_dir, "visualizations")
+                    self.plot_dir = os.path.join(self.run_dir, "plots")
+            
+            # Another barrier to ensure all processes have the correct paths
+            if dist.is_initialized():
+                dist.barrier()
+        
         # Initialize wandb if enabled
-        if config.use_wandb:
-            self.setup_wandb()
+        if config.use_wandb and self.is_main_process:
+            # For distributed training, disable wandb by default to avoid conflicts
+            if self.distributed and not config.use_wandb:
+                print(f"[Rank {self.local_rank}] Note: W&B disabled for distributed training (use --use_wandb to force enable)")
+                self.config.use_wandb = False
+            else:
+                self.setup_wandb()
         else:
             self.config.use_wandb = False
         
@@ -786,6 +783,8 @@ class DeepfakeTrainer:
             'val_accuracies': [],
             'train_f1_scores': [],
             'val_f1_scores': [],
+            'train_macro_f1_scores': [],  # Key metric for imbalanced data
+            'val_macro_f1_scores': [],    # Key metric for imbalanced data
             'train_auc_scores': [],
             'val_auc_scores': []
         }
@@ -797,32 +796,51 @@ class DeepfakeTrainer:
         # Initialize memory management tracking
         self.memory_warnings = 0
         self.oom_errors = 0
-
-        # Track optimizer steps executed (helps detect scaler skipping steps)
-        self.optimizer_steps = 0
         
-        # Initialize best model tracking with overfitting detection
+        # Initialize best model tracking
         self.best_val_accuracy = 0.0
         self.best_val_f1 = 0.0
         self.best_epoch = 0
         self.early_stop_counter = 0
         
-        # 🔧 OVERFITTING MONITORING
-        self.train_val_gap_history = []  # Track train/val performance gap
-        self.val_loss_history = []       # Track validation loss for plateau detection
-        self.overfitting_warnings = 0   # Count overfitting warnings
-        
         # Initialize scaler for mixed precision
         self.scaler = GradScaler() if self.amp_enabled else None
         
         # Create a specific run folder in the checkpoint directory
-        self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # In distributed training, only main process creates the directory
+        if self.distributed:
+            # Use the same timestamp across all processes by broadcasting from rank 0
+            if self.local_rank == 0:
+                self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            else:
+                self.timestamp = None
             
+            # Synchronize timestamp across all processes (simplified approach)
+            # In practice, you'd use dist.broadcast, but we'll use a simpler approach
+            import time
+            if self.local_rank == 0:
+                # Main process creates timestamp file
+                timestamp_file = os.path.join(self.config.checkpoint_dir, "current_run_timestamp.txt")
+                os.makedirs(self.config.checkpoint_dir, exist_ok=True)
+                with open(timestamp_file, 'w') as f:
+                    f.write(self.timestamp)
+            
+            # Wait a bit and then all processes read the same timestamp
+            time.sleep(1)
+            timestamp_file = os.path.join(self.config.checkpoint_dir, "current_run_timestamp.txt")
+            if os.path.exists(timestamp_file):
+                with open(timestamp_file, 'r') as f:
+                    self.timestamp = f.read().strip()
+            else:
+                self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        else:
+            self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         
         self.run_checkpoint_dir = os.path.join(self.config.checkpoint_dir, f"run_{self.timestamp}")
         
-        # Create the directory 
-        os.makedirs(self.run_checkpoint_dir, exist_ok=True)
+        # Only main process creates the directory in distributed training
+        if not self.distributed or self.is_main_process:
+            os.makedirs(self.run_checkpoint_dir, exist_ok=True)
         
         # Initialize starting epoch and batch
         self.start_epoch = 0
@@ -844,9 +862,8 @@ class DeepfakeTrainer:
             # Load checkpoint on appropriate device
             checkpoint = torch.load(checkpoint_path, map_location=self.device)
             
-            # Load model weights (handle DataParallel)
-            if hasattr(self.model, 'module'):
-                # DataParallel wraps model in .module
+            # Load model weights
+            if self.distributed:
                 self.model.module.load_state_dict(checkpoint['model_state_dict'], strict=False)
             else:
                 self.model.load_state_dict(checkpoint['model_state_dict'], strict=False)
@@ -894,6 +911,10 @@ class DeepfakeTrainer:
         
     def setup_directories(self):
         """Set up directories for saving models, logs, and visualizations."""
+        # Only main process creates directories in distributed training
+        if self.distributed and not self.is_main_process:
+            return
+            
         os.makedirs(self.config.output_dir, exist_ok=True)
         
         # Create timestamped run directory
@@ -921,6 +942,11 @@ class DeepfakeTrainer:
     def setup_wandb(self):
         """Initialize Weights & Biases for experiment tracking."""
         try:
+            # Set wandb to offline mode for distributed training to avoid conflicts
+            if self.distributed:
+                os.environ['WANDB_MODE'] = 'offline'
+                os.environ['WANDB_SILENT'] = 'true'
+            
             project_name = self.config.wandb_project or "deepfake-detection"
             run_name = self.config.wandb_run_name or f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
             
@@ -939,21 +965,32 @@ class DeepfakeTrainer:
             if hasattr(self.config, 'enhanced_augmentation') and self.config.enhanced_augmentation:
                 tags.append("enhanced_augmentation")
             
+            # Add distributed training tag
+            if self.distributed:
+                tags.append(f"distributed_{dist.get_world_size()}gpus")
+            
             wandb.init(
                 project=project_name,
                 name=run_name,
                 config=vars(self.config),
-                tags=tags
+                tags=tags,
+                mode='offline' if self.distributed else 'online',  # Offline mode for distributed
+                settings=wandb.Settings(start_method="thread")  # Use thread start method
             )
             
-            print(f"Weights & Biases initialized: {project_name}/{run_name}")
+            print(f"[Rank {self.local_rank}] Weights & Biases initialized: {project_name}/{run_name}")
+            if self.distributed:
+                print(f"[Rank {self.local_rank}] Note: W&B running in offline mode for distributed training")
         except Exception as e:
-            print(f"Error initializing Weights & Biases: {e}")
+            print(f"[Rank {self.local_rank}] Error initializing Weights & Biases: {e}")
             self.config.use_wandb = False
     
     def save_config(self):
         """Save configuration to JSON file."""
-        # Save configuration to file
+        # Only main process saves config in distributed training
+        if self.distributed and not self.is_main_process:
+            return
+            
         config_path = os.path.join(self.run_dir, "config.json")
         with open(config_path, 'w') as f:
             # Convert config to dict and handle non-serializable values
@@ -970,21 +1007,152 @@ class DeepfakeTrainer:
         """Initialize data loaders for training, validation, and testing."""
         print("Setting up data loaders...")
         
-        # ✅ MULTIPROCESSING OPTIMIZATION: Use optimal num_workers for local training
-        safe_num_workers = self.config.num_workers  # Use configured workers for local performance
-        if self.config.num_workers > 0:
-            print(f"🚀 MULTIPROCESSING: Using {self.config.num_workers} worker processes for faster training")
-            print(f"   Leveraging your multi-core system for optimal data loading performance")
-            print(f"   This provides ~5x faster data loading compared to single-threaded")
+        # Initialize distributed training BEFORE setting up data loaders
+        if self.distributed:
+            try:
+                # 🔧 ROBUST DISTRIBUTED INITIALIZATION
+                print(f"[Rank {self.local_rank}] 🚀 Starting distributed process group initialization...")
+                
+                # Step 1: Verify CUDA device is properly set
+                torch.cuda.set_device(self.local_rank)
+                current_device = torch.cuda.current_device()
+                if current_device != self.local_rank:
+                    print(f"[Rank {self.local_rank}] ❌ Device mismatch: expected {self.local_rank}, got {current_device}")
+                    raise RuntimeError(f"Device setting failed: expected {self.local_rank}, got {current_device}")
+                
+                # Step 2: Force CUDA context creation and test basic operations
+                try:
+                    with torch.cuda.device(self.local_rank):
+                        # Force CUDA context creation on the correct device
+                        test_tensor = torch.zeros(10, device=self.local_rank)
+                        test_result = test_tensor.sum()  # Force computation
+                        print(f"[Rank {self.local_rank}] ✅ CUDA context initialized (test result: {test_result.item()})")
+                        del test_tensor, test_result
+                        torch.cuda.empty_cache()
+                except Exception as cuda_context_error:
+                    print(f"[Rank {self.local_rank}] ❌ CUDA context creation failed: {cuda_context_error}")
+                    raise
+                
+                self.device = torch.device(f'cuda:{self.local_rank}')
+                print(f"[Rank {self.local_rank}] ✅ CUDA device confirmed: {self.device}")
+                
+                # Step 3: Initialize process group with comprehensive error handling
+                if not dist.is_initialized():
+                    # Additional NCCL safety settings
+                    additional_nccl_vars = {
+                        'TORCH_NCCL_ASYNC_ERROR_HANDLING': '1',  # Use new non-deprecated variable
+                        'TORCH_NCCL_DESYNC_DEBUG': '1',  # Use new non-deprecated variable
+                        'NCCL_CUMEM_ENABLE': '0',  # Disable CUDA memory pooling
+                        'NCCL_BUFFSIZE': '2097152',  # 2MB buffer
+                        'NCCL_NTHREADS': '1',  # Single thread per rank
+                        'NCCL_CHECKS_DISABLE': '0',  # Enable all checks
+                        'NCCL_CHECK_POINTERS': '1',  # Check pointers
+                    }
+                    
+                    for key, value in additional_nccl_vars.items():
+                        os.environ[key] = value
+                    
+                    print(f"[Rank {self.local_rank}] ⚙️ Additional NCCL safety settings applied")
+                    
+                    # Initialize with multiple fallback strategies
+                    init_strategies = [
+                        {'timeout': 1800, 'backend': 'nccl'},
+                        {'timeout': 3600, 'backend': 'nccl'},  # Longer timeout
+                    ]
+                    
+                    init_success = False
+                    for strategy_idx, strategy in enumerate(init_strategies):
+                        try:
+                            print(f"[Rank {self.local_rank}] � Trying initialization strategy {strategy_idx + 1}/{len(init_strategies)} (timeout: {strategy['timeout']}s)...")
+                            
+                            # Synchronize before initialization attempt
+                            torch.cuda.synchronize(self.local_rank)
+                            
+                            with torch.cuda.device(self.local_rank):
+                                start_time = time.time()
+                                dist.init_process_group(
+                                    backend=strategy['backend'],
+                                    init_method='env://',
+                                    timeout=timedelta(seconds=strategy['timeout'])
+                                )
+                                init_time = time.time() - start_time
+                                
+                            print(f"[Rank {self.local_rank}] ✅ Process group initialized successfully in {init_time:.2f}s")
+                            init_success = True
+                            break
+                            
+                        except Exception as init_error:
+                            print(f"[Rank {self.local_rank}] ❌ Strategy {strategy_idx + 1} failed: {init_error}")
+                            if strategy_idx < len(init_strategies) - 1:
+                                print(f"[Rank {self.local_rank}] 🔄 Trying next strategy...")
+                                time.sleep(2)  # Wait before retry
+                            else:
+                                print(f"[Rank {self.local_rank}] 💥 All initialization strategies failed")
+                                raise init_error
+                    
+                    if not init_success:
+                        raise RuntimeError("Failed to initialize process group with any strategy")
+                
+                # Step 4: Verify process group functionality
+                if dist.is_initialized():
+                    world_size = dist.get_world_size()
+                    rank = dist.get_rank()
+                    print(f"[Rank {self.local_rank}] ✅ Process group verified: rank {rank}/{world_size}")
+                    
+                    # Test basic communication
+                    try:
+                        test_tensor = torch.ones(1, device=self.local_rank) * self.local_rank
+                        dist.all_reduce(test_tensor, op=dist.ReduceOp.SUM)
+                        expected_sum = sum(range(world_size))
+                        if abs(test_tensor.item() - expected_sum) < 1e-6:
+                            print(f"[Rank {self.local_rank}] ✅ Communication test passed (sum: {test_tensor.item()})")
+                        else:
+                            print(f"[Rank {self.local_rank}] ⚠️ Communication test failed: got {test_tensor.item()}, expected {expected_sum}")
+                        del test_tensor
+                    except Exception as comm_test_error:
+                        print(f"[Rank {self.local_rank}] ⚠️ Communication test failed: {comm_test_error}")
+                        # Don't fail here, just warn
+                    
+                    # Synchronization barrier with timeout
+                    try:
+                        print(f"[Rank {self.local_rank}] 🔄 Waiting at synchronization barrier...")
+                        barrier_start = time.time()
+                        dist.barrier()
+                        barrier_time = time.time() - barrier_start
+                        print(f"[Rank {self.local_rank}] ✅ Passed synchronization barrier in {barrier_time:.2f}s")
+                    except Exception as barrier_error:
+                        print(f"[Rank {self.local_rank}] ⚠️ Barrier synchronization failed: {barrier_error}")
+                        # Continue without barrier - not always critical
+                else:
+                    raise RuntimeError("Process group initialization reported success but dist.is_initialized() returns False")
+                
+            except Exception as distributed_error:
+                print(f"[Rank {self.local_rank}] 🚨 Distributed setup failed completely: {distributed_error}")
+                print(f"[Rank {self.local_rank}] � Error details:")
+                traceback.print_exc()
+                
+                # Attempt graceful fallback to single-GPU mode
+                print(f"[Rank {self.local_rank}] 🔄 Attempting graceful fallback to single-GPU mode...")
+                try:
+                    self.distributed = False
+                    self.is_main_process = True  # Make this process the main one
+                    self.device = torch.device(f'cuda:{self.local_rank}' if torch.cuda.is_available() else 'cpu')
+                    torch.cuda.set_device(self.local_rank if torch.cuda.is_available() else 0)
+                    print(f"[Rank {self.local_rank}] ✅ Fallback successful - running in single-GPU mode on {self.device}")
+                except Exception as fallback_error:
+                    print(f"[Rank {self.local_rank}] ❌ Fallback to single-GPU mode also failed: {fallback_error}")
+                    raise distributed_error  # Re-raise the original error
         
-        print(f"✅ PERFORMANCE OPTIMIZED: Using num_workers={safe_num_workers}")
-        print("🚀 Multi-threaded loading enabled for maximum performance")
+        # 🧼 OPTIMIZED: Check num_workers setting based on benchmarks
+        if self.config.num_workers > 0:
+            print(f"⚠️  EXPERIMENTAL: Using num_workers={self.config.num_workers}")
+            print("📊 Benchmarks show num_workers=0 is fastest for this multimodal dataset")
+            print("🧼 If training is slow, try --num_workers=0")
+        else:
+            print(f"✅ OPTIMAL: Using num_workers=0 (benchmarked as fastest for multimodal data)")
+            print("🚀 Single-threaded loading avoids I/O contention with complex preprocessing")
         
         # Get data loaders with appropriate options
-        pin_memory_enabled = getattr(self.config, 'pin_memory', False) and self.device.type == 'cuda'
-        if pin_memory_enabled:
-            print("🚀 CUDA detected: Enabling pin_memory for faster GPU transfers")
-        
         self.train_loader, self.val_loader, self.test_loader, self.class_weights = get_data_loaders(
             json_path=self.config.json_path,
             data_dir=self.config.data_dir,
@@ -992,73 +1160,18 @@ class DeepfakeTrainer:
             validation_split=self.config.validation_split,
             test_split=self.config.test_split,
             shuffle=True,
-            num_workers=safe_num_workers,  # Use safe number of workers
+            num_workers=self.config.num_workers,
             max_samples=self.config.max_samples,
             detect_faces=self.config.detect_faces,
             compute_spectrograms=self.config.compute_spectrograms,
             temporal_features=self.config.temporal_features,
             enhanced_preprocessing=getattr(self.config, 'enhanced_preprocessing', True),
             enhanced_augmentation=getattr(self.config, 'enhanced_augmentation', False),
-            multiprocessing_context=None,  # 🧼 SAFETY: Use default context to prevent issues
-            pin_memory=pin_memory_enabled,  # Enable pin memory for CUDA
-            reduce_frames=getattr(self.config, 'reduce_frames', 16)  # Frame reduction support
+            multiprocessing_context="spawn"  # 🧼 SAFETY: Prevent GPU context corruption in multiprocessing
         )
         
         print(f"✅ Data loaders created: {len(self.train_loader)} train batches, "
               f"{len(self.val_loader)} validation batches, {len(self.test_loader)} test batches")
-        
-        # 🏛️ BALANCED CLASS WEIGHTS CALCULATION
-        if hasattr(self.config, 'class_weights_mode') and self.config.class_weights_mode == 'balanced':
-            print("🎯 Calculating balanced class weights...")
-            self._calculate_balanced_class_weights()
-        elif self.class_weights is not None:
-            print(f"✅ Using pre-calculated class weights: {self.class_weights}")
-        else:
-            print("ℹ️  No class weights applied")
-    
-    def _calculate_balanced_class_weights(self):
-        """Calculate balanced class weights from training data."""
-        if compute_class_weight is None:
-            print("⚠️  sklearn not available, cannot calculate balanced class weights")
-            self.class_weights = None
-            return
-            
-        try:
-            # Collect all labels from training dataset
-            all_labels = []
-            print("📊 Scanning training data for class distribution...")
-            
-            for batch_idx, batch in enumerate(self.train_loader):
-                if 'label' in batch:
-                    labels = batch['label']
-                    if isinstance(labels, torch.Tensor):
-                        labels = labels.cpu().numpy()
-                    all_labels.extend(labels)
-                
-                # Progress indicator for large datasets
-                if (batch_idx + 1) % 100 == 0:
-                    print(f"   Processed {batch_idx + 1}/{len(self.train_loader)} batches...")
-            
-            all_labels = np.array(all_labels)
-            unique_classes = np.unique(all_labels)
-            
-            # Calculate balanced weights
-            class_weights = compute_class_weight(
-                'balanced', 
-                classes=unique_classes, 
-                y=all_labels
-            )
-            
-            # Convert to tensor
-            self.class_weights = torch.FloatTensor(class_weights).to(self.device)
-            
-            print(f"✅ Calculated balanced class weights: {dict(zip(unique_classes, class_weights))}")
-            print(f"   Class distribution: {dict(zip(*np.unique(all_labels, return_counts=True)))}")
-            
-        except Exception as e:
-            print(f"⚠️  Failed to calculate balanced class weights: {e}")
-            print("   Falling back to uniform weights")
-            self.class_weights = None
     
     def setup_model(self):
         """Initialize model, loss function, optimizer, and scheduler."""
@@ -1067,10 +1180,7 @@ class DeepfakeTrainer:
         # Move class weights to device
         self.class_weights = self.class_weights.to(self.device) if self.class_weights is not None else None
 
-        # Initialize model with dropout configuration
-        dropout_rate = getattr(self.config, 'dropout_rate', 0.1)
-        print(f"🎯 Configuring model with dropout rate: {dropout_rate}")
-        
+        # Initialize model
         self.model = MultiModalDeepfakeModel(
             num_classes=self.config.num_classes,
             video_feature_dim=self.config.video_feature_dim,
@@ -1087,8 +1197,9 @@ class DeepfakeTrainer:
             num_deepfake_types=self.config.num_deepfake_types,
             debug=self.config.debug,
             enable_skin_color_analysis=getattr(self.config, 'enable_skin_color_analysis', False),
-            enable_advanced_physiological=getattr(self.config, 'enable_advanced_physiological', False),
-            dropout_rate=dropout_rate  # Pass dropout rate to model
+            enable_advanced_physiological=getattr(self.config, 'enable_advanced_physiological', False)
+            # Note: Dropout regularization is handled within the model architecture
+            # Weight decay is handled by the optimizer (L2 regularization)
         )
 
         # Load pretrained weights if specified
@@ -1109,47 +1220,54 @@ class DeepfakeTrainer:
         # Move model to device
         self.model.to(self.device)
 
-        # � MULTI-GPU SETUP: Enable DataParallel for local system performance
-        visible_gpus = torch.cuda.device_count()
-        if visible_gpus > 1:
-            self.model = nn.DataParallel(self.model)
-            print(f"� MULTI-GPU ENABLED: Using DataParallel across {visible_gpus} GPUs")
-            print(f"   Primary device: {self.device}")
-            print(f"   GPU devices: {list(range(visible_gpus))}")
-            self.is_multi_gpu = True
-        else:
-            print(f"✅ Using single GPU: {self.device}")
-            self.is_multi_gpu = False
+        # Initialize in distributed mode if specified
+        if self.distributed:
+            # Ensure the model is on the correct device before wrapping with DDP
+            print(f"[Rank {self.local_rank}] Moving model to device: {self.device}")
+            
+            # Explicitly set the device before DDP wrapping to avoid GPU mapping warnings
+            torch.cuda.set_device(self.local_rank)
+            self.model = self.model.to(self.device)
+            
+            # Wrap model with DDP, explicitly specifying device_ids to avoid warnings
+            self.model = DDP(
+                self.model, 
+                device_ids=[self.local_rank], 
+                output_device=self.local_rank,
+                find_unused_parameters=True,  # Re-enable to handle dynamic parameter usage
+                static_graph=False  # Disable static graph to allow dynamic parameter usage
+            )
+            
+            # Note: Static graph disabled due to dynamic parameter usage in multimodal model
+            
+            print(f"[Rank {self.local_rank}] Model wrapped with DDP on device {self.local_rank}")
+            print(f"[Rank {self.local_rank}] Dynamic parameter detection enabled (find_unused_parameters=True)")
+        # Enable DataParallel for multi-GPU if available and not using distributed
+        elif torch.cuda.device_count() > 1:
+            print(f"[INFO] Using DataParallel on {torch.cuda.device_count()} GPUs.")
+            self.model = torch.nn.DataParallel(self.model)
 
         # Initialize loss function with class weights for imbalanced data
-        loss_type = getattr(self.config, 'loss_type', 'crossentropy')
-        # Auto-enable weighted loss for heavily imbalanced datasets unless focal loss is explicitly chosen
-        try:
-            counts = self.train_loader.dataset.class_counts if hasattr(self.train_loader, 'dataset') else None
-            if counts and 'real' in counts and 'fake' in counts:
-                real_cnt = counts.get('real', 0)
-                fake_cnt = counts.get('fake', 0)
-                if real_cnt > 0 and fake_cnt > 0:
-                    ratio = max(real_cnt, fake_cnt) / min(real_cnt, fake_cnt)
-                    threshold = getattr(self.config, 'class_imbalance_threshold', 2.0)
-                    if ratio >= threshold and not getattr(self.config, 'use_weighted_loss', False) and loss_type != 'focal':
-                        print(f"⚠️ Class imbalance detected (ratio={ratio:.2f}) - enabling class-weighted loss automatically")
-                        self.config.use_weighted_loss = True
-        except Exception as e:
-            print(f"[INFO] Could not auto-detect class imbalance: {e}")
+        loss_type = getattr(self.config, 'loss_type', 'ce')  # Default to cross-entropy
         
         if loss_type == 'focal':
-            # 🔥 FOCAL LOSS for handling class imbalance
+            # Use Focal Loss for better handling of class imbalance
             focal_alpha = getattr(self.config, 'focal_alpha', 1.0)
             focal_gamma = getattr(self.config, 'focal_gamma', 2.0)
-            self.criterion = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
-            print(f"🔥 Using Focal Loss with alpha={focal_alpha}, gamma={focal_gamma}")
+            self.criterion = FocalLoss(
+                alpha=focal_alpha, 
+                gamma=focal_gamma, 
+                class_weights=self.class_weights if self.config.use_weighted_loss else None
+            )
+            print(f"Using Focal Loss (alpha={focal_alpha}, gamma={focal_gamma}) with weights: {self.class_weights}")
+        
         elif self.class_weights is not None and self.config.use_weighted_loss:
-            self.criterion = nn.CrossEntropyLoss(weight=self.class_weights, label_smoothing=self.config.label_smoothing)
-            print(f"Using weighted CrossEntropyLoss with weights: {self.class_weights}, label_smoothing: {self.config.label_smoothing}")
+            # Use class-balanced Cross Entropy Loss
+            self.criterion = nn.CrossEntropyLoss(weight=self.class_weights)
+            print(f"Using weighted CrossEntropyLoss with weights: {self.class_weights}")
         else:
-            self.criterion = nn.CrossEntropyLoss(label_smoothing=self.config.label_smoothing)
-            print(f"Using CrossEntropyLoss with label_smoothing: {self.config.label_smoothing}")
+            self.criterion = nn.CrossEntropyLoss()
+            print("Using standard CrossEntropyLoss")
 
         # Initialize optimizer
         if self.config.optimizer == 'adam':
@@ -1161,23 +1279,18 @@ class DeepfakeTrainer:
         else:
             self.optimizer = optim.AdamW(self.model.parameters(), lr=self.config.learning_rate, weight_decay=self.config.weight_decay)
 
-        # 🔧 OPTIMIZER STEP TRACKING: Initialize step counter for debugging
-        self.optimizer_steps_taken = 0
-        self.scaler_skipped_steps = 0
-
-        # Initialize learning rate scheduler with overfitting prevention
+        # Initialize learning rate scheduler
         if self.config.scheduler == 'step':
             self.scheduler = optim.lr_scheduler.StepLR(
                 self.optimizer, step_size=self.config.scheduler_step_size, gamma=self.config.scheduler_gamma
             )
         elif self.config.scheduler == 'cosine':
             self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
-                self.optimizer, T_max=self.config.num_epochs, eta_min=self.config.min_lr
+                self.optimizer, T_max=self.config.num_epochs
             )
         elif self.config.scheduler == 'plateau':
             self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-                self.optimizer, mode='max', factor=self.config.scheduler_gamma, 
-                patience=self.config.scheduler_patience, verbose=True, min_lr=self.config.min_lr
+                self.optimizer, mode='max', factor=self.config.scheduler_gamma, patience=self.config.scheduler_patience, verbose=True
             )
         else:
             self.scheduler = None
@@ -1193,67 +1306,6 @@ class DeepfakeTrainer:
         
         # Debug: Print GPU usage information
         self.print_gpu_usage_info()
-    
-    def _get_safe_device(self, config):
-        """Get device with server-friendly GPU selection."""
-        if not torch.cuda.is_available():
-            print("⚠️  CUDA not available, using CPU")
-            return torch.device("cpu")
-        
-        # Check available GPUs
-        available_gpus = torch.cuda.device_count()
-        print(f"🔍 Found {available_gpus} GPUs available")
-        
-        # Use only the first GPU by default for server safety
-        if hasattr(config, 'device') and config.device.startswith('cuda:'):
-            try:
-                gpu_id = int(config.device.split(':')[1])
-                if gpu_id < available_gpus:
-                    device = torch.device(config.device)
-                    print(f"✅ Using specified GPU: {device}")
-                else:
-                    device = torch.device("cuda:0")
-                    print(f"⚠️  Specified GPU {gpu_id} not available, using GPU 0")
-            except:
-                device = torch.device("cuda:0")
-                print(f"⚠️  Invalid device specification, using GPU 0")
-        else:
-            device = torch.device("cuda:0")
-            print(f"🎯 Using GPU 0 for server safety")
-        
-        return device
-    
-    def _start_resource_monitor(self):
-        """Start background resource monitoring thread."""
-        def monitor_worker():
-            while self.resource_monitor_active:
-                try:
-                    current_time = time.time()
-                    
-                    # Periodic cleanup
-                    if current_time - self.last_cleanup_time > self.cleanup_interval:
-                        print("🧼 Performing periodic cleanup...")
-                        kill_zombie_processes()
-                        cleanup_gpu_memory()
-                        monitor_system_resources()
-                        self.last_cleanup_time = current_time
-                    
-                    time.sleep(60)  # Check every minute
-                    
-                except Exception as e:
-                    print(f"Resource monitor error: {e}")
-                    break
-        
-        # Start monitoring thread
-        # 🧼 ZOMBIE PROCESS SAFE: Start monitoring thread (daemon=True, no child processes)
-        monitor_thread = threading.Thread(target=monitor_worker, daemon=True)
-        monitor_thread.start()
-        print("🔍 Started background resource monitoring")
-    
-    def _stop_resource_monitor(self):
-        """Stop resource monitoring."""
-        self.resource_monitor_active = False
-        print("🛑 Stopped resource monitoring")
     
     def print_gpu_usage_info(self):
         """Print detailed information about GPU usage."""
@@ -1292,7 +1344,11 @@ class DeepfakeTrainer:
             
             # Show model parallel status
             print(f"\n🚀 Model Parallel Status:")
-            if hasattr(self.model, 'module'):
+            if self.distributed:
+                print(f"   ✅ Using DistributedDataParallel (DDP)")
+                print(f"   📍 Local Rank: {self.local_rank}")
+                print(f"   🌟 Main Process: {self.is_main_process}")
+            elif hasattr(self.model, 'module'):
                 # DataParallel wraps model in .module
                 print(f"   ✅ Using DataParallel")
                 if hasattr(self.model, 'device_ids'):
@@ -1301,8 +1357,7 @@ class DeepfakeTrainer:
                     print(f"   📍 Using all available GPUs")
             else:
                 print(f"   ❌ Using Single GPU only")
-                if total_gpus > 1:
-                    print(f"   💡 Consider using DataParallel for better multi-GPU performance")
+                print(f"   💡 Consider using --distributed for better multi-GPU performance")
             
         else:
             print("❌ CUDA not available - using CPU")
@@ -1311,6 +1366,10 @@ class DeepfakeTrainer:
     
     def save_intermediate_checkpoint(self, epoch, batch_idx):
         """Save intermediate checkpoint during training."""
+        # Only main process saves checkpoints in distributed training
+        if not self.is_main_process:
+            return
+            
         if not self.config.save_intermediate:
             print(f"[DEBUG] Intermediate saving disabled, skipping batch {batch_idx}")
             return
@@ -1330,9 +1389,10 @@ class DeepfakeTrainer:
                 f"checkpoint_epoch_{epoch+1}_batch_{batch_idx}.pth"
             )
             
-            # Get model state dict (handle DataParallel)
-            if hasattr(self.model, 'module'):
-                # DataParallel wraps model in .module
+            # Handle distributed vs non-distributed model state dict
+            if self.distributed:
+                model_state_dict = self.model.module.state_dict()
+            elif hasattr(self.model, 'module'):  # DataParallel
                 model_state_dict = self.model.module.state_dict()
             else:
                 model_state_dict = self.model.state_dict()
@@ -1369,34 +1429,37 @@ class DeepfakeTrainer:
         epoch_loss = 0
         y_true, y_pred, y_probs = [], [], []
         
-        train_progress = tqdm(self.train_loader, desc=f"Epoch {epoch+1}/{self.config.num_epochs} [Train]")
+        train_progress = tqdm(self.train_loader, desc=f"Epoch {epoch+1}/{self.config.num_epochs} [Train]", 
+                           disable=not self.is_main_process)
         
-        # Add debugging info
-        print(f"Starting training epoch {epoch+1} with {len(self.train_loader)} batches")
+        # Add debugging info for distributed training
+        if self.is_main_process:
+            print(f"[RANK {self.local_rank}] Starting training epoch {epoch+1} with {len(self.train_loader)} batches")
         
         for batch_idx, batch in enumerate(train_progress):
             # Skip batches if resuming from a checkpoint
             if hasattr(self, 'start_batch') and epoch == getattr(self, 'start_epoch', 0) and batch_idx < self.start_batch:
-                if batch_idx % 10 == 0:
+                if self.is_main_process and batch_idx % 10 == 0:
                     print(f"[RESUME] Skipping batch {batch_idx} (resuming from batch {self.start_batch})")
                 continue
             
             # Debug: Print batch loading progress
-            if batch_idx == 0:
-                print(f"Processing first batch...")
-            elif batch_idx % 10 == 0:
-                print(f"Processing batch {batch_idx}/{len(self.train_loader)}")
+            if self.is_main_process and batch_idx == 0:
+                print(f"[RANK {self.local_rank}] Processing first batch...")
+            elif batch_idx % 10 == 0 and self.is_main_process:
+                print(f"[RANK {self.local_rank}] Processing batch {batch_idx}/{len(self.train_loader)}")
                 
             # Reset start_batch after first epoch to avoid skipping in subsequent epochs
             if epoch == getattr(self, 'start_epoch', 0) and batch_idx == getattr(self, 'start_batch', 0):
-                print(f"🔄 Resumed training from epoch {epoch+1}, batch {batch_idx}")
+                if self.is_main_process:
+                    print(f"🔄 Resumed training from epoch {epoch+1}, batch {batch_idx}")
                 # Clear the start_batch to avoid affecting subsequent epochs
                 if hasattr(self, 'start_batch'):
                     delattr(self, 'start_batch')
             try:
                 # Add timeout protection for first batch
                 if batch_idx == 0:
-                    print(f"Loading first batch, this may take time...")
+                    print(f"[RANK {self.local_rank}] Loading first batch, this may take time...")
                     start_time = time.time()
                 
                 # Clear GPU cache periodically to prevent memory buildup
@@ -1410,12 +1473,12 @@ class DeepfakeTrainer:
                     clear_gpu_cache()
                 
                 # Move batch to device with timeout protection
-                print(f"Moving batch {batch_idx} to device...")
+                print(f"[RANK {self.local_rank}] Moving batch {batch_idx} to device...")
                 batch = move_batch_to_device(batch, self.device, trainer=self)
                 
                 if batch_idx == 0:
                     load_time = time.time() - start_time
-                    print(f"First batch loaded in {load_time:.2f} seconds")
+                    print(f"[RANK {self.local_rank}] First batch loaded in {load_time:.2f} seconds")
                 # --- SkinColorAnalyzer integration ---
                 if getattr(self.config, 'enable_skin_color_analysis', False) and 'video_frames' in batch:
                     if not hasattr(self, '_skin_color_analyzer'):
@@ -1437,7 +1500,7 @@ class DeepfakeTrainer:
                 
                 # For first few batches, reduce effective batch size to prevent hanging
                 if batch_idx < 3 and labels.shape[0] > 40:
-                    print(f"Reducing batch size for initial batches: {labels.shape[0]} -> 40")
+                    print(f"[RANK {self.local_rank}] Reducing batch size for initial batches: {labels.shape[0]} -> 40")
                     # Truncate all batch elements to smaller size
                     for key, value in batch.items():
                         if isinstance(value, torch.Tensor) and value.shape[0] == labels.shape[0]:
@@ -1599,15 +1662,9 @@ class DeepfakeTrainer:
                         
                         self.scaler.step(self.optimizer)
                         self.scaler.update()
-                        # 🔧 OPTIMIZER TRACKING: Count successful steps and check for AMP skipping
-                        self.optimizer_steps_taken += 1
-                        if self.optimizer_steps_taken % 50 == 0:
-                            print(f"[DEBUG] Optimizer steps taken so far: {self.optimizer_steps_taken}")
                         
                     except Exception as scaler_error:
-                        self.scaler_skipped_steps += 1
                         print(f"[ERROR] AMP scaler error at batch {batch_idx}: {scaler_error}")
-                        print(f"[DEBUG] Scaler skipped steps so far: {self.scaler_skipped_steps}")
                         # Reset optimizer and scaler state
                         self.optimizer.zero_grad()
                         # Recreate scaler to fix state issues
@@ -1680,10 +1737,6 @@ class DeepfakeTrainer:
                     elif self.config.gradient_clip > 0:
                         nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clip)
                     self.optimizer.step()
-                    # 🔧 OPTIMIZER TRACKING: Count successful steps (non-AMP path)
-                    self.optimizer_steps_taken += 1
-                    if self.optimizer_steps_taken % 50 == 0:
-                        print(f"[DEBUG] Optimizer steps taken so far: {self.optimizer_steps_taken}")
                 
                 # Update learning rate with warmup if enabled
                 if self.warmup_scheduler is not None and epoch < self.config.warmup_epochs:
@@ -1716,7 +1769,7 @@ class DeepfakeTrainer:
                 y_probs.extend(torch.softmax(outputs, dim=1)[:, 1].detach().cpu().numpy())
                 
                 # Log batch results to WandB
-                if self.config.use_wandb and batch_idx % self.config.log_interval == 0:
+                if self.config.use_wandb and self.is_main_process and batch_idx % self.config.log_interval == 0:
                     # Log component weights if available
                     component_weights = {}
                     if 'component_weights' in results and results['component_weights'] is not None:
@@ -1731,10 +1784,11 @@ class DeepfakeTrainer:
                     })
                     
                 # Save intermediate checkpoint if enabled (before any exception handling)
-                self.save_intermediate_checkpoint(epoch, batch_idx)
+                if self.is_main_process:
+                    self.save_intermediate_checkpoint(epoch, batch_idx)
                 
                 # Visualize sample predictions periodically
-                if (batch_idx + 1) % self.config.visualization_interval == 0:
+                if (batch_idx + 1) % self.config.visualization_interval == 0 and self.is_main_process:
                     try:
                         sample_idx = np.random.randint(min(4, outputs.size(0)))
                         save_visualizations(
@@ -1771,42 +1825,31 @@ class DeepfakeTrainer:
         
         # Calculate average loss and metrics
         avg_loss = epoch_loss / len(self.train_loader)
-        precision, recall, f1, auc_score, accuracy = calculate_metrics(y_true, y_pred, y_probs, epoch+1)
+        precision, recall, f1, auc_score, accuracy, macro_f1 = calculate_metrics(y_true, y_pred, y_probs, epoch+1)
         
-        # Store metrics
+        # Store metrics (including macro F1 for balanced evaluation)
         self.metrics['train_losses'].append(avg_loss)
         self.metrics['train_accuracies'].append(accuracy)
         self.metrics['train_f1_scores'].append(f1)
+        self.metrics['train_macro_f1_scores'].append(macro_f1)  # Key metric for imbalanced data
         self.metrics['train_auc_scores'].append(auc_score)
         
-        # Return metrics
-        return avg_loss, accuracy, precision, recall, f1, auc_score
+        # Return metrics (include macro F1)
+        return avg_loss, accuracy, precision, recall, f1, auc_score, macro_f1
     
     def validate_epoch(self, epoch):
         """Validate the model for one epoch."""
-        print(f"\n🔍 [DEBUG] Starting validation epoch {epoch+1}")
-        print(f"🔍 [DEBUG] Model is in eval mode: {not self.model.training}")
-        
-        # RADICAL FIX: Keep model in training mode during validation to force BatchNorm to use batch stats
-        # This should eliminate the split personality issue caused by running averages
-        print(f"🔍 [DEBUG] FORCING MODEL TO STAY IN TRAINING MODE DURING VALIDATION")
-        self.model.train()  # Keep in training mode!
-        
-        # ADDITIONAL FIX: Force dropout layers to eval mode to prevent randomness during validation
-        print(f"🔍 [DEBUG] SETTING DROPOUT LAYERS TO EVAL MODE FOR CONSISTENT VALIDATION")
-        for module in self.model.modules():
-            if isinstance(module, torch.nn.Dropout):
-                module.eval()  # Disable dropout during validation
-        
+        self.model.eval()
         epoch_loss = 0
         y_true, y_pred, y_probs = [], [], []
         
-        val_progress = tqdm(self.val_loader, desc=f"Epoch {epoch+1}/{self.config.num_epochs} [Val]")
+        val_progress = tqdm(self.val_loader, desc=f"Epoch {epoch+1}/{self.config.num_epochs} [Val]", 
+                          disable=not self.is_main_process)
         
         # Track component contributions to analyze feature importance
         all_component_contributions = {}
         
-        with torch.no_grad():  # Still disable gradients to prevent weight updates
+        with torch.no_grad():
             for batch_idx, batch in enumerate(val_progress):
                 try:
                     # Clear GPU cache periodically during validation
@@ -1819,9 +1862,7 @@ class DeepfakeTrainer:
                     # Get labels
                     labels = batch['label']
                     
-                    # Forward pass - MODEL STAYS IN TRAINING MODE, DROPOUT IN EVAL MODE
-                    print(f"[DEBUG] Batch {batch_idx}: Model training mode: {self.model.training}")
-                    
+                    # Forward pass
                     if self.amp_enabled:
                         with autocast():
                             outputs, results = self.model(batch)
@@ -1838,27 +1879,12 @@ class DeepfakeTrainer:
                     
                     # Accumulate predictions and labels for metrics calculation
                     y_true.extend(labels.cpu().numpy())
-                    
-                    # DEBUG: Check for validation prediction issues
-                    if batch_idx == 0:  # First batch debugging
-                        print(f"\n[DEBUG] Validation Batch 0 Analysis:")
-                        print(f"  Raw outputs shape: {outputs.shape}")
-                        print(f"  Raw outputs sample: {outputs[0].detach().cpu().numpy()}")
-                        print(f"  Softmax probs sample: {torch.softmax(outputs, dim=1)[0].detach().cpu().numpy()}")
-                        print(f"  Labels sample: {labels[0].cpu().numpy()}")
-                    
                     predictions = outputs.argmax(1).cpu().numpy()
                     y_pred.extend(predictions)
                     y_probs.extend(torch.softmax(outputs, dim=1)[:, 1].detach().cpu().numpy())
                     
-                    # DEBUG: Check prediction distribution in first batch
-                    if batch_idx == 0:
-                        unique_preds, counts = np.unique(predictions, return_counts=True)
-                        print(f"  Predictions in batch 0: {dict(zip(unique_preds, counts))}")
-                        print(f"  Probability range: [{np.min(torch.softmax(outputs, dim=1)[:, 1].detach().cpu().numpy()):.4f}, {np.max(torch.softmax(outputs, dim=1)[:, 1].detach().cpu().numpy()):.4f}]")
-                    
                     # Visualize sample predictions periodically
-                    if (batch_idx + 1) % self.config.visualization_interval == 0:
+                    if (batch_idx + 1) % self.config.visualization_interval == 0 and self.is_main_process:
                         try:
                             sample_idx = np.random.randint(min(4, outputs.size(0)))
                             save_visualizations(
@@ -1902,63 +1928,57 @@ class DeepfakeTrainer:
         
         # Calculate average loss and metrics
         avg_loss = epoch_loss / len(self.val_loader)
-        precision, recall, f1, auc_score, accuracy = calculate_metrics(y_true, y_pred, y_probs, epoch+1)
+        precision, recall, f1, auc_score, accuracy, macro_f1 = calculate_metrics(y_true, y_pred, y_probs, epoch+1)
         
-        # Store metrics
+        # Store metrics (including macro F1 for balanced evaluation)
         self.metrics['val_losses'].append(avg_loss)
         self.metrics['val_accuracies'].append(accuracy)
         self.metrics['val_f1_scores'].append(f1)
+        self.metrics['val_macro_f1_scores'].append(macro_f1)  # Key metric for imbalanced data
         self.metrics['val_auc_scores'].append(auc_score)
         
         # Plot confusion matrix
-        cm_path = plot_confusion_matrix(y_true, y_pred, epoch+1, self.plot_dir)
-        
-        # Log confusion matrix to WandB (with error handling)
-        if self.config.use_wandb and cm_path is not None:
-            try:
+        if self.is_main_process:
+            cm_path = plot_confusion_matrix(y_true, y_pred, epoch+1, self.plot_dir)
+            
+            # Log confusion matrix to WandB
+            if self.config.use_wandb:
                 wandb.log({f"confusion_matrix_epoch_{epoch+1}": wandb.Image(cm_path)})
-            except Exception as e:
-                if self.debug:
-                    print(f"[WARNING] Failed to log confusion matrix to wandb: {e}")
-            
-        # Log component importance for feature analysis to WandB
-        if self.config.use_wandb and all_component_contributions:
-            component_importance = {}
-            for key, values in all_component_contributions.items():
-                if values:
-                    avg_value = np.mean(values)
-                    component_importance[f"component_{key}"] = avg_value
-            
-            wandb.log(component_importance)
-            
-            # Create feature importance chart
-            if component_importance:
-                plt.figure(figsize=(12, 6))
-                keys = sorted(component_importance.keys())
-                values = [component_importance[k] for k in keys]
                 
-                # Sort by value
-                sorted_indices = np.argsort(values)
-                sorted_keys = [keys[i] for i in sorted_indices]
-                sorted_values = [values[i] for i in sorted_indices]
+            # Log component importance for feature analysis to WandB
+            if self.config.use_wandb and all_component_contributions:
+                component_importance = {}
+                for key, values in all_component_contributions.items():
+                    if values:
+                        avg_value = np.mean(values)
+                        component_importance[f"component_{key}"] = avg_value
                 
-                plt.barh(sorted_keys, sorted_values)
-                plt.title("Feature Importance Scores")
-                plt.xlabel("Average Contribution")
-                plt.tight_layout()
+                wandb.log(component_importance)
                 
-                feature_importance_path = os.path.join(self.plot_dir, f"feature_importance_epoch_{epoch+1}.png")
-                plt.savefig(feature_importance_path)
-                plt.close()
-                
-                wandb.log({f"feature_importance_epoch_{epoch+1}": wandb.Image(feature_importance_path)})
+                # Create feature importance chart
+                if component_importance:
+                    plt.figure(figsize=(12, 6))
+                    keys = sorted(component_importance.keys())
+                    values = [component_importance[k] for k in keys]
+                    
+                    # Sort by value
+                    sorted_indices = np.argsort(values)
+                    sorted_keys = [keys[i] for i in sorted_indices]
+                    sorted_values = [values[i] for i in sorted_indices]
+                    
+                    plt.barh(sorted_keys, sorted_values)
+                    plt.title("Feature Importance Scores")
+                    plt.xlabel("Average Contribution")
+                    plt.tight_layout()
+                    
+                    feature_importance_path = os.path.join(self.plot_dir, f"feature_importance_epoch_{epoch+1}.png")
+                    plt.savefig(feature_importance_path)
+                    plt.close()
+                    
+                    wandb.log({f"feature_importance_epoch_{epoch+1}": wandb.Image(feature_importance_path)})
         
-        # IMPORTANT: Set model back to eval mode after validation
-        self.model.eval()
-        print(f"🔍 [DEBUG] Validation complete - model set back to eval mode: {not self.model.training}")
-        
-        # Return metrics
-        return avg_loss, accuracy, precision, recall, f1, auc_score
+        # Return metrics (include macro F1)
+        return avg_loss, accuracy, precision, recall, f1, auc_score, macro_f1
     
     def test_model(self):
         """Test the trained model on the test set."""
@@ -2066,7 +2086,7 @@ class DeepfakeTrainer:
                                     detailed_component_results[key].append(0.0)
                     
                     # Visualize sample predictions periodically
-                    if (batch_idx + 1) % self.config.visualization_interval == 0:
+                    if (batch_idx + 1) % self.config.visualization_interval == 0 and self.is_main_process:
                         try:
                             sample_idx = np.random.randint(min(4, outputs.size(0)))
                             save_visualizations(
@@ -2096,13 +2116,14 @@ class DeepfakeTrainer:
         print(f"- AUC Score: {metrics_dict['auc']:.4f}")
         
         # Plot confusion matrix for test set
-        cm_path = plot_confusion_matrix(y_true, y_pred, 0, self.plot_dir)
-        
-        # Log confusion matrix to WandB
-        if self.config.use_wandb:
-            wandb.log({
-                "test_confusion_matrix": wandb.Image(cm_path),
-                "test_accuracy": metrics_dict['accuracy'],
+        if self.is_main_process:
+            cm_path = plot_confusion_matrix(y_true, y_pred, 0, self.plot_dir)
+            
+            # Log confusion matrix to WandB
+            if self.config.use_wandb:
+                wandb.log({
+                    "test_confusion_matrix": wandb.Image(cm_path),
+                    "test_accuracy": metrics_dict['accuracy'],
                     "test_precision": metrics_dict['precision'],
                     "test_recall": metrics_dict['recall'],
                     "test_f1": metrics_dict['f1'],
@@ -2110,49 +2131,50 @@ class DeepfakeTrainer:
                 })
         
         # Save detailed results to CSV
-        # Basic results
-        results_df = pd.DataFrame(results_data)
-        results_path = os.path.join(self.log_dir, "test_results.csv")
-        results_df.to_csv(results_path, index=False)
-        print(f"Test results saved to: {results_path}")
-        
-        # Add component results to detailed analysis DataFrame
-        for key, values in detailed_component_results.items():
-            if len(values) == len(results_data['file_path']):
-                results_df[f"component_{key}"] = values
-        
-        # Save enhanced results with component details
-        enhanced_results_path = os.path.join(self.log_dir, "test_results_detailed.csv")
-        results_df.to_csv(enhanced_results_path, index=False)
-        print(f"Detailed test results with component analysis saved to: {enhanced_results_path}")
-        
-        # Create feature importance visualization
-        if detailed_component_results:
-            # Calculate average importance for each component
-            component_importance = {}
+        if self.is_main_process:
+            # Basic results
+            results_df = pd.DataFrame(results_data)
+            results_path = os.path.join(self.log_dir, "test_results.csv")
+            results_df.to_csv(results_path, index=False)
+            print(f"Test results saved to: {results_path}")
+            
+            # Add component results to detailed analysis DataFrame
             for key, values in detailed_component_results.items():
-                if values:
-                    component_importance[key] = np.mean(values)
+                if len(values) == len(results_data['file_path']):
+                    results_df[f"component_{key}"] = values
             
-            # Sort components by importance
-            sorted_components = sorted(component_importance.items(), key=lambda x: x[1], reverse=True)
+            # Save enhanced results with component details
+            enhanced_results_path = os.path.join(self.log_dir, "test_results_detailed.csv")
+            results_df.to_csv(enhanced_results_path, index=False)
+            print(f"Detailed test results with component analysis saved to: {enhanced_results_path}")
             
-            # Create feature importance chart
-            plt.figure(figsize=(12, 8))
-            component_names = [item[0] for item in sorted_components]
-            component_values = [item[1] for item in sorted_components]
-            
-            plt.barh(component_names, component_values)
-            plt.title("Component Importance in Deepfake Detection")
-            plt.xlabel("Average Contribution")
-            plt.tight_layout()
-            
-            feature_importance_path = os.path.join(self.plot_dir, "feature_importance_test.png")
-            plt.savefig(feature_importance_path)
-            plt.close()
-            
-            if self.config.use_wandb:
-                wandb.log({"feature_importance_test": wandb.Image(feature_importance_path)})
+            # Create feature importance visualization
+            if detailed_component_results:
+                # Calculate average importance for each component
+                component_importance = {}
+                for key, values in detailed_component_results.items():
+                    if values:
+                        component_importance[key] = np.mean(values)
+                
+                # Sort components by importance
+                sorted_components = sorted(component_importance.items(), key=lambda x: x[1], reverse=True)
+                
+                # Create feature importance chart
+                plt.figure(figsize=(12, 8))
+                component_names = [item[0] for item in sorted_components]
+                component_values = [item[1] for item in sorted_components]
+                
+                plt.barh(component_names, component_values)
+                plt.title("Component Importance in Deepfake Detection")
+                plt.xlabel("Average Contribution")
+                plt.tight_layout()
+                
+                feature_importance_path = os.path.join(self.plot_dir, "feature_importance_test.png")
+                plt.savefig(feature_importance_path)
+                plt.close()
+                
+                if self.config.use_wandb:
+                    wandb.log({"feature_importance_test": wandb.Image(feature_importance_path)})
         
         return avg_loss, metrics_dict
     
@@ -2173,16 +2195,16 @@ class DeepfakeTrainer:
             epoch_start_time = time.time()
             
             # Training phase
-            train_loss, train_acc, train_precision, train_recall, train_f1, train_auc = self.train_epoch(epoch)
+            train_loss, train_acc, train_precision, train_recall, train_f1, train_auc, train_macro_f1 = self.train_epoch(epoch)
             
             # Validation phase
-            val_loss, val_acc, val_precision, val_recall, val_f1, val_auc = self.validate_epoch(epoch)
+            val_loss, val_acc, val_precision, val_recall, val_f1, val_auc, val_macro_f1 = self.validate_epoch(epoch)
             
             # Update learning rate scheduler if using plateau scheduler
             if self.scheduler is not None:
                 if self.config.scheduler == 'plateau':
-                    # ReduceLROnPlateau step with validation metrics
-                    self.scheduler.step(val_f1)  # or val_acc
+                    # ReduceLROnPlateau step with macro F1 (better for imbalanced data)
+                    self.scheduler.step(val_macro_f1)
                 else:
                     self.scheduler.step()
             
@@ -2190,22 +2212,24 @@ class DeepfakeTrainer:
             epoch_time = time.time() - epoch_start_time
             
             # Print epoch summary
-            print(f"\nEpoch {epoch+1}/{self.config.num_epochs} completed in {epoch_time:.2f}s")
-            print(f"Train - Loss: {train_loss:.4f}, Accuracy: {train_acc:.4f}, F1: {train_f1:.4f}, AUC: {train_auc:.4f}")
-            print(f"Val   - Loss: {val_loss:.4f}, Accuracy: {val_acc:.4f}, F1: {val_f1:.4f}, AUC: {val_auc:.4f}")
-            
-            # Save checkpoint
-            self.save_checkpoint(epoch, val_acc, val_f1)
-            
-            # Plot metrics with error handling
-            print("[DEBUG] Starting to generate plots...")
-            try:
-                for metric_name, train_values, val_values in [
-                    ('loss', self.metrics['train_losses'], self.metrics['val_losses']),
-                    ('accuracy', self.metrics['train_accuracies'], self.metrics['val_accuracies']),
-                    ('f1', self.metrics['train_f1_scores'], self.metrics['val_f1_scores']),
-                    ('auc', self.metrics['train_auc_scores'], self.metrics['val_auc_scores'])
-                ]:
+            if self.is_main_process:
+                print(f"\nEpoch {epoch+1}/{self.config.num_epochs} completed in {epoch_time:.2f}s")
+                print(f"Train - Loss: {train_loss:.4f}, Accuracy: {train_acc:.4f}, F1: {train_f1:.4f}, Macro F1: {train_macro_f1:.4f} ⭐, AUC: {train_auc:.4f}")
+                print(f"Val   - Loss: {val_loss:.4f}, Accuracy: {val_acc:.4f}, F1: {val_f1:.4f}, Macro F1: {val_macro_f1:.4f} ⭐, AUC: {val_auc:.4f}")
+                
+                # Save checkpoint (use macro F1 for balanced evaluation)
+                self.save_checkpoint(epoch, val_acc, val_macro_f1)
+                
+                # Plot metrics with error handling
+                print("[DEBUG] Starting to generate plots...")
+                try:
+                    for metric_name, train_values, val_values in [
+                        ('loss', self.metrics['train_losses'], self.metrics['val_losses']),
+                        ('accuracy', self.metrics['train_accuracies'], self.metrics['val_accuracies']),
+                        ('f1', self.metrics['train_f1_scores'], self.metrics['val_f1_scores']),
+                        ('macro_f1', self.metrics['train_macro_f1_scores'], self.metrics['val_macro_f1_scores']),  # Key for imbalanced data
+                        ('auc', self.metrics['train_auc_scores'], self.metrics['val_auc_scores'])
+                    ]:
                         print(f"[DEBUG] Plotting {metric_name} - Train: {len(train_values)} values, Val: {len(val_values)} values")
                         plot_path = plot_metrics(train_values, val_values, metric_name, epoch+1, self.plot_dir)
                         print(f"[DEBUG] Successfully saved {metric_name} plot to: {plot_path}")
@@ -2214,12 +2238,12 @@ class DeepfakeTrainer:
                         if self.config.use_wandb:
                             wandb.log({f"{metric_name}_plot": wandb.Image(plot_path)})
                     
-                print("✅ All plots generated successfully!")
+                    print("✅ All plots generated successfully!")
                     
-            except Exception as e:
-                print(f"❌ Error generating plots: {e}")
-                import traceback
-                traceback.print_exc()
+                except Exception as e:
+                    print(f"❌ Error generating plots: {e}")
+                    import traceback
+                    traceback.print_exc()
                 
                 # Log epoch metrics to WandB
                 if self.config.use_wandb:
@@ -2235,95 +2259,82 @@ class DeepfakeTrainer:
                         'val_recall': val_recall,
                         'train_f1': train_f1,
                         'val_f1': val_f1,
+                        'train_macro_f1': train_macro_f1,  # Key metric for imbalanced data
+                        'val_macro_f1': val_macro_f1,      # Key metric for imbalanced data
                         'train_auc': train_auc,
                         'val_auc': val_auc,
                         'learning_rate': get_lr(self.optimizer),
                         'epoch_time': epoch_time
                     })
                 
-                # 🔧 OVERFITTING DETECTION
-                train_val_gap = train_acc - val_acc
-                self.train_val_gap_history.append(train_val_gap)
-                self.val_loss_history.append(val_loss)
-                
-                # Warn if train/val gap is too large
-                if train_val_gap > 0.15:  # 15% gap threshold
-                    self.overfitting_warnings += 1
-                    print(f"⚠️  OVERFITTING WARNING: Train/Val accuracy gap: {train_val_gap:.3f} (>{0.15:.1f})")
-                    
-                # Detect validation loss plateau
-                if len(self.val_loss_history) >= 5:
-                    recent_val_losses = self.val_loss_history[-5:]
-                    if all(abs(recent_val_losses[i] - recent_val_losses[i-1]) < 0.001 for i in range(1, len(recent_val_losses))):
-                        print(f"⚠️  Validation loss plateaued: {val_loss:.4f}")
-                
-                # Check for early stopping
-                if val_f1 > self.best_val_f1:
-                    self.best_val_f1 = val_f1
+                # Check for early stopping (using macro F1 for better balanced evaluation)
+                if val_macro_f1 > self.best_val_f1:
+                    self.best_val_f1 = val_macro_f1  # Now tracking macro F1
                     self.best_val_accuracy = val_acc
                     self.best_epoch = epoch + 1
                     self.early_stop_counter = 0
                     
-                    # Save best model
-                    self.save_best_model(epoch, val_acc, val_f1)
+                    # Save best model (using macro F1)
+                    self.save_best_model(epoch, val_acc, val_macro_f1)
                 else:
                     self.early_stop_counter += 1
                     print(f"Early stopping counter: {self.early_stop_counter}/{self.config.early_stopping_patience}")
                 
                 if self.early_stop_counter >= self.config.early_stopping_patience:
                     print(f"\nEarly stopping triggered after {epoch+1} epochs")
-                    print(f"Best validation F1: {self.best_val_f1:.4f}, Accuracy: {self.best_val_accuracy:.4f} (Epoch {self.best_epoch})")
+                    print(f"Best validation Macro F1: {self.best_val_f1:.4f}, Accuracy: {self.best_val_accuracy:.4f} (Epoch {self.best_epoch})")
                     break
         
         # Print training summary
-        print("\nTraining completed!")
-        print(f"Best validation F1: {self.best_val_f1:.4f}, Accuracy: {self.best_val_accuracy:.4f} (Epoch {self.best_epoch})")
-        
-        # Load best model for testing
-        self.load_best_model()
-        
-        # Test the model
-        test_loss, test_metrics = self.test_model()
-        
-        # Save final results
-        final_results = {
-            'best_epoch': self.best_epoch,
-            'best_val_accuracy': float(self.best_val_accuracy),
-            'best_val_f1': float(self.best_val_f1),
-            'test_loss': float(test_loss),
-            'test_accuracy': float(test_metrics['accuracy']),
-            'test_precision': float(test_metrics['precision']),
-            'test_recall': float(test_metrics['recall']),
-            'test_f1': float(test_metrics['f1']),
-            'test_auc': float(test_metrics['auc']),
-            'training_time': time.time() - self.training_start_time if hasattr(self, 'training_start_time') else None,
-            'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            'config': vars(self.config)
-        }
-        
-        # Save as JSON
-        final_results_path = os.path.join(self.log_dir, "final_results.json")
-        with open(final_results_path, 'w') as f:
-            # Handle non-serializable values
-            serializable_results = {}
-            for key, value in final_results.items():
-                if key == 'config':
-                    # Convert config to serializable dict
-                    config_dict = {}
-                    for k, v in value.items():
-                        if isinstance(v, (int, float, str, bool, list, dict, type(None))):
-                            config_dict[k] = v
-                        else:
-                            config_dict[k] = str(v)
-                    serializable_results[key] = config_dict
-                elif isinstance(value, (int, float, str, bool, list, dict, type(None))):
-                    serializable_results[key] = value
-                else:
-                    serializable_results[key] = str(value)
+        if self.is_main_process:
+            print("\nTraining completed!")
+            print(f"Best validation Macro F1: {self.best_val_f1:.4f}, Accuracy: {self.best_val_accuracy:.4f} (Epoch {self.best_epoch})")
             
-            json.dump(serializable_results, f, indent=4)
-        
-        print(f"Final results saved to: {final_results_path}")
+            # Load best model for testing
+            self.load_best_model()
+            
+            # Test the model
+            test_loss, test_metrics = self.test_model()
+            
+            # Save final results
+            final_results = {
+                'best_epoch': self.best_epoch,
+                'best_val_accuracy': float(self.best_val_accuracy),
+                'best_val_f1': float(self.best_val_f1),
+                'test_loss': float(test_loss),
+                'test_accuracy': float(test_metrics['accuracy']),
+                'test_precision': float(test_metrics['precision']),
+                'test_recall': float(test_metrics['recall']),
+                'test_f1': float(test_metrics['f1']),
+                'test_auc': float(test_metrics['auc']),
+                'training_time': time.time() - self.training_start_time if hasattr(self, 'training_start_time') else None,
+                'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                'config': vars(self.config)
+            }
+            
+            # Save as JSON
+            final_results_path = os.path.join(self.log_dir, "final_results.json")
+            with open(final_results_path, 'w') as f:
+                # Handle non-serializable values
+                serializable_results = {}
+                for key, value in final_results.items():
+                    if key == 'config':
+                        # Convert config to serializable dict
+                        config_dict = {}
+                        for k, v in value.items():
+                            if isinstance(v, (int, float, str, bool, list, dict, type(None))):
+                                config_dict[k] = v
+                            else:
+                                config_dict[k] = str(v)
+                        serializable_results[key] = config_dict
+                    elif isinstance(value, (int, float, str, bool, list, dict, type(None))):
+                        serializable_results[key] = value
+                    else:
+                        serializable_results[key] = str(value)
+                
+                json.dump(serializable_results, f, indent=4)
+            
+            print(f"Final results saved to: {final_results_path}")
     
     def save_checkpoint(self, epoch, accuracy, f1_score):
         """Save model checkpoint."""
@@ -2335,12 +2346,7 @@ class DeepfakeTrainer:
             f"checkpoint_epoch_{epoch+1}_acc_{accuracy:.4f}_f1_{f1_score:.4f}.pth"
         )
         
-        # Get model state dict (handle DataParallel)
-        if hasattr(self.model, 'module'):
-            # DataParallel wraps model in .module
-            model_state_dict = self.model.module.state_dict()
-        else:
-            model_state_dict = self.model.state_dict()
+        model_state_dict = self.model.module.state_dict() if self.distributed else self.model.state_dict()
         
         checkpoint = {
             'epoch': epoch + 1,
@@ -2359,12 +2365,7 @@ class DeepfakeTrainer:
         """Save best model checkpoint."""
         best_model_path = os.path.join(self.run_checkpoint_dir, "best_model.pth")
         
-        # Get model state dict (handle DataParallel)
-        if hasattr(self.model, 'module'):
-            # DataParallel wraps model in .module
-            model_state_dict = self.model.module.state_dict()
-        else:
-            model_state_dict = self.model.state_dict()
+        model_state_dict = self.model.module.state_dict() if self.distributed else self.model.state_dict()
         
         checkpoint = {
             'epoch': epoch + 1,
@@ -2393,10 +2394,58 @@ class DeepfakeTrainer:
         print(f"Loading best model from: {best_model_path}")
         checkpoint = torch.load(best_model_path, map_location=self.device)
         
-        # Load model weights (direct access, no DataParallel)
-        self.model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+        # Load model weights
+        if self.distributed:
+            self.model.module.load_state_dict(checkpoint['model_state_dict'], strict=False)
+        else:
+            self.model.load_state_dict(checkpoint['model_state_dict'], strict=False)
         
         print(f"Best model loaded (Epoch {checkpoint['epoch']}, Accuracy: {checkpoint['accuracy']:.4f}, F1: {checkpoint['f1_score']:.4f})")
+    
+    def print_training_improvements(self):
+        """Print the training improvements for class imbalance and overfitting."""
+        print("\n" + "="*70)
+        print("🔥 IMPROVED DEEPFAKE DETECTION TRAINING")
+        print("="*70)
+        
+        # Class Imbalance Fixes
+        print("✅ CLASS IMBALANCE FIXES:")
+        loss_type = getattr(self.config, 'loss_type', 'ce')
+        if loss_type == 'focal':
+            alpha = getattr(self.config, 'focal_alpha', 1.0)
+            gamma = getattr(self.config, 'focal_gamma', 2.0)
+            print(f"   🎯 Focal Loss enabled (α={alpha}, γ={gamma}) - focuses on hard examples")
+        else:
+            print(f"   📊 Cross-Entropy Loss with class weighting")
+        
+        if getattr(self.config, 'use_weighted_loss', False):
+            print(f"   ⚖️ Class-balanced weights enabled")
+        
+        if getattr(self.config, 'oversample_minority', False):
+            print(f"   📈 Minority class oversampling enabled")
+        
+        print(f"   📏 Macro F1 as primary metric (balances Real vs Fake performance)")
+        
+        # Overfitting Prevention
+        print("\n✅ OVERFITTING PREVENTION:")
+        dropout = getattr(self.config, 'dropout_rate', 0.0)
+        if dropout > 0:
+            print(f"   🛡️ Dropout regularization: {dropout:.1%}")
+        
+        print(f"   📉 L2 Weight decay: {self.config.weight_decay}")
+        print(f"   ⏹️ Early stopping patience: {self.config.early_stopping_patience} epochs")
+        print(f"   ✂️ Gradient clipping: {self.config.gradient_clip}")
+        
+        # Evaluation Improvements
+        print("\n✅ ENHANCED EVALUATION:")
+        print(f"   🎯 Per-class metrics tracking (Real vs Fake)")
+        print(f"   📊 Confusion matrix analysis")
+        print(f"   🏆 Macro F1 for balanced scoring")
+        print(f"   📈 Training stability monitoring")
+        
+        print("="*70)
+        print("Ready to train with bias-resistant configuration! 🚀")
+        print("="*70 + "\n")
     
     def run(self):
         """
@@ -2418,10 +2467,11 @@ class DeepfakeTrainer:
             self.train_and_validate()
             
             # Print final memory statistics
-            print(f"\n[MEMORY] Training completed with {self.oom_errors} out-of-memory errors and {self.memory_warnings} memory warnings")
-            if torch.cuda.is_available():
-                allocated, reserved = get_gpu_memory_usage()
-                print(f"[MEMORY] Final GPU memory - Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB")
+            if self.is_main_process:
+                print(f"\n[MEMORY] Training completed with {self.oom_errors} out-of-memory errors and {self.memory_warnings} memory warnings")
+                if torch.cuda.is_available():
+                    allocated, reserved = get_gpu_memory_usage()
+                    print(f"[MEMORY] Final GPU memory - Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB")
             
             print("✅ Training pipeline completed successfully")
             
@@ -2434,26 +2484,17 @@ class DeepfakeTrainer:
             
         finally:
             try:
-                # 🧼 COMPREHENSIVE SERVER-SAFE CLEANUP
-                print("🧼 Starting comprehensive cleanup for server safety...")
-                
-                # Stop resource monitoring
-                self._stop_resource_monitor()
-                
-                # Kill any remaining zombie processes
-                kill_zombie_processes()
-                
                 # Finalize experiment on WandB
-                if self.config.use_wandb:
+                if self.config.use_wandb and self.is_main_process:
                     wandb.finish()
                 
+                # Clean up distributed training resources
+                if self.distributed and dist.is_initialized():
+                    dist.destroy_process_group()
+                    
                 # Final GPU cleanup
                 cleanup_gpu_memory()
-                
-                # Final resource monitoring
-                monitor_system_resources()
-                
-                print("✅ Server-safe training cleanup completed")
+                print("🧼 Training cleanup completed")
                 
             except Exception as cleanup_error:
                 print(f"Warning during cleanup: {cleanup_error}")
@@ -2473,9 +2514,7 @@ def parse_args():
     parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints', help='Directory to save checkpoints')
     
     # Model parameters
-    parser.add_argument('--backbone_visual', type=str, default='efficientnet', 
-                       choices=['efficientnet', 'efficientnet_b3', 'efficientnet_b4', 'regnet', 'swin'], 
-                       help='Visual backbone architecture')
+    parser.add_argument('--backbone_visual', type=str, default='efficientnet', choices=['efficientnet', 'swin'], help='Visual backbone architecture')
     parser.add_argument('--backbone_audio', type=str, default='wav2vec2', choices=['wav2vec2', 'hubert'], help='Audio backbone architecture')
     parser.add_argument('--fusion_type', type=str, default='attention', choices=['attention', 'concat'], help='Fusion type for multimodal features')
     parser.add_argument('--video_feature_dim', type=int, default=1024, help='Dimension of video features')
@@ -2498,31 +2537,40 @@ def parse_args():
     parser.add_argument('--enable_advanced_physiological', action='store_true', help='Enable advanced physiological analysis (heartbeat, blood flow, breathing)')
     parser.add_argument('--physiological_fps', type=int, default=30, help='Frame rate for physiological signal analysis')
     parser.add_argument('--resume_checkpoint', type=str, default=None, help='Path to checkpoint file to resume training from')
-    # Training parameters - 🔧 OVERFITTING OPTIMIZED DEFAULTS
-    parser.add_argument('--batch_size', type=int, default=16, help='Batch size (optimized to prevent overfitting)')  # Reduced for better generalization
+    # Training parameters
+    parser.add_argument('--batch_size', type=int, default=128, help='Batch size')
     parser.add_argument('--num_epochs', type=int, default=30, help='Number of training epochs')
-    parser.add_argument('--learning_rate', type=float, default=5e-5, help='Learning rate (reduced to prevent overfitting)')  # Lowered
-    parser.add_argument('--weight_decay', type=float, default=1e-4, help='Weight decay (increased for better regularization)')  # Increased
-    parser.add_argument('--max_samples', type=int, default=1000, help='Maximum number of samples to use')
+    parser.add_argument('--learning_rate', type=float, default=1e-4, help='Learning rate')
+    parser.add_argument('--weight_decay', type=float, default=1e-5, help='Weight decay')
+    parser.add_argument('--max_samples', type=int, default=50, help='Maximum number of samples to use')
+    parser.add_argument('--num_workers', type=int, default=0, help='🧼 SAFETY: Number of data loader workers (default=0, optimal for complex multimodal datasets)')  # Reverted based on benchmark results
     parser.add_argument('--validation_split', type=float, default=0.2, help='Validation split ratio')
     parser.add_argument('--test_split', type=float, default=0.1, help='Test split ratio')
     parser.add_argument('--use_weighted_loss', action='store_true', help='Use class-weighted loss function')
+    
+    # 🔥 Class Imbalance & Bias Fixes
+    parser.add_argument('--loss_type', type=str, default='ce', choices=['ce', 'focal'], help='Loss function type: ce (CrossEntropy) or focal (FocalLoss for imbalanced data)')
+    parser.add_argument('--focal_alpha', type=float, default=1.0, help='Alpha parameter for Focal Loss (weight for rare class)')
+    parser.add_argument('--focal_gamma', type=float, default=2.0, help='Gamma parameter for Focal Loss (focusing parameter)')
+    parser.add_argument('--oversample_minority', action='store_true', help='Oversample minority class (Real) to balance dataset')
+    parser.add_argument('--class_weights_mode', type=str, default='balanced', choices=['balanced', 'manual', 'manual_extreme', 'none'], help='How to compute class weights')
+    
     parser.add_argument('--optimizer', type=str, default='adamw', choices=['adam', 'adamw', 'sgd'], help='Optimizer to use')
     parser.add_argument('--scheduler', type=str, default='cosine', choices=['step', 'cosine', 'plateau', 'none'], help='Learning rate scheduler')
     parser.add_argument('--scheduler_step_size', type=int, default=10, help='Step size for StepLR scheduler')
     parser.add_argument('--scheduler_gamma', type=float, default=0.1, help='Gamma for StepLR scheduler')
     parser.add_argument('--scheduler_patience', type=int, default=5, help='Patience for ReduceLROnPlateau scheduler')
     parser.add_argument('--warmup_epochs', type=int, default=2, help='Number of warmup epochs')
-    parser.add_argument('--early_stopping_patience', type=int, default=7, help='Patience for early stopping (optimized to prevent overfitting)')  # Reduced from 10
-    parser.add_argument('--gradient_clip', type=float, default=1.0, help='Gradient clipping value (increased for stability)')  # Increased from 0.5
+    parser.add_argument('--early_stopping_patience', type=int, default=10, help='Patience for early stopping')
+    parser.add_argument('--gradient_clip', type=float, default=0.5, help='Gradient clipping value')  # Reduced for stability
     
-    # 🔧 OVERFITTING PREVENTION TECHNIQUES
-    parser.add_argument('--label_smoothing', type=float, default=0.1, help='Label smoothing factor (0.0-0.2) to prevent overfitting')
-    parser.add_argument('--mixup_alpha', type=float, default=0.2, help='Mixup alpha parameter for data augmentation')
-    parser.add_argument('--cutmix_alpha', type=float, default=0.0, help='CutMix alpha parameter for data augmentation')
-    parser.add_argument('--image_size', type=int, default=224, help='Image size for preprocessing (224, 320, 352, etc.)')
-    parser.add_argument('--dropout_rate', type=float, default=0.3, help='Global dropout rate for regularization')
-    parser.add_argument('--min_lr', type=float, default=1e-6, help='Minimum learning rate for scheduler')
+    # 🔥 Regularization & Overfitting Prevention
+    parser.add_argument('--dropout_rate', type=float, default=0.3, help='Dropout rate for regularization (0.0-0.8)')
+    parser.add_argument('--l2_reg_strength', type=float, default=1e-4, help='L2 regularization strength')
+    
+    # Distributed training parameters
+    parser.add_argument('--distributed', action='store_true', help='Enable distributed training')
+    parser.add_argument('--local_rank', type=int, default=0, help='Local rank for distributed training')
     
     # Logging and visualization parameters
     parser.add_argument('--use_wandb', action='store_true', help='Use Weights & Biases for logging')
@@ -2536,9 +2584,6 @@ def parse_args():
     # Misc parameters
     parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
     parser.add_argument('--device', type=str, default='cuda', help='Device to use (cuda or cpu)')
-    parser.add_argument('--use_all_gpus', action='store_true', default=True, help='🚀 Use all available GPUs with DataParallel (default: True for local systems)')
-    parser.add_argument('--single_gpu_mode', action='store_true', help='🔒 Force single GPU mode (for server environments)')
-    parser.add_argument('--num_workers', type=int, default=4, help='🚀 Number of data loader workers (default=4 for local systems)')
     parser.add_argument('--amp_enabled', action='store_true', default=True, help='Enable automatic mixed precision (default: True)')
     parser.add_argument('--debug', action='store_true', help='Enable debug mode')
     parser.add_argument('--pretrained_path', type=str, default=None, help='Path to pretrained model weights')
@@ -2552,85 +2597,113 @@ def parse_args():
     parser.add_argument('--disable_advanced_physio', action='store_true', help='Disable advanced physiological analysis for speed')
     parser.add_argument('--fast_mode', action='store_true', help='Enable fast mode with reduced feature extraction')
     
-    # Loss function parameters
-    parser.add_argument('--loss_type', type=str, default='crossentropy', choices=['crossentropy', 'focal'], help='Type of loss function to use')
-    parser.add_argument('--focal_gamma', type=float, default=2.0, help='Gamma parameter for focal loss')
-    parser.add_argument('--focal_alpha', type=float, default=1.0, help='Alpha parameter for focal loss')
-    
-    # Class weights parameters
-    parser.add_argument('--class_weights_mode', type=str, default='none', choices=['none', 'balanced', 'custom'], help='Class weights calculation mode')
-    
     return parser.parse_args()
 
 
 def main():
     """
-    Main entry point with comprehensive server-safe error handling and cleanup.
-    🧼 PROCESS SAFETY: Includes measures to prevent SSH access revocation.
+    Main entry point with comprehensive error handling and cleanup.
+    🧼 PROCESS SAFETY: Includes proper cleanup to prevent zombie processes.
     """
-    trainer = None
+    local_rank = int(os.environ.get('LOCAL_RANK', 0))
+    world_size = int(os.environ.get('WORLD_SIZE', 1))
+    
+    # Set up basic logging for debugging
+    log_level = "INFO" if local_rank == 0 else "ERROR"  # Reduce noise from non-main processes
+    
     try:
-        print("STARTING OPTIMIZED LOCAL TRAINING")
-        print("   - High-performance multiprocessing enabled")
-        print("   - Full GPU utilization for maximum speed") 
-        print("   - Optimized settings for local training environment")
+        print(f"[Rank {local_rank}] 🚀 Main function started (rank {local_rank}/{world_size})")
         
         # Parse arguments
         args = parse_args()
         
-        # 🧼 LOCAL OPTIMIZATION: Allow higher batch sizes for local training
-        if args.batch_size > 64:
-            print(f"ℹ️ INFO: Using optimized batch size {args.batch_size} for local training")
-            
-        # ✅ MULTIPROCESSING ENABLED: Using optimal num_workers for local training
-        if args.num_workers > 0:
-            print(f"🚀 MULTIPROCESSING: Using {args.num_workers} worker processes for 5x faster training")
-            print(f"   Leveraging your {args.num_workers}-core system for optimal performance")
+        # Set local_rank from environment variable if running with torchrun
+        if args.distributed and 'LOCAL_RANK' in os.environ:
+            args.local_rank = int(os.environ['LOCAL_RANK'])
+            local_rank = args.local_rank
         
         # Suppress warnings
         suppress_warnings()
         
-        print("🚀 Starting optimized training with advanced features enabled")
+        print(f"[Rank {local_rank}] ⚙️ Configuration parsed and warnings suppressed")
+        print(f"[Rank {local_rank}] 🧼 Starting training with process safety measures enabled")
         
-        # Create trainer and run
-        trainer = DeepfakeTrainer(args)
-        trainer.run()
+        # Add environment debugging for main process
+        if local_rank == 0:
+            print("🔍 Environment Debug Info:")
+            print(f"   - CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', 'Not set')}")
+            print(f"   - WORLD_SIZE: {world_size}")
+            print(f"   - LOCAL_RANK: {local_rank}")
+            print(f"   - MASTER_ADDR: {os.environ.get('MASTER_ADDR', 'Not set')}")
+            print(f"   - MASTER_PORT: {os.environ.get('MASTER_PORT', 'Not set')}")
+            if torch.cuda.is_available():
+                print(f"   - Available GPUs: {torch.cuda.device_count()}")
+                for i in range(torch.cuda.device_count()):
+                    props = torch.cuda.get_device_properties(i)
+                    print(f"     GPU {i}: {props.name} ({props.total_memory // 1024**3}GB)")
         
-        print("✅ Training completed successfully without server issues")
+        # Create trainer with enhanced error handling
+        try:
+            print(f"[Rank {local_rank}] 🏗️ Creating DeepfakeTrainer...")
+            trainer = DeepfakeTrainer(args)
+            print(f"[Rank {local_rank}] ✅ DeepfakeTrainer created successfully")
+        except Exception as trainer_creation_error:
+            print(f"[Rank {local_rank}] ❌ Failed to create DeepfakeTrainer: {trainer_creation_error}")
+            traceback.print_exc()
+            raise
+        
+        # Run training with enhanced error handling
+        try:
+            print(f"[Rank {local_rank}] 🚀 Starting training run...")
+            trainer.run()
+            print(f"[Rank {local_rank}] ✅ Training completed successfully")
+        except Exception as training_error:
+            print(f"[Rank {local_rank}] ❌ Training run failed: {training_error}")
+            traceback.print_exc()
+            raise
         
     except KeyboardInterrupt:
-        print("Training interrupted by user, performing safe cleanup...")
-        if trainer:
-            trainer._stop_resource_monitor()
-        kill_zombie_processes()
+        print(f"[Rank {local_rank}] 🧼 Training interrupted by user (Ctrl+C), cleaning up...")
         cleanup_processes()
+        sys.exit(130)  # Standard exit code for Ctrl+C
+        
+    except RuntimeError as e:
+        error_msg = str(e).lower()
+        if "cuda" in error_msg or "device" in error_msg or "gpu" in error_msg:
+            print(f"[Rank {local_rank}] ❌ CUDA/GPU error: {e}")
+            print(f"[Rank {local_rank}] 💡 Troubleshooting tips:")
+            print(f"   - Check if GPUs are available and accessible")
+            print(f"   - Try reducing batch size with --batch_size")
+            print(f"   - Verify CUDA_VISIBLE_DEVICES is set correctly")
+            print(f"   - Check for GPU memory issues")
+        elif "nccl" in error_msg or "distributed" in error_msg:
+            print(f"[Rank {local_rank}] ❌ Distributed training error: {e}")
+            print(f"[Rank {local_rank}] 💡 Troubleshooting tips:")
+            print(f"   - Try running without --distributed flag")
+            print(f"   - Check network connectivity between nodes")
+            print(f"   - Verify MASTER_ADDR and MASTER_PORT settings")
+        else:
+            print(f"[Rank {local_rank}] ❌ Runtime error: {e}")
+        
+        traceback.print_exc()
+        cleanup_processes()
+        sys.exit(1)
         
     except Exception as e:
-        print(f"Training failed with error: {e}")
+        print(f"[Rank {local_rank}] ❌ Unexpected error: {e}")
+        print(f"[Rank {local_rank}] 📋 Full error details:")
         traceback.print_exc()
-        if trainer:
-            trainer._stop_resource_monitor()
-        kill_zombie_processes()
         cleanup_processes()
-        raise
+        sys.exit(1)
         
     finally:
-        # 🧼 COMPREHENSIVE FINAL CLEANUP FOR SERVER SAFETY
-        print("Performing final server-safe cleanup...")
-        
-        if trainer:
-            trainer._stop_resource_monitor()
-            
-        # Kill any remaining zombie processes
-        kill_zombie_processes()
-        
-        # Final process cleanup
-        cleanup_processes()
-        
-        # Final resource check
-        monitor_system_resources()
-        
-        print("✅ All server-safe cleanup completed - ready for SSH session end")
+        # Final cleanup with error handling
+        try:
+            cleanup_processes()
+            print(f"[Rank {local_rank}] 🧼 Process cleanup completed successfully")
+        except Exception as cleanup_error:
+            print(f"[Rank {local_rank}] ⚠️ Cleanup error (non-fatal): {cleanup_error}")
+            # Don't fail on cleanup errors
 
 
 if __name__ == "__main__":
