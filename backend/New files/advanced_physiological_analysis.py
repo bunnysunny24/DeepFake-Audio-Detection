@@ -882,22 +882,28 @@ class AdvancedPhysiologicalAnalyzer(nn.Module):
         }
 
 
-# 🧼 PROCESS SAFETY GUARD - NO MULTIPROCESSING ALLOWED
+# 🧼 PROCESS SAFETY GUARD
 if __name__ == "__main__":
     """
-    🧼 ZOMBIE PROCESS SAFE: Safety test for advanced physiological analysis.
-    All multiprocessing functionality REMOVED for server safety.
+    Safety test for advanced physiological analysis.
+    Prevents zombie processes and Xid 43 errors.
     """
+    import multiprocessing
     
-    print("🧼 Advanced Physiological Analysis Safety Test - SERVER SAFE MODE")
+    # Set multiprocessing start method (important for CUDA compatibility)
+    try:
+        multiprocessing.set_start_method('spawn', force=True)
+    except RuntimeError:
+        pass  # Already set
+    
+    print("🧼 Advanced Physiological Analysis Safety Test")
     print("✅ GPU memory management enabled")
     print("✅ Automatic cleanup on exit registered")
     print("✅ Error handling with GPU cleanup")
-    print("🚫 NO MULTIPROCESSING - Zero zombie process risk")
     
     try:
         # Test with small dummy data
-        device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         print(f"✅ Using device: {device}")
         
         # Create analyzer
