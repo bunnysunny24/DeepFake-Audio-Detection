@@ -15,7 +15,6 @@ import random
 import math
 import librosa
 import uuid
-# 🧼 ZOMBIE PROCESS SAFE: multiprocessing import only for context detection (never creates processes)
 import multiprocessing
 import uuid
 import dlib
@@ -90,6 +89,7 @@ class MultiModalDeepfakeDataset(Dataset):
         # Initialize error counters early
         self.face_detection_error_count = 0
         self.max_face_detection_errors_to_print = 5  # Reduce error messages for cleaner output
+        self._sample_count = 0  # Track sample count for periodic detailed logging
         
         # Optional face detector for more focused analysis
         if self.detect_faces:
@@ -117,11 +117,13 @@ class MultiModalDeepfakeDataset(Dataset):
                 # Try to load dlib's face detector and landmark predictor
                 self.dlib_detector = dlib.get_frontal_face_detector()
                 
-                # Use absolute path to ensure file is found regardless of working directory
-                model_path = "/home/srmist54/backend/Models/shape_predictor_68_face_landmarks.dat"
+                # Use relative path to the model file in the Models directory
+                model_path = "shape_predictor_68_face_landmarks.dat"
+                # Check if file exists in current directory
                 if not os.path.exists(model_path):
-                    # Fallback to relative path
-                    model_path = "shape_predictor_68_face_landmarks.dat"
+                    # Try finding it in the script's directory
+                    script_dir = os.path.dirname(os.path.abspath(__file__))
+                    model_path = os.path.join(script_dir, "shape_predictor_68_face_landmarks.dat")
                     
                 if os.path.exists(model_path):
                     self.landmark_predictor = dlib.shape_predictor(model_path)
@@ -188,7 +190,18 @@ class MultiModalDeepfakeDataset(Dataset):
         weight_real = total / (2.0 * self.class_counts['real'])
         weight_fake = total / (2.0 * self.class_counts['fake'])
         
-        return torch.tensor([weight_real, weight_fake])
+        # For manual_extreme mode, use a very high weight for the real class
+        # This is for cases with extreme class imbalance
+        if hasattr(self, "class_weights_mode") and self.class_weights_mode == "manual_extreme":
+            print("Using manual_extreme class weights with 10:1 ratio")
+            # Set real:fake weight ratio to 10:1
+            weight_real = 10.0  # Real class (minority)
+            weight_fake = 1.0   # Fake class (majority)
+            
+        weights = torch.tensor([weight_real, weight_fake])
+        print(f"Class weights: {weights}")
+        
+        return weights
 
     def __len__(self):
         return len(self.valid_indices)
@@ -283,9 +296,29 @@ class MultiModalDeepfakeDataset(Dataset):
             deepfake_type = sample.get('deepfake_type', 'unknown')
             deepfake_type_id = self._get_deepfake_type_id(deepfake_type)
 
-            # Debugging: Log successful data loading
+            # Debugging: Log successful data loading with feature details
             if self.logging:
-                print(f"✅ Successfully loaded sample at index {actual_idx}")
+                # Increment sample counter
+                self._sample_count = getattr(self, '_sample_count', 0) + 1
+                
+                # Build concise feature summary
+                features_extracted = []
+                if pulse_signal is not None:
+                    features_extracted.append("pulse")
+                if skin_color_variations is not None:
+                    features_extracted.append("skin")
+                if head_pose_features is not None:
+                    features_extracted.append("pose")
+                if eye_blink_features is not None:
+                    features_extracted.append("blink")
+                if frequency_features is not None:
+                    features_extracted.append("freq")
+                if facial_landmarks is not None and len(facial_landmarks) > 0:
+                    features_extracted.append("landmarks")
+                
+                # Concise one-line output
+                features_str = "+".join(features_extracted) if features_extracted else "basic"
+                print(f"✅ Sample {actual_idx}: {features_str}")
 
             result = {
                 'video_frames': video_frames,
@@ -396,6 +429,16 @@ class MultiModalDeepfakeDataset(Dataset):
 
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             fps = cap.get(cv2.CAP_PROP_FPS)
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            
+            # Only show detailed info every 100 samples
+            show_details = self.logging and (hasattr(self, '_sample_count') and self._sample_count % 100 == 0)
+            
+            if show_details:
+                print(f"📹 Loading video: {os.path.basename(path)}")
+                print(f"   📐 Dimensions: {width}x{height}, {total_frames} frames @ {fps:.1f} FPS")
+            
             if total_frames <= 0:
                 if self.logging:
                     warnings.warn(f"⚠️ Video has no frames: {path}")
@@ -416,13 +459,16 @@ class MultiModalDeepfakeDataset(Dataset):
             else:
                 # Evenly distributed frames for validation/testing
                 frame_indices = np.linspace(0, total_frames - 1, self.max_frames, dtype=int)
+            
+            if show_details:
+                print(f"   🎯 Sampling {len(frame_indices)} frames: {frame_indices[:5]}{'...' if len(frame_indices) > 5 else ''}")
                 
             video_frames = []
             face_crops = []
             all_landmarks = []
             prev_face_locs = None
 
-            for frame_idx in frame_indices:
+            for i, frame_idx in enumerate(frame_indices):
                 cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
                 ret, frame = cap.read()
                 if not ret:
@@ -435,6 +481,8 @@ class MultiModalDeepfakeDataset(Dataset):
                     if self.logging:
                         warnings.warn(f"⚠️ Empty frame at index {frame_idx}")
                     continue
+                
+                original_shape = frame.shape
                 
                 # Convert to RGB with error handling
                 try:
@@ -767,6 +815,9 @@ class MultiModalDeepfakeDataset(Dataset):
             # Load audio with torchaudio
             audio, sample_rate = torchaudio.load(path)
             audio = audio.squeeze(0).numpy()
+            
+            original_length = len(audio)
+            original_duration = original_length / sample_rate
 
             # Process audio length
             if len(audio) > self.audio_length:
@@ -780,7 +831,8 @@ class MultiModalDeepfakeDataset(Dataset):
                     audio = audio[start:start + self.audio_length]
             else:
                 # Pad if too short
-                audio = np.pad(audio, (0, self.audio_length - len(audio)), mode='constant')
+                padding_needed = self.audio_length - len(audio)
+                audio = np.pad(audio, (0, padding_needed), mode='constant')
 
             # Apply audio augmentation if provided
             if self.audio_transform and self.phase == 'train':
@@ -1483,9 +1535,9 @@ def get_transforms_enhanced(phase='train'):
 
 def get_data_loaders(
     json_path, data_dir, batch_size=4, validation_split=0.2, test_split=0.1,
-    shuffle=True, num_workers=4, max_samples=None, detect_faces=True,  # 🚀 LOCAL SYSTEM: num_workers=4 for better performance
+    shuffle=True, num_workers=2, max_samples=None, detect_faces=True,
     compute_spectrograms=True, temporal_features=True, enhanced_preprocessing=True,
-    enhanced_augmentation=False, multiprocessing_context=None, pin_memory=True, reduce_frames=16  # 🚀 Enable pin_memory for GPU transfers
+    enhanced_augmentation=False, multiprocessing_context=None
 ):
     """
     Load data loaders with an option to restrict the maximum number of samples.
@@ -1505,8 +1557,6 @@ def get_data_loaders(
         enhanced_preprocessing (bool): Whether to enable enhanced preprocessing features.
         enhanced_augmentation (bool): Whether to use enhanced data augmentation techniques.
         multiprocessing_context (str, optional): Multiprocessing context method ('spawn', 'fork', etc.) for safety.
-        pin_memory (bool): Whether to pin memory for faster GPU transfers.
-        reduce_frames (int): Maximum number of frames to extract from each video.
     
     Returns:
         tuple: Training, validation, and test data loaders, plus class weights.
@@ -1523,7 +1573,6 @@ def get_data_loaders(
     train_dataset = MultiModalDeepfakeDataset(
         json_path=json_path,
         data_dir=data_dir,
-        max_frames=reduce_frames,  # Use reduce_frames parameter
         transform=train_video_transform,
         audio_transform=train_audio_transform,
         logging=True,  # Enable logging for debugging
@@ -1538,22 +1587,6 @@ def get_data_loaders(
     val_dataset = MultiModalDeepfakeDataset(
         json_path=json_path,
         data_dir=data_dir,
-        max_frames=reduce_frames,  # Use reduce_frames parameter
-        transform=val_video_transform,
-        audio_transform=val_audio_transform,
-        logging=True,  # Enable logging for debugging
-        phase='val',
-        detect_faces=detect_faces,
-        compute_spectrograms=compute_spectrograms,
-        temporal_features=temporal_features,
-        enhanced_preprocessing=enhanced_preprocessing
-    )
-    
-    # Create test dataset
-    test_dataset = MultiModalDeepfakeDataset(
-        json_path=json_path,
-        data_dir=data_dir,
-        max_frames=reduce_frames,  # Use reduce_frames parameter
         transform=val_video_transform,
         audio_transform=val_audio_transform,
         logging=True,  # Enable logging for debugging
@@ -1597,101 +1630,30 @@ def get_data_loaders(
             np.random.seed(42)
             np.random.shuffle(indices)
     
-    # 🎯 STRATIFIED SPLITTING: Ensure same class distribution in train/val/test
-    # Get labels for all samples to perform stratified split
-    print("🎯 Performing stratified split to ensure balanced class distribution...")
+    # Calculate split sizes
+    val_count = int(np.floor(validation_split * num_samples))
+    test_count = int(np.floor(test_split * num_samples))
+    train_count = num_samples - val_count - test_count
     
-    labels = []
-    for idx in indices:
-        sample = train_dataset.data[idx]
-        # Extract label from n_fakes: 0 = real, >0 = fake
-        label = 1 if sample['n_fakes'] > 0 else 0
-        labels.append(label)
-    
-    labels = np.array(labels)
-    
-    # Get unique classes and their counts
-    unique_classes, class_counts = np.unique(labels, return_counts=True)
-    print(f"📊 Overall class distribution: {dict(zip(unique_classes, class_counts))}")
-    
-    # Perform stratified split for each class
-    train_indices = []
-    val_indices = []
-    test_indices = []
-    
-    for class_label in unique_classes:
-        # Get indices for this class
-        class_indices = np.array(indices)[labels == class_label]
-        class_size = len(class_indices)
-        
-        # Calculate splits for this class
-        val_class_count = int(np.floor(validation_split * class_size))
-        test_class_count = int(np.floor(test_split * class_size))
-        train_class_count = class_size - val_class_count - test_class_count
-        
-        # Shuffle class indices
-        np.random.seed(42 + int(class_label))  # Different seed per class for diversity
-        np.random.shuffle(class_indices)
-        
-        # Split this class
-        train_indices.extend(class_indices[:train_class_count])
-        val_indices.extend(class_indices[train_class_count:train_class_count+val_class_count])
-        test_indices.extend(class_indices[train_class_count+val_class_count:])
-        
-        print(f"   Class {class_label}: {train_class_count} train, {val_class_count} val, {test_class_count} test")
-    
-    # Shuffle the final indices to mix classes
-    np.random.seed(42)
-    np.random.shuffle(train_indices)
-    np.random.shuffle(val_indices)
-    np.random.shuffle(test_indices)
-    
-    print(f"✅ Stratified split completed: {len(train_indices)} train, {len(val_indices)} val, {len(test_indices)} test")
+    # Split indices
+    train_indices = indices[:train_count]
+    val_indices = indices[train_count:train_count+val_count]
+    test_indices = indices[train_count+val_count:]
 
     # Create samplers
     train_sampler = SubsetRandomSampler(train_indices)
     val_sampler = SubsetRandomSampler(val_indices)
     test_sampler = SubsetRandomSampler(test_indices)
     
-    # 🔍 VERIFY STRATIFIED SPLIT: Check class distributions
-    def verify_split_distribution(indices, split_name):
-        split_labels = []
-        for idx in indices:
-            sample = train_dataset.data[idx]
-            # Extract label from n_fakes: 0 = real, >0 = fake
-            label = 1 if sample['n_fakes'] > 0 else 0
-            split_labels.append(label)
-        
-        unique, counts = np.unique(split_labels, return_counts=True)
-        percentages = counts / len(split_labels) * 100
-        print(f"   {split_name}: {dict(zip(unique, [f'{count} ({pct:.1f}%)' for count, pct in zip(counts, percentages)]))}")
-        return dict(zip(unique, percentages))
-    
-    print("🔍 Verifying stratified split distributions:")
-    train_dist = verify_split_distribution(train_indices, "Training")
-    val_dist = verify_split_distribution(val_indices, "Validation") 
-    test_dist = verify_split_distribution(test_indices, "Test")
-    
-    # Check if distributions are similar (within 5% tolerance)
-    for class_label in unique_classes:
-        train_pct = train_dist.get(class_label, 0)
-        val_pct = val_dist.get(class_label, 0)
-        if abs(train_pct - val_pct) > 5:
-            print(f"⚠️  Warning: Class {class_label} distribution differs significantly between train ({train_pct:.1f}%) and val ({val_pct:.1f}%)")
-        else:
-            print(f"✅ Class {class_label} distribution is consistent: train ({train_pct:.1f}%) vs val ({val_pct:.1f}%)")
-    
     # Get class weights for weighted sampling
     class_weights = train_dataset.class_weights
 
-    # 🚀 LOCAL SYSTEM: Handle multiprocessing context for performance
+    # Handle multiprocessing context for safety
     mp_context = None
     if num_workers > 0 and multiprocessing_context:
-        # 🚀 PERFORMANCE: Use multiprocessing for faster data loading on local system
         import multiprocessing as mp
         try:
             mp_context = mp.get_context(multiprocessing_context)
-            print(f"🚀 Using multiprocessing context: {multiprocessing_context}")
         except Exception as e:
             print(f"⚠️ Warning: Could not set multiprocessing context '{multiprocessing_context}': {e}")
             mp_context = None
@@ -1702,7 +1664,7 @@ def get_data_loaders(
         'batch_size': batch_size,
         'sampler': train_sampler,
         'num_workers': num_workers,
-        'pin_memory': pin_memory,  # Use configurable pin_memory
+        'pin_memory': True,
         'drop_last': False,
         'collate_fn': collate_fn,
         'persistent_workers': True if num_workers > 0 else False,
@@ -1717,7 +1679,7 @@ def get_data_loaders(
         'batch_size': batch_size,
         'sampler': val_sampler,
         'num_workers': num_workers,
-        'pin_memory': pin_memory,  # Use configurable pin_memory
+        'pin_memory': True,
         'drop_last': False,
         'collate_fn': collate_fn,
         'persistent_workers': True if num_workers > 0 else False,
@@ -1732,7 +1694,7 @@ def get_data_loaders(
         'batch_size': batch_size,
         'sampler': test_sampler,
         'num_workers': num_workers,
-        'pin_memory': pin_memory,  # Use configurable pin_memory
+        'pin_memory': True,
         'drop_last': False,
         'collate_fn': collate_fn,
         'persistent_workers': True if num_workers > 0 else False,
