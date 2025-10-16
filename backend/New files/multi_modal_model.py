@@ -21,6 +21,22 @@ try:
 except ImportError:
     print("Warning: Some optional dependencies (dlib, facenet_pytorch) not found, some features may be limited")
 
+# Import advanced model components and augmentations
+try:
+    from advanced_model_components import (
+        SelfAttentionPooling,
+        TemporalConsistencyDetector,
+        EnhancedCrossModalFusion,
+        PeriodicalFeatureExtractor,
+        MultiScaleFeatureFusion
+    )
+    print("✅ Successfully imported advanced model components")
+    ADVANCED_COMPONENTS_AVAILABLE = True
+except ImportError as e:
+    print(f"⚠️ Warning: advanced_model_components.py not found or has errors: {e}")
+    print("⚠️ Falling back to standard components")
+    ADVANCED_COMPONENTS_AVAILABLE = False
+
 # Import local skin analyzer
 try:
     from skin_analyzer import SkinColorAnalyzer
@@ -2646,6 +2662,46 @@ class MultiModalDeepfakeModel(nn.Module):
             feature_dim=128
         )
         
+        # ========== ADVANCED MODEL COMPONENTS INTEGRATION ==========
+        # Check if advanced components are available
+        if ADVANCED_COMPONENTS_AVAILABLE:
+            print("✅ Integrating advanced model components...")
+            
+            # Self-Attention Pooling for improved temporal feature aggregation
+            self.visual_self_attention = SelfAttentionPooling(input_dim=self.actual_video_feature_dim)
+            self.audio_self_attention = SelfAttentionPooling(input_dim=self.actual_audio_feature_dim)
+            
+            # Temporal Consistency Detector for deepfake temporal artifacts
+            self.temporal_consistency_detector = TemporalConsistencyDetector(
+                feature_dim=self.actual_video_feature_dim,
+                hidden_dim=256
+            )
+            
+            # Enhanced Cross-Modal Fusion replacing basic fusion
+            self.enhanced_cross_modal_fusion = EnhancedCrossModalFusion(
+                visual_dim=self.actual_video_feature_dim,
+                audio_dim=self.actual_audio_feature_dim,
+                fusion_dim=512
+            )
+            
+            # Periodical Feature Extractor for detecting periodic patterns
+            self.periodical_extractor = PeriodicalFeatureExtractor(
+                input_dim=self.actual_video_feature_dim,
+                hidden_dim=128
+            )
+            
+            # Multi-Scale Feature Fusion for hierarchical representations
+            self.multiscale_fusion = MultiScaleFeatureFusion(
+                input_dim=self.actual_video_feature_dim,
+                scales=[1, 2, 4]
+            )
+            
+            print("✅ Advanced components initialized successfully!")
+            self.use_advanced_components = True
+        else:
+            print("⚠️ Advanced components not available, using standard components")
+            self.use_advanced_components = False
+        
         # 6. Advanced Machine Learning Models
         self.siamese_network = SiameseNetwork(
             audio_dim=self.actual_audio_feature_dim,
@@ -2669,6 +2725,13 @@ class MultiModalDeepfakeModel(nn.Module):
             # Original features + new enhanced features
             combined_dim += 128 * 4  # Original: ELA + metadata + sync + face embeddings
             combined_dim += 512      # Additional features from new modules
+            
+        # Add dimensions for advanced components if available
+        if ADVANCED_COMPONENTS_AVAILABLE and hasattr(self, 'use_advanced_components') and self.use_advanced_components:
+            combined_dim += 512  # Enhanced fusion output
+            combined_dim += 256  # Temporal consistency detector output (bidirectional GRU)
+            combined_dim += 128  # Periodical features
+            combined_dim += self.actual_video_feature_dim  # Multi-scale fusion output
         
         # Main classifier
         self.classifier = nn.Sequential(
@@ -3339,8 +3402,79 @@ class MultiModalDeepfakeModel(nn.Module):
             liveness_score, _ = self.liveness_detector(video_features)
             component_contributions['liveness'] = liveness_score
             
+            # ========== ADVANCED MODEL COMPONENTS INTEGRATION ==========
+            # Apply advanced components if available
+            advanced_features_list = []
+            
+            if hasattr(self, 'use_advanced_components') and self.use_advanced_components:
+                if self.debug:
+                    print("[INFO] Applying advanced model components...")
+                
+                try:
+                    # 1. Self-Attention Pooling for temporal features
+                    # Apply on temporal visual features (before mean pooling)
+                    visual_attended = self.visual_self_attention(temporal_visual_features)
+                    component_contributions['visual_self_attention'] = torch.sigmoid(torch.mean(visual_attended, dim=-1, keepdim=True))
+                    
+                    # Apply on audio features (expand to sequence first)
+                    audio_seq = audio_features.unsqueeze(1).expand(-1, 5, -1)
+                    audio_attended = self.audio_self_attention(audio_seq)
+                    component_contributions['audio_self_attention'] = torch.sigmoid(torch.mean(audio_attended, dim=-1, keepdim=True))
+                    
+                    # 2. Temporal Consistency Detector
+                    # Analyze temporal patterns in visual features
+                    temporal_consistency_features = self.temporal_consistency_detector(temporal_visual_features)
+                    component_contributions['advanced_temporal_consistency'] = torch.sigmoid(
+                        torch.mean(temporal_consistency_features, dim=-1, keepdim=True)
+                    )
+                    advanced_features_list.append(temporal_consistency_features)
+                    
+                    # 3. Enhanced Cross-Modal Fusion
+                    enhanced_fused_features = self.enhanced_cross_modal_fusion(
+                        visual_attended, 
+                        audio_attended
+                    )
+                    component_contributions['enhanced_fusion'] = torch.sigmoid(
+                        torch.mean(enhanced_fused_features, dim=-1, keepdim=True)
+                    )
+                    advanced_features_list.append(enhanced_fused_features)
+                    
+                    # 4. Periodical Feature Extractor
+                    # Extract periodic patterns from visual sequence
+                    periodical_features = self.periodical_extractor(temporal_visual_features)
+                    component_contributions['periodical_patterns'] = torch.sigmoid(
+                        torch.mean(periodical_features, dim=-1, keepdim=True)
+                    )
+                    advanced_features_list.append(periodical_features)
+                    
+                    # 5. Multi-Scale Feature Fusion
+                    # Apply on visual features across multiple scales
+                    multiscale_features = self.multiscale_fusion(temporal_visual_features)
+                    component_contributions['multiscale_features'] = torch.sigmoid(
+                        torch.mean(multiscale_features, dim=-1, keepdim=True)
+                    )
+                    advanced_features_list.append(multiscale_features)
+                    
+                    if self.debug:
+                        print(f"[INFO] Advanced components applied successfully")
+                        print(f"[INFO] Generated {len(advanced_features_list)} advanced feature tensors")
+                        
+                except Exception as e:
+                    if self.debug:
+                        print(f"[WARNING] Error in advanced components: {e}")
+                        import traceback
+                        traceback.print_exc()
+                    # Continue without advanced features
+                    advanced_features_list = []
+            
             # Combine and fuse features
-            if self.fusion_type == 'attention':
+            # Use enhanced fusion if advanced components are available
+            if hasattr(self, 'use_advanced_components') and self.use_advanced_components and len(advanced_features_list) > 0:
+                # Use enhanced cross-modal fusion
+                combined_features = enhanced_fused_features  # Already computed in advanced components section
+                if self.debug:
+                    print(f"[INFO] Using enhanced cross-modal fusion, output shape: {combined_features.shape}")
+            elif self.fusion_type == 'attention':
                 combined_features = self.fusion_module(video_features, audio_features)
             else:  # Default to concat
                 combined_features = torch.cat([video_features, audio_features], dim=-1)
@@ -3348,6 +3482,23 @@ class MultiModalDeepfakeModel(nn.Module):
 
             # Process through transformer
             transformer_output = self.transformer(combined_features.unsqueeze(1)).squeeze(1)
+            
+            # Concatenate advanced features if available
+            if hasattr(self, 'use_advanced_components') and self.use_advanced_components and len(advanced_features_list) > 0:
+                # Ensure all advanced features have correct batch size
+                device = transformer_output.device
+                normalized_advanced_features = []
+                for feat in advanced_features_list:
+                    if feat.shape[0] != batch_size:
+                        feat = self._ensure_batch_consistency(feat, batch_size, "advanced_feature")
+                    normalized_advanced_features.append(feat)
+                
+                # Concatenate advanced features with transformer output
+                all_advanced_features = torch.cat(normalized_advanced_features, dim=-1)
+                transformer_output = torch.cat([transformer_output, all_advanced_features], dim=-1)
+                
+                if self.debug:
+                    print(f"[INFO] Added advanced features, new transformer output shape: {transformer_output.shape}")
             
             # Validate and fix component contributions batch sizes before processing
             if self.enable_explainability:
@@ -3580,7 +3731,7 @@ class MultiModalDeepfakeModel(nn.Module):
                     print(f"[DEBUG] Batch size: {batch_size}, Tensor shapes: {[t.shape for t in normalized_tensors]}")
                     # Create a fallback vector with a reasonable dimension
                     fallback_dim = len(normalized_tensors) * target_dim if normalized_tensors else target_dim
-                    explainability_vector = torch.zeros(batch_size, fallback_dim, device=device)
+                    explainability_vector = torch.zeros(batch_size, fallback_dim, device=video_frames.device)
                 
                 # Ensure consistent dimensionality
                 explainability_vector = explainability_vector.view(batch_size, -1)
@@ -3606,7 +3757,7 @@ class MultiModalDeepfakeModel(nn.Module):
                         adapter.bias.zero_()
                     
                     # Move to correct device and register as submodule
-                    self.feature_adapter = adapter.to(device)
+                    self.feature_adapter = adapter.to(video_frames.device)
                     self.add_module('feature_adapter', self.feature_adapter)
                 
                 # Apply the adapter
