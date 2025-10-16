@@ -150,3 +150,47 @@ python f:\deepfake\backup\Models\predict_deepfake.py f:\deepfake\backup\Models\s
 
 
 6. Latency optimization – try to decrease the latency between model prediction and output generation.
+
+
+optimize_model.py - Complete optimization suite
+
+Pruning (30%, 50%, 70%)
+Layer adjustments (dropout/BatchNorm experiments)
+Quantization (Dynamic, Static)
+ONNX export & optimization
+Latency benchmarking
+Complete automation
+quick_benchmark.py - Fast latency testing
+
+Quick inference benchmarks
+Compare optimization methods
+Beautiful visualizations
+Performance metrics
+run_optimization.ps1 - PowerShell runner
+
+Easy execution
+Interactive prompts
+Results summary
+File size reporting
+OPTIMIZATION_GUIDE.md - Detailed documentation
+
+All techniques explained
+Expected results & trade-offs
+Deployment recommendations
+Troubleshooting guide
+OPTIMIZATION_README.md - Quick reference
+
+Command cheat sheet
+Common use cases
+Next steps
+.\run_optimization.ps1 -CheckpointPath "server_checkpoints\best_model.pth"
+python quick_benchmark.py --checkpoint server_checkpoints\best_model.pth --compare
+python optimize_model.py --checkpoint best_model.pth --method pruning
+📊 What Each Technique Does:
+Technique	Purpose	Benefit	Trade-off
+1. Pruning	Remove unimportant weights	40-60% smaller, 1.2-1.4x faster	1-3% accuracy loss
+2. Layer Adjustments	Optimize dropout/BatchNorm	10-15% faster	Needs testing
+3. Quantization	FP32 → INT8	75% smaller, 3-4x faster (CPU)	<2% accuracy loss
+4. ONNX Export	Platform-independent format	Cross-platform deployment	None
+5. Latency Optimization	Reduce inference time	1.5-2x faster (AMP)	None
+6. Inference Mode	Production optimizations	Minimal latency	None
