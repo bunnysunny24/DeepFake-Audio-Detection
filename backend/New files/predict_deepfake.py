@@ -267,239 +267,110 @@ def main(model_path, video_path):
             # - oversample_minority flag
             # - focal loss with alpha=0.75, gamma=2.0
             # - use_weighted_loss flag
-            # All of these create a very strong bias toward the real class
-            
-            # Extract logits for better analysis
+            # Extract logits for analysis
             real_logit = output[0, 0].item()
             fake_logit = output[0, 1].item()
             logit_diff = real_logit - fake_logit
+            
             print(f"  Logit difference (real-fake): {logit_diff:.4f}")
+            print(f"  Raw probabilities: Real={real_prob:.4f}, Fake={fake_prob:.4f}")
             
-            # For "manual_extreme" weights, the ratio is typically 10:1 or higher
-            # We need to apply a correction based on the training configuration
+            # Use simple probability-based decision
+            # The model outputs are already calibrated from training
+            result = "REAL" if real_prob > fake_prob else "FAKE"
             
-            # Method 1: Hard threshold approach for class with extreme imbalance
-            custom_threshold = 0.02  # Consider it fake if raw probability > 2%
-            threshold_decision = "FAKE" if fake_prob > custom_threshold else "REAL"
+            # Confidence is the probability of the predicted class
+            confidence = real_prob if result == "REAL" else fake_prob
+            confidence_pct = confidence * 100
             
-            # Method 2: Logit-based decision (if logit difference is below a threshold)
-            # This accounts for the extreme class weighting during training
-            # After analysis of both videos, we need a lower threshold to catch fake videos
-            logit_threshold = 3.0  # Lower threshold to detect fake videos (was 3.5)
-            logit_decision = "FAKE" if logit_diff < logit_threshold else "REAL"
-            
-            # Method 3: Adjust probability based on class weights from training (--class_weights_mode manual_extreme)
-            # For manual_extreme, we apply a weight of about 10-30x to account for imbalance
-            weight_factor = 25.0  # Extreme class weighting factor
-            adjusted_fake_prob = fake_prob * weight_factor
-            adjusted_fake_prob = min(adjusted_fake_prob, 1.0)  # Cap at 1.0
-            adjusted_real_prob = 1.0 - adjusted_fake_prob
-            
-            print(f"  Adjusted for class imbalance: Real={adjusted_real_prob:.4f}, Fake={adjusted_fake_prob:.4f}")
-            print(f"  Threshold decision: {threshold_decision} (threshold={custom_threshold:.4f})")
-            print(f"  Logit-based decision: {logit_decision} (threshold={logit_threshold:.4f})")
-            
-            # IMPORTANT: Given your training configuration, we should primarily use the logit-based
-            # or threshold-based approach rather than raw probabilities, but with fine-tuning
-            
-            # Let's use a more refined approach for the final decision
-            # Based on the training log, the best model was at epoch 16 with Macro F1: 0.7220
-            # We need to establish precise thresholds specifically for this model
-            
-            # After analysis of known videos:
-            # - REALO.mp4 (real) has logit_diff around 3.89
-            # - fake_1.mp4 (fake) has logit_diff around 3.85
-            # - fake_014.mp4 (fake) has logit_diff around 3.90
-            
-            # The threshold must be higher than our highest observed fake video
-            real_logit_threshold = 3.91  # Set above fake_014.mp4's logit diff
-            
-            # Use logit difference as the primary decision factor
-            # We know that some sophisticated deepfakes have very high logit values
-            if logit_diff >= real_logit_threshold:
-                custom_decision = "REAL"
-            elif logit_diff >= 3.89 and logit_diff < real_logit_threshold:
-                # Special warning zone: Videos with logit diffs in this range need careful scrutiny
-                # Similar to fake_014.mp4 which had a very high logit diff
-                custom_decision = "FAKE (HIGH-CONFIDENCE)"
+            # Determine confidence level
+            if confidence > 0.90:
+                confidence_level = "Very High"
+            elif confidence > 0.75:
+                confidence_level = "High"
+            elif confidence > 0.60:
+                confidence_level = "Medium"
             else:
-                custom_decision = "FAKE"
-                
-            # Print our decision with clear thresholds
-            print(f"  Custom decision: {custom_decision} (real_threshold={real_logit_threshold:.4f})")
-            print(f"  For reference: REALO.mp4 has logit_diff≈3.89, fake_014.mp4 has logit_diff≈3.90, fake_1.mp4 has logit_diff≈3.85")
+                confidence_level = "Low"
             
-            # Final decision based on our custom threshold
-            result = custom_decision
-            
-            # Track the decision rule for explanation
-            if result == "FAKE":
-                decision_rule = f"logit difference {logit_diff:.4f} < {real_logit_threshold:.4f}"
-            else:
-                decision_rule = f"logit difference {logit_diff:.4f} >= {real_logit_threshold:.4f}"
-            
-            # Confidence calculation based on distance from the decision threshold
-            # For subtle differences like this, small changes in logit difference are significant
-            # The expected range of difference is about 0.04 (difference between REALO and fake_1)
-            
-            if result == "FAKE":
-                # For fake videos: closer to 0 = higher confidence it's fake
-                # Calculate how far below the threshold (positive number = more confident)
-                diff_from_threshold = real_logit_threshold - logit_diff
-                # Scale to a percentage (0.02 logit diff ≈ 100% confidence)
-                confidence = min(50.0 + (diff_from_threshold / 0.02) * 45.0, 95.0)
-            else:  # REAL
-                # For real videos: higher logit diff = more confident it's real
-                # Calculate how far above the threshold (positive number = more confident)
-                diff_from_threshold = logit_diff - real_logit_threshold
-                # Scale to a percentage (0.02 logit diff ≈ 100% confidence)
-                confidence = min(50.0 + (diff_from_threshold / 0.02) * 45.0, 95.0)
-                
-            # Ensure confidence is reasonable (between 50-95%)
-            confidence = max(50.0, min(confidence, 95.0))
-            
-            # Assign confidence level
-            confidence_level = "Low" if confidence < 65 else "Medium" if confidence < 85 else "High"
+            decision_rule = f"real_prob ({real_prob:.4f}) {'>' if result == 'REAL' else '<'} fake_prob ({fake_prob:.4f})"
             
             print("\n" + "="*60)
-            print(f"📊 PREDICTION: {result} (Confidence: {confidence:.2%} - {confidence_level})")
+            print(f"📊 PREDICTION: {result} (Confidence: {confidence_pct:.2f}% - {confidence_level})")
             print("="*60)
             
             # Show detailed probabilities with visual bar
-            print(f"\n📈 Analysis Methods:")
+            print(f"\n📈 Model Analysis:")
             
             # Create visual bar representation
             bar_length = 40
             
-            # 1. Raw probabilities
-            print(f"📊 Raw Model Output (Not reliable due to extreme class imbalance):")
-            real_bar_raw = "█" * int(real_prob * bar_length)
-            fake_bar_raw = "█" * int(fake_prob * bar_length)
-            print(f"  REAL (Raw): {real_prob:.4f} ({real_prob*100:.2f}%) {real_bar_raw}")
-            print(f"  FAKE (Raw): {fake_prob:.4f} ({fake_prob*100:.2f}%) {fake_bar_raw}")
+            # Show probabilities
+            print(f"📊 Output Probabilities:")
+            real_bar = "█" * int(real_prob * bar_length)
+            fake_bar = "█" * int(fake_prob * bar_length)
+            print(f"  REAL: {real_prob:.4f} ({real_prob*100:.2f}%) {real_bar}")
+            print(f"  FAKE: {fake_prob:.4f} ({fake_prob*100:.2f}%) {fake_bar}")
             
-            # 2. Adjusted probabilities
-            print(f"\n📊 Weight-Adjusted Output (Corrected for class imbalance):")
-            real_bar_adjusted = "█" * int(adjusted_real_prob * bar_length)
-            fake_bar_adjusted = "█" * int(adjusted_fake_prob * bar_length)
-            print(f"  REAL (Adj): {adjusted_real_prob:.4f} ({adjusted_real_prob*100:.2f}%) {real_bar_adjusted}")
-            print(f"  FAKE (Adj): {adjusted_fake_prob:.4f} ({adjusted_fake_prob*100:.2f}%) {fake_bar_adjusted}")
+            # Logit information (for reference)
+            print(f"\n📊 Logit Analysis (for reference):")
+            print(f"  Real logit: {real_logit:.4f}")
+            print(f"  Fake logit: {fake_logit:.4f}")
+            print(f"  Logit difference (real-fake): {logit_diff:.4f}")
             
-            # 3. Logit-based analysis (most reliable for extreme imbalance)
-            print(f"\n📊 Logit Analysis (Most reliable for extreme class imbalance):")
-            # Create a clearer visualization with fake/real boundary
-            # For this fine-grained detection, we'll create a zoomed-in visualization
-            # of the region around our decision boundary
-            
-            # Set the visualization range around our threshold
-            viz_min = 3.80
-            viz_max = 4.00
-            
-            threshold_pos = int((real_logit_threshold - viz_min) / (viz_max - viz_min) * bar_length)
-            marker_pos = int((logit_diff - viz_min) / (viz_max - viz_min) * bar_length)
-            marker_pos = min(max(marker_pos, 0), bar_length-1)
-            
-            # Create the fake and real zones
-            fake_zone = "🔴" * threshold_pos
-            real_zone = "🟢" * (bar_length - threshold_pos)
-            
-            # Create the marker line
-            marker_bar = " " * marker_pos + "▼" + " " * (bar_length - marker_pos - 1)
-            
-            # Print the visualization
-            print(f"  FAKE [{fake_zone}{real_zone}] REAL")
-            print(f"       {marker_bar}")
-            print(f"       {' ' * threshold_pos}|")  # Threshold marker
-            print(f"  Logit difference: {logit_diff:.4f} (Threshold: {real_logit_threshold:.4f})")
-            print(f"  Visualization range: {viz_min:.4f} - {viz_max:.4f}")
-            
-            # Provide clear interpretation
-            diff_from_threshold = abs(logit_diff - real_logit_threshold)
-            if diff_from_threshold < 0.01:
-                print(f"  🟡 BORDERLINE: This video is very near the decision boundary")
-                print(f"     (Difference from threshold: {diff_from_threshold:.4f})")
-            elif logit_diff < real_logit_threshold:
-                print(f"  🔴 FAKE DETECTED: Logit diff below threshold by {real_logit_threshold - logit_diff:.4f}")
-            else:
-                print(f"  🟢 REAL DETECTED: Logit diff above threshold by {logit_diff - real_logit_threshold:.4f}")
-            
-            # Interpretation of result based on logit analysis
+            # Interpretation of result
             print("\n🔍 Interpretation:")
-            diff_from_threshold = abs(logit_diff - real_logit_threshold)
             
-            if diff_from_threshold < 0.02:
-                print("  ⚠️ BORDERLINE CASE: The model is uncertain about this video.")
-                print("     • Video characteristics are very close to the decision boundary")
-                print("     • This could be a high-quality deepfake or a real video with unusual features")
-                print("     • Consider additional verification methods for this video")
-                print(f"     • The difference from threshold is only {diff_from_threshold:.4f}")
-                print("     • ⚠️ IMPORTANT: Some sophisticated deepfakes like fake_014.mp4 have high logit differences")
-            elif confidence > 80:
+            
+            if confidence > 0.75:
                 if result == "FAKE":
-                    print("  🚨 HIGH CONFIDENCE FAKE: This is highly likely to be a deepfake video.")
-                    print(f"     • Logit difference ({logit_diff:.4f}) is clearly below our threshold ({real_logit_threshold:.4f})")
-                    print(f"     • Difference of {real_logit_threshold - logit_diff:.4f} indicates manipulation")
-                    print("     • Based on calibrated analysis comparing with known real/fake samples")
+                    print(f"  🚨 HIGH CONFIDENCE: This is highly likely to be a deepfake video.")
+                    print(f"     • Model confidence: {confidence_pct:.2f}%")
+                    print(f"     • Fake probability ({fake_prob:.4f}) is significantly higher than real ({real_prob:.4f})")
                 else:
-                    print("  ✅ HIGH CONFIDENCE REAL: This is highly likely to be an authentic video.")
-                    print(f"     • Logit difference ({logit_diff:.4f}) is clearly above our threshold ({real_logit_threshold:.4f})")
-                    print(f"     • Difference of {logit_diff - real_logit_threshold:.4f} indicates authenticity")
-                    print("     • Based on calibrated analysis comparing with known real/fake samples")
+                    print(f"  ✅ HIGH CONFIDENCE: This is highly likely to be an authentic video.")
+                    print(f"     • Model confidence: {confidence_pct:.2f}%")
+                    print(f"     • Real probability ({real_prob:.4f}) is significantly higher than fake ({fake_prob:.4f})")
+            elif confidence > 0.60:
+                if result == "FAKE":
+                    print(f"  ⚠️ MEDIUM CONFIDENCE: This video shows characteristics of being manipulated.")
+                    print(f"     • Model confidence: {confidence_pct:.2f}%")
+                    print(f"     • Fake probability ({fake_prob:.4f}) is higher than real ({real_prob:.4f})")
+                else:
+                    print(f"  ⚠️ MEDIUM CONFIDENCE: This video appears mostly authentic.")
+                    print(f"     • Model confidence: {confidence_pct:.2f}%")
+                    print(f"     • Real probability ({real_prob:.4f}) is higher than fake ({fake_prob:.4f})")
             else:
-                if result == "FAKE":
-                    print("  ⚠️ LIKELY FAKE: This video shows characteristics of being manipulated.")
-                    print(f"     • Logit difference ({logit_diff:.4f}) is below our threshold ({real_logit_threshold:.4f})")
-                    print(f"     • The difference from threshold ({real_logit_threshold - logit_diff:.4f}) suggests manipulation")
-                    print("     • Medium-confidence detection based on subtle differences")
-                else:
-                    print("  ⚠️ LIKELY REAL: This video appears mostly authentic but with some unusual characteristics.")
-                    print(f"     • Logit difference ({logit_diff:.4f}) is above our threshold ({real_logit_threshold:.4f})")
-                    print(f"     • The difference from threshold ({logit_diff - real_logit_threshold:.4f}) suggests authenticity")
-                    print("     • Medium-confidence detection based on subtle differences")
+                print(f"  ⚠️ LOW CONFIDENCE: The model is uncertain about this video.")
+                print(f"     • Model confidence: {confidence_pct:.2f}%")
+                print(f"     • Probabilities are very close: Real={real_prob:.4f}, Fake={fake_prob:.4f}")
+                print("     • Consider additional verification methods")
             
-            print("\n📈 Model Training Analysis:")
-            print("  • Model was trained with extreme class balancing techniques")
-            print("  • Used manual_extreme class weights, oversample_minority, and focal loss (alpha=0.75, gamma=2.0)")
-            print("  • Best validation performance at epoch 16 with Macro F1: 0.7220, Accuracy: 0.7300")
-            print("  • Raw probabilities are NOT reliable due to extreme training imbalance")
-            print(f"  • Using precise logit difference threshold of {real_logit_threshold:.4f} as decision boundary")
-            print("  • Threshold was calibrated using multiple real/fake reference videos")
-            print("  • IMPORTANT: Some fake videos have very high logit differences (≈3.90) that appear real-like")
-            
-            print("\n🔍 Detection Analysis:")
-            print(f"  • DETECTED AS {result}")
-            print(f"  • Confidence: {confidence:.1f}% ({confidence_level})")
+            print("\n🔍 Detection Summary:")
+            print(f"  • Prediction: {result}")
+            print(f"  • Confidence: {confidence_pct:.2f}% ({confidence_level})")
             print(f"  • Decision based on: {decision_rule}")
-            print(f"  • Key metrics:")
-            print(f"    - Logit difference (real-fake): {logit_diff:.4f}")
-            print(f"    - Threshold for real classification: {real_logit_threshold:.4f}")
-            print(f"    - Raw real probability: {real_prob:.6f}")
-            print(f"    - Raw fake probability: {fake_prob:.6f}")
-            print("  • Model was trained with:")
-            print(f"    - Extreme class balancing (manual_extreme mode)")
-            print(f"    - Focal loss (alpha=0.75, gamma=2.0)")
-            print(f"    - Best model from epoch 16 (Macro F1: 0.7220)")
             
+            # Show a simple conclusion
             if result == "FAKE":
-                print("\n🚨 This video appears to be manipulated (deepfake)")
-                print(f"    Logit difference ({logit_diff:.4f}) is below the threshold for real videos ({real_logit_threshold:.4f})")
+                print(f"\n🚨 This video appears to be manipulated (deepfake)")
             else:
-                print("\n✅ This video appears to be authentic (real)")
-                print(f"    Logit difference ({logit_diff:.4f}) is above the threshold for real videos ({real_logit_threshold:.4f})")
+                print(f"\n✅ This video appears to be authentic (real)")
             
             # Show key features if available
             if isinstance(results, dict) and results:
-                print("\n🔎 Detection Features:")
+                print("\n🔎 Additional Features:")
+                feature_count = 0
                 for key, value in results.items():
+                    if feature_count >= 5:  # Limit to 5 features
+                        break
                     if isinstance(value, torch.Tensor):
                         if value.numel() == 1:
                             print(f"  • {key}: {float(value):.4f}")
+                            feature_count += 1
                     elif isinstance(value, float):
                         print(f"  • {key}: {value:.4f}")
-                    elif isinstance(value, bool):
-                        print(f"  • {key}: {'✓' if value else '✗'}")
-                    elif isinstance(value, str):
-                        print(f"  • {key}: {value}")
+                        feature_count += 1
                     
         except Exception as e:
             print(f"❌ Error during prediction: {e}")
