@@ -20,6 +20,17 @@ import uuid
 import dlib
 from audiomentations import Compose, AddGaussianNoise, PitchShift, TimeStretch, Shift
 import albumentations as A
+
+# Import our improved augmentation techniques
+try:
+    from improved_augmentation import (
+        get_advanced_video_transforms, 
+        get_advanced_audio_transforms,
+        TemporalConsistencyAugmenter,
+        mix_up_augmentation
+    )
+except ImportError:
+    print("Warning: improved_augmentation.py not found, falling back to standard augmentation")
 try:
     from facenet_pytorch import MTCNN
 except ImportError:
@@ -1499,36 +1510,57 @@ def get_transforms(phase='train'):
 
 
 def get_transforms_enhanced(phase='train'):
-    """Enhanced transforms with more diverse augmentations."""
-    if phase == 'train':
-        # Advanced training transforms with augmentation
-        video_transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.RandomResizedCrop(224, scale=(0.8, 1.0)),
-            transforms.RandomHorizontalFlip(),
-            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
-            transforms.RandomRotation(15),
-            transforms.RandomAffine(degrees=0, translate=(0.1, 0.1), scale=(0.9, 1.1)),
-            transforms.RandomPerspective(distortion_scale=0.2, p=0.5),
-            transforms.RandomErasing(p=0.2, scale=(0.02, 0.15), ratio=(0.3, 3.3)),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ])
-        
-        audio_transform = Compose([
-            AddGaussianNoise(min_amplitude=0.001, max_amplitude=0.02, p=0.6),
-            PitchShift(min_semitones=-4, max_semitones=4, p=0.6),
-            TimeStretch(min_rate=0.8, max_rate=1.2, p=0.5),
-            Shift(min_shift=-0.5, max_shift=0.5, p=0.5),
-        ])
-    else:
-        # Validation/test transforms (same as before for consistency)
-        video_transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Resize((224, 224)),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ])
-        
-        audio_transform = None
+    """Enhanced transforms with more diverse augmentations from improved_augmentation.py."""
+    try:
+        # Try to use the advanced augmentation techniques from improved_augmentation.py
+        if phase == 'train':
+            # Use our advanced video transforms with temporal consistency
+            video_transform = get_advanced_video_transforms(train=True)
+            
+            # Use our advanced audio transforms 
+            audio_transform = get_advanced_audio_transforms(train=True)
+            
+            # Add temporal consistency augmenter if available
+            if 'TemporalConsistencyAugmenter' in globals():
+                print("✅ Using Temporal Consistency Augmenter")
+                # This will be applied at the batch level in the training loop
+        else:
+            # Validation/test transforms - use standard transforms for consistency
+            video_transform = get_advanced_video_transforms(train=False)
+            audio_transform = get_advanced_audio_transforms(train=False)
+            
+    except (NameError, ImportError) as e:
+        # Fallback to standard enhanced transforms if advanced ones aren't available
+        print(f"⚠️ Falling back to standard enhanced transforms: {e}")
+        if phase == 'train':
+            # Advanced training transforms with augmentation
+            video_transform = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.RandomResizedCrop(224, scale=(0.8, 1.0)),
+                transforms.RandomHorizontalFlip(),
+                transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+                transforms.RandomRotation(15),
+                transforms.RandomAffine(degrees=0, translate=(0.1, 0.1), scale=(0.9, 1.1)),
+                transforms.RandomPerspective(distortion_scale=0.2, p=0.5),
+                transforms.RandomErasing(p=0.2, scale=(0.02, 0.15), ratio=(0.3, 3.3)),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ])
+            
+            audio_transform = Compose([
+                AddGaussianNoise(min_amplitude=0.001, max_amplitude=0.02, p=0.6),
+                PitchShift(min_semitones=-4, max_semitones=4, p=0.6),
+                TimeStretch(min_rate=0.8, max_rate=1.2, p=0.5),
+                Shift(min_shift=-0.5, max_shift=0.5, p=0.5),
+            ])
+        else:
+            # Validation/test transforms (same as before for consistency)
+            video_transform = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Resize((224, 224)),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ])
+            
+            audio_transform = None
         
     return video_transform, audio_transform
 
@@ -1537,7 +1569,8 @@ def get_data_loaders(
     json_path, data_dir, batch_size=4, validation_split=0.2, test_split=0.1,
     shuffle=True, num_workers=2, max_samples=None, detect_faces=True,
     compute_spectrograms=True, temporal_features=True, enhanced_preprocessing=True,
-    enhanced_augmentation=False, multiprocessing_context=None
+    enhanced_augmentation=False, multiprocessing_context=None, 
+    use_mixup=True, mixup_alpha=0.2, cutmix_prob=0.3
 ):
     """
     Load data loaders with an option to restrict the maximum number of samples.
@@ -1557,14 +1590,31 @@ def get_data_loaders(
         enhanced_preprocessing (bool): Whether to enable enhanced preprocessing features.
         enhanced_augmentation (bool): Whether to use enhanced data augmentation techniques.
         multiprocessing_context (str, optional): Multiprocessing context method ('spawn', 'fork', etc.) for safety.
+        use_mixup (bool): Whether to enable MixUp data augmentation (when enhanced_augmentation is True).
+        mixup_alpha (float): Alpha parameter for MixUp augmentation.
+        cutmix_prob (float): Probability of applying CutMix instead of MixUp.
     
     Returns:
-        tuple: Training, validation, and test data loaders, plus class weights.
+        tuple: Training, validation, and test data loaders, plus class weights and optionally a mixup function.
     """
+    # Store if we're using MixUp
+    using_mixup = enhanced_augmentation and use_mixup
+    mixup_fn = None
+    
     # Get transforms for training and validation
     if enhanced_augmentation:
         train_video_transform, train_audio_transform = get_transforms_enhanced('train')
         val_video_transform, val_audio_transform = get_transforms_enhanced('val')
+        
+        # Set up MixUp/CutMix if we're using advanced augmentations
+        if using_mixup:
+            try:
+                # Create MixUp augmentation function from improved_augmentation.py
+                mixup_fn = mix_up_augmentation
+                print("✅ Using MixUp/CutMix augmentation from improved_augmentation.py")
+            except (NameError, AttributeError) as e:
+                print(f"⚠️ MixUp augmentation not available: {e}")
+                using_mixup = False
     else:
         train_video_transform, train_audio_transform = get_transforms('train')
         val_video_transform, val_audio_transform = get_transforms('val')
@@ -1705,7 +1755,12 @@ def get_data_loaders(
     test_loader = DataLoader(**test_loader_kwargs)
 
     print(f"✅ Dataset loaded with {len(train_indices)} training, {len(val_indices)} validation, and {len(test_indices)} test samples.")
-    return train_loader, val_loader, test_loader, class_weights
+    
+    # Return mixup function if using enhanced augmentation
+    if enhanced_augmentation and 'mixup_fn' in locals() and mixup_fn is not None:
+        return train_loader, val_loader, test_loader, class_weights, mixup_fn
+    else:
+        return train_loader, val_loader, test_loader, class_weights
 
 
 def collate_fn(batch):
