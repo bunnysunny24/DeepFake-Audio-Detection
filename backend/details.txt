@@ -131,3 +131,22 @@ You run training scripts with multiprocessing disabled (num_workers=0 for safety
 
 
 python f:\deepfake\backup\Models\predict_deepfake.py f:\deepfake\backup\Models\server_checkpoints\best_model.pth f:\deepfake\backup\LAV-DF\fake_014.mp4
+
+
+
+1. Test with different datasets – evaluate generalization across multiple domains.
+
+
+2. Layer adjustments – experiment with dropping some dropout or normalization layers and record performance changes.
+
+
+3. Quantization – quantize the model and check the accuracy drop; compare different quantization methods.
+
+
+4. ONNX Implementation – test model export to ONNX, run inference, and optimize using available ONNX runtime techniques.
+
+
+5. Modality separation – if possible, split and test model performance for audio-only and image-only inputs.
+
+
+6. Latency optimization – try to decrease the latency between model prediction and output generation.
