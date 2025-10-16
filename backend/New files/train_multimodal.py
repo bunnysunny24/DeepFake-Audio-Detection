@@ -328,7 +328,7 @@ def calculate_metrics(y_true, y_pred, y_probs, epoch, return_dict=False):
     print(f"- Precision   : {precision:.4f}")
     print(f"- Recall      : {recall:.4f}")
     print(f"- F1 Score    : {f1:.4f}")
-    print(f"- Macro F1    : {macro_f1:.4f} ⭐")  # Key metric for imbalanced data
+    print(f"- Macro F1    : {macro_f1:.4f} (key)")  # Key metric for imbalanced data
     print(f"- AUC Score   : {auc_score:.4f}")
     
     # Per-class breakdown
@@ -789,6 +789,16 @@ class DeepfakeTrainer:
             'val_auc_scores': []
         }
         
+        # Set up logging to file if specified
+        self.log_file = None
+        if self.config.log_file:
+            os.makedirs(os.path.dirname(os.path.abspath(self.config.log_file)), exist_ok=True)
+            self.log_file = open(self.config.log_file, 'w', encoding='utf-8')
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self.log_file.write(f"=== DeepFake Detection Training Log - {timestamp} ===\n")
+            self.log_file.write(f"Configuration: {vars(self.config)}\n\n")
+            self.log_file.flush()
+        
         # Initialize numerical stability tracking
         self.nan_count = 0
         self.total_batches = 0
@@ -1153,7 +1163,7 @@ class DeepfakeTrainer:
             print("🚀 Single-threaded loading avoids I/O contention with complex preprocessing")
         
         # Get data loaders with appropriate options
-        self.train_loader, self.val_loader, self.test_loader, self.class_weights = get_data_loaders(
+        result = get_data_loaders(
             json_path=self.config.json_path,
             data_dir=self.config.data_dir,
             batch_size=self.config.batch_size,
@@ -1169,6 +1179,14 @@ class DeepfakeTrainer:
             enhanced_augmentation=getattr(self.config, 'enhanced_augmentation', False),
             multiprocessing_context="spawn"  # 🧼 SAFETY: Prevent GPU context corruption in multiprocessing
         )
+        
+        # Unpack result - handle optional mixup_fn
+        if len(result) == 5:
+            self.train_loader, self.val_loader, self.test_loader, self.class_weights, self.mixup_fn = result
+            print("✅ Using MixUp/CutMix augmentation")
+        else:
+            self.train_loader, self.val_loader, self.test_loader, self.class_weights = result
+            self.mixup_fn = None
         
         print(f"✅ Data loaders created: {len(self.train_loader)} train batches, "
               f"{len(self.val_loader)} validation batches, {len(self.test_loader)} test batches")
@@ -1287,6 +1305,16 @@ class DeepfakeTrainer:
         elif self.config.scheduler == 'cosine':
             self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
                 self.optimizer, T_max=self.config.num_epochs
+            )
+        elif self.config.scheduler == 'cosine_with_restarts':
+            # Cosine Annealing with Warm Restarts (SGDR)
+            # T_0: Number of epochs for the first restart (cycle length)
+            # T_mult: Factor to increase cycle length after each restart
+            self.scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                self.optimizer, 
+                T_0=10,  # First cycle: 10 epochs
+                T_mult=2,  # Each subsequent cycle is 2x longer (10, 20, 40...)
+                eta_min=1e-7  # Minimum learning rate
             )
         elif self.config.scheduler == 'plateau':
             self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
@@ -2213,9 +2241,32 @@ class DeepfakeTrainer:
             
             # Print epoch summary
             if self.is_main_process:
-                print(f"\nEpoch {epoch+1}/{self.config.num_epochs} completed in {epoch_time:.2f}s")
-                print(f"Train - Loss: {train_loss:.4f}, Accuracy: {train_acc:.4f}, F1: {train_f1:.4f}, Macro F1: {train_macro_f1:.4f} ⭐, AUC: {train_auc:.4f}")
-                print(f"Val   - Loss: {val_loss:.4f}, Accuracy: {val_acc:.4f}, F1: {val_f1:.4f}, Macro F1: {val_macro_f1:.4f} ⭐, AUC: {val_auc:.4f}")
+                epoch_summary = f"\nEpoch {epoch+1}/{self.config.num_epochs} completed in {epoch_time:.2f}s"
+                # Keep the star in console output but use (key) for log file
+                train_metrics_console = f"Train - Loss: {train_loss:.4f}, Accuracy: {train_acc:.4f}, F1: {train_f1:.4f}, Macro F1: {train_macro_f1:.4f} ⭐, AUC: {train_auc:.4f}"
+                val_metrics_console = f"Val   - Loss: {val_loss:.4f}, Accuracy: {val_acc:.4f}, F1: {val_f1:.4f}, Macro F1: {val_macro_f1:.4f} ⭐, AUC: {val_auc:.4f}"
+                
+                # Plain text versions for log file (no emoji)
+                train_metrics = f"Train - Loss: {train_loss:.4f}, Accuracy: {train_acc:.4f}, F1: {train_f1:.4f}, Macro F1: {train_macro_f1:.4f} (key), AUC: {train_auc:.4f}"
+                val_metrics = f"Val   - Loss: {val_loss:.4f}, Accuracy: {val_acc:.4f}, F1: {val_f1:.4f}, Macro F1: {val_macro_f1:.4f} (key), AUC: {val_auc:.4f}"
+                
+                print(train_metrics_console)
+                print(val_metrics_console)
+                
+                print(epoch_summary)
+                
+                # Log to file if specified
+                if self.log_file:
+                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    self.log_file.write(f"{timestamp} - {epoch_summary}\n")
+                    self.log_file.write(f"{timestamp} - {train_metrics}\n")
+                    self.log_file.write(f"{timestamp} - {val_metrics}\n")
+                    
+                    # Log additional metrics in CSV format for easy analysis
+                    self.log_file.write(f"EPOCH_CSV,{epoch+1},{train_loss:.6f},{train_acc:.6f},{train_precision:.6f},{train_recall:.6f},{train_f1:.6f},{train_macro_f1:.6f},{train_auc:.6f},")
+                    self.log_file.write(f"{val_loss:.6f},{val_acc:.6f},{val_precision:.6f},{val_recall:.6f},{val_f1:.6f},{val_macro_f1:.6f},{val_auc:.6f}\n")
+                    
+                    self.log_file.flush()
                 
                 # Save checkpoint (use macro F1 for balanced evaluation)
                 self.save_checkpoint(epoch, val_acc, val_macro_f1)
@@ -2281,14 +2332,36 @@ class DeepfakeTrainer:
                     print(f"Early stopping counter: {self.early_stop_counter}/{self.config.early_stopping_patience}")
                 
                 if self.early_stop_counter >= self.config.early_stopping_patience:
-                    print(f"\nEarly stopping triggered after {epoch+1} epochs")
-                    print(f"Best validation Macro F1: {self.best_val_f1:.4f}, Accuracy: {self.best_val_accuracy:.4f} (Epoch {self.best_epoch})")
+                    early_stop_msg = f"\nEarly stopping triggered after {epoch+1} epochs"
+                    best_results_msg = f"Best validation Macro F1: {self.best_val_f1:.4f}, Accuracy: {self.best_val_accuracy:.4f} (Epoch {self.best_epoch})"
+                    
+                    # Messages without emojis for log file
+                    print(early_stop_msg)
+                    print(best_results_msg)
+                    
+                    # Log to file if specified
+                    if self.log_file:
+                        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        self.log_file.write(f"{timestamp} - {early_stop_msg}\n")
+                        self.log_file.write(f"{timestamp} - {best_results_msg}\n")
+                        self.log_file.flush()
+                    
                     break
         
         # Print training summary
         if self.is_main_process:
-            print("\nTraining completed!")
-            print(f"Best validation Macro F1: {self.best_val_f1:.4f}, Accuracy: {self.best_val_accuracy:.4f} (Epoch {self.best_epoch})")
+            training_complete_msg = "\nTraining completed!"
+            best_results_msg = f"Best validation Macro F1: {self.best_val_f1:.4f}, Accuracy: {self.best_val_accuracy:.4f} (Epoch {self.best_epoch})"
+            
+            print(training_complete_msg)
+            print(best_results_msg)
+            
+            # Log to file if specified
+            if self.log_file:
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                self.log_file.write(f"{timestamp} - {training_complete_msg}\n")
+                self.log_file.write(f"{timestamp} - {best_results_msg}\n")
+                self.log_file.flush()
             
             # Load best model for testing
             self.load_best_model()
@@ -2335,6 +2408,21 @@ class DeepfakeTrainer:
                 json.dump(serializable_results, f, indent=4)
             
             print(f"Final results saved to: {final_results_path}")
+            
+            # Close log file if it was opened
+            if self.log_file:
+                final_msg = f"Training completed. Final results saved to: {final_results_path}"
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                self.log_file.write(f"{timestamp} - {final_msg}\n")
+                
+                # Log test metrics
+                test_metrics_msg = f"Test - Loss: {test_loss:.4f}, Accuracy: {test_metrics['accuracy']:.4f}, F1: {test_metrics['f1']:.4f}, " \
+                                  f"Precision: {test_metrics['precision']:.4f}, Recall: {test_metrics['recall']:.4f}, AUC: {test_metrics['auc']:.4f}"
+                self.log_file.write(f"{timestamp} - {test_metrics_msg}\n")
+                
+                # Close the log file
+                self.log_file.close()
+                print(f"Training log saved to: {self.config.log_file}")
     
     def save_checkpoint(self, epoch, accuracy, f1_score):
         """Save model checkpoint."""
@@ -2556,7 +2644,7 @@ def parse_args():
     parser.add_argument('--class_weights_mode', type=str, default='balanced', choices=['balanced', 'manual', 'manual_extreme', 'none'], help='How to compute class weights')
     
     parser.add_argument('--optimizer', type=str, default='adamw', choices=['adam', 'adamw', 'sgd'], help='Optimizer to use')
-    parser.add_argument('--scheduler', type=str, default='cosine', choices=['step', 'cosine', 'plateau', 'none'], help='Learning rate scheduler')
+    parser.add_argument('--scheduler', type=str, default='cosine', choices=['step', 'cosine', 'cosine_with_restarts', 'plateau', 'none'], help='Learning rate scheduler')
     parser.add_argument('--scheduler_step_size', type=int, default=10, help='Step size for StepLR scheduler')
     parser.add_argument('--scheduler_gamma', type=float, default=0.1, help='Gamma for StepLR scheduler')
     parser.add_argument('--scheduler_patience', type=int, default=5, help='Patience for ReduceLROnPlateau scheduler')
@@ -2577,6 +2665,7 @@ def parse_args():
     parser.add_argument('--wandb_project', type=str, default='deepfake-detection', help='WandB project name')
     parser.add_argument('--wandb_run_name', type=str, default=None, help='WandB run name')
     parser.add_argument('--log_interval', type=int, default=10, help='Interval for logging batch results')
+    parser.add_argument('--log_file', type=str, default='', help='Path to save training and validation logs')
     parser.add_argument('--visualization_interval', type=int, default=50, help='Interval for visualizing predictions')
     parser.add_argument('--save_intermediate', action='store_true', help='Save intermediate checkpoints')
     parser.add_argument('--save_intermediate_interval', type=int, default=20, help='Interval for saving intermediate checkpoints')
