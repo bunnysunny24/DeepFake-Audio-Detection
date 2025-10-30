@@ -189,17 +189,32 @@ class MultiModalDeepfakeDataset(Dataset):
                 fake_count += 1
             else:
                 real_count += 1
+        
+        # Log dataset distribution
+        total = real_count + fake_count
+        real_pct = (real_count / total * 100) if total > 0 else 0
+        fake_pct = (fake_count / total * 100) if total > 0 else 0
+        phase_name = getattr(self, 'phase', 'UNKNOWN').upper()
+        print(f"\n{'='*60}")
+        print(f"📊 DATASET CLASS DISTRIBUTION ({phase_name})")
+        print(f"{'='*60}")
+        print(f"  Real videos: {real_count:5d} ({real_pct:5.2f}%)")
+        print(f"  Fake videos: {fake_count:5d} ({fake_pct:5.2f}%)")
+        print(f"  Total:       {total:5d}")
+        print(f"  Imbalance ratio (Fake:Real): {fake_count/max(real_count, 1):.2f}:1")
+        print(f"{'='*60}\n")
                 
         return {'real': real_count, 'fake': fake_count}
     
     def _calculate_class_weights(self):
         """Calculate class weights for handling imbalanced data."""
         if self.class_counts['real'] == 0 or self.class_counts['fake'] == 0:
-            return torch.tensor([1.0, 1.0])
+            return torch.tensor([1.0, 1.0], dtype=torch.float32)
             
         total = self.class_counts['real'] + self.class_counts['fake']
-        weight_real = total / (2.0 * self.class_counts['real'])
-        weight_fake = total / (2.0 * self.class_counts['fake'])
+        
+        # Calculate imbalance ratio
+        imbalance_ratio = self.class_counts['fake'] / max(self.class_counts['real'], 1)
         
         # For manual_extreme mode, use a very high weight for the real class
         # This is for cases with extreme class imbalance
@@ -208,9 +223,30 @@ class MultiModalDeepfakeDataset(Dataset):
             # Set real:fake weight ratio to 10:1
             weight_real = 10.0  # Real class (minority)
             weight_fake = 1.0   # Fake class (majority)
+        
+        # For sqrt_balanced mode, explicitly use square root balanced weights
+        elif hasattr(self, "class_weights_mode") and self.class_weights_mode == "sqrt_balanced":
+            weight_real = float(np.sqrt(total / (2.0 * self.class_counts['real'])))
+            weight_fake = float(np.sqrt(total / (2.0 * self.class_counts['fake'])))
+            print(f"Using sqrt_balanced class weights (imbalance ratio {imbalance_ratio:.2f}:1)")
+        
+        # For severe imbalance (ratio > 2), use stronger default weights in balanced mode
+        elif imbalance_ratio > 2.0:
+            # Use square root of ratio to get stronger weighting
+            weight_real = float(np.sqrt(total / (2.0 * self.class_counts['real'])))
+            weight_fake = float(np.sqrt(total / (2.0 * self.class_counts['fake'])))
+            print(f"⚠️  Severe class imbalance detected (ratio {imbalance_ratio:.2f}:1)")
+            print(f"Using enhanced class weights (sqrt-balanced)")
+        
+        else:
+            # Standard balanced weights
+            weight_real = float(total / (2.0 * self.class_counts['real']))
+            weight_fake = float(total / (2.0 * self.class_counts['fake']))
+            print("Using standard balanced class weights")
             
-        weights = torch.tensor([weight_real, weight_fake])
-        print(f"Class weights: {weights}")
+        weights = torch.tensor([weight_real, weight_fake], dtype=torch.float32)
+        print(f"📊 Final class weights: Real={weight_real:.4f}, Fake={weight_fake:.4f}")
+        print(f"   (Real class weight is {weight_real/weight_fake:.2f}x higher than Fake)\n")
         
         return weights
 
@@ -657,16 +693,25 @@ class MultiModalDeepfakeDataset(Dataset):
                 # Extract facial landmarks even if no face was detected (for consistency)
                 all_landmarks.append(landmarks if landmarks else [0] * 136)  # 68 landmarks * 2 coordinates
                 
-                # Resize frame
-                frame_rgb = cv2.resize(frame_rgb, (224, 224))
+                # Ensure frame is in correct format for transforms (uint8, 0-255 range)
+                if frame_rgb.dtype != np.uint8:
+                    if frame_rgb.max() <= 1.0:
+                        frame_rgb = (frame_rgb * 255).astype(np.uint8)
+                    else:
+                        frame_rgb = np.clip(frame_rgb, 0, 255).astype(np.uint8)
                 
                 # Apply transformations
                 if self.transform:
                     try:
-                        if self.phase == 'train':  # Apply augmentation only during training
-                            frame_rgb = self.transform(frame_rgb)
+                        # Check if using Albumentation transforms (require named arguments)
+                        if hasattr(self.transform, 'processors'):
+                            # Albumentation Compose object - use named argument
+                            # Frame must be uint8 for Albumentation
+                            transformed = self.transform(image=frame_rgb)
+                            frame_rgb = transformed['image']
                         else:
-                            # Just normalize for validation/testing
+                            # PyTorch transforms - resize first
+                            frame_rgb = cv2.resize(frame_rgb, (224, 224))
                             frame_rgb = self.transform(frame_rgb)
                         
                         # Ensure result is a tensor

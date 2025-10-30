@@ -367,11 +367,52 @@ class FocalLoss(nn.Module):
         self.gamma = gamma
         self.class_weights = class_weights
         self.reduction = reduction
+        self.debug_counter = 0  # For periodic debugging
         
     def forward(self, inputs, targets):
-        ce_loss = F.cross_entropy(inputs, targets, weight=self.class_weights, reduction='none')
+        # Add numerical stability - clamp logits to prevent extreme values
+        inputs = torch.clamp(inputs, min=-50, max=50)
+        
+        # Debug: Check inputs and targets
+        if self.debug_counter % 100 == 0:
+            print(f"[FOCAL LOSS DEBUG] Input logits shape: {inputs.shape}")
+            print(f"[FOCAL LOSS DEBUG] Input logits sample: {inputs[:3]}")
+            print(f"[FOCAL LOSS DEBUG] Targets shape: {targets.shape}")
+            print(f"[FOCAL LOSS DEBUG] Targets sample: {targets[:8]}")
+            print(f"[FOCAL LOSS DEBUG] Class weights: {self.class_weights}")
+        
+        # First, calculate CE loss WITHOUT weights to diagnose the issue
+        ce_loss_no_weight = F.cross_entropy(inputs, targets, reduction='none')
+        
+        # Then calculate WITH weights, ensuring proper device but KEEP float32 dtype
+        if self.class_weights is not None:
+            # CRITICAL: Keep weights in float32, don't convert to float16!
+            # PyTorch will handle the dtype conversion internally for cross_entropy
+            weights = self.class_weights.to(inputs.device, dtype=torch.float32)
+            ce_loss = F.cross_entropy(inputs, targets, weight=weights, reduction='none')
+        else:
+            ce_loss = ce_loss_no_weight
+        
+        # Debug CE loss
+        if self.debug_counter % 100 == 0:
+            print(f"[FOCAL LOSS DEBUG] CE loss (NO weights) sample: {ce_loss_no_weight[:8]}")
+            print(f"[FOCAL LOSS DEBUG] CE loss (WITH weights) sample: {ce_loss[:8]}")
+            print(f"[FOCAL LOSS DEBUG] CE loss (NO weights) range: [{ce_loss_no_weight.min().item():.6f}, {ce_loss_no_weight.max().item():.6f}]")
+        
         pt = torch.exp(-ce_loss)
+        
+        # Clamp pt to prevent (1-pt) from being exactly zero
+        pt = torch.clamp(pt, min=1e-7, max=1.0 - 1e-7)
+        
         focal_loss = self.alpha * (1-pt)**self.gamma * ce_loss
+        
+        # Debug logging every 100 batches
+        if self.debug_counter % 100 == 0:
+            print(f"[FOCAL LOSS DEBUG] CE loss (weighted) range: [{ce_loss.min().item():.6f}, {ce_loss.max().item():.6f}]")
+            print(f"[FOCAL LOSS DEBUG] pt range: [{pt.min().item():.6f}, {pt.max().item():.6f}]")
+            print(f"[FOCAL LOSS DEBUG] (1-pt)^gamma range: [{((1-pt)**self.gamma).min().item():.6e}, {((1-pt)**self.gamma).max().item():.6e}]")
+            print(f"[FOCAL LOSS DEBUG] Focal loss range: [{focal_loss.min().item():.6e}, {focal_loss.max().item():.6e}]")
+        self.debug_counter += 1
         
         if self.reduction == 'mean':
             return focal_loss.mean()
@@ -1188,6 +1229,10 @@ class DeepfakeTrainer:
             self.train_loader, self.val_loader, self.test_loader, self.class_weights = result
             self.mixup_fn = None
         
+        # CRITICAL DEBUG: Check class weights immediately after assignment from dataset loader
+        print(f"[CRITICAL DEBUG] Class weights from dataset_loader: {self.class_weights}")
+        print(f"[CRITICAL DEBUG] Dtype from dataset_loader: {self.class_weights.dtype if self.class_weights is not None else 'None'}")
+        
         print(f"✅ Data loaders created: {len(self.train_loader)} train batches, "
               f"{len(self.val_loader)} validation batches, {len(self.test_loader)} test batches")
     
@@ -1195,8 +1240,16 @@ class DeepfakeTrainer:
         """Initialize model, loss function, optimizer, and scheduler."""
         print(f"Initializing model on {self.device}...")
 
-        # Move class weights to device
-        self.class_weights = self.class_weights.to(self.device) if self.class_weights is not None else None
+        # Move class weights to device - CRITICAL: Preserve float32 dtype!
+        if self.class_weights is not None:
+            print(f"[DEBUG] Class weights BEFORE device transfer: {self.class_weights}")
+            print(f"[DEBUG] Class weights dtype BEFORE: {self.class_weights.dtype}")
+            # Ensure weights stay in float32, not float16
+            self.class_weights = self.class_weights.to(device=self.device, dtype=torch.float32)
+            print(f"[DEBUG] Class weights AFTER device transfer: {self.class_weights}")
+            print(f"[DEBUG] Class weights dtype AFTER: {self.class_weights.dtype}")
+        else:
+            self.class_weights = None
 
         # Initialize model
         self.model = MultiModalDeepfakeModel(
@@ -1272,12 +1325,21 @@ class DeepfakeTrainer:
             # Use Focal Loss for better handling of class imbalance
             focal_alpha = getattr(self.config, 'focal_alpha', 1.0)
             focal_gamma = getattr(self.config, 'focal_gamma', 2.0)
+            
+            # CRITICAL FIX: Ensure class_weights are in float32 before passing to FocalLoss
+            if self.class_weights is not None and self.config.use_weighted_loss:
+                # Clone and ensure float32 dtype to prevent float16 corruption
+                class_weights_for_loss = self.class_weights.clone().to(dtype=torch.float32)
+                print(f"[CRITICAL FIX] Class weights for FocalLoss: {class_weights_for_loss} (dtype: {class_weights_for_loss.dtype})")
+            else:
+                class_weights_for_loss = None
+            
             self.criterion = FocalLoss(
                 alpha=focal_alpha, 
                 gamma=focal_gamma, 
-                class_weights=self.class_weights if self.config.use_weighted_loss else None
+                class_weights=class_weights_for_loss
             )
-            print(f"Using Focal Loss (alpha={focal_alpha}, gamma={focal_gamma}) with weights: {self.class_weights}")
+            print(f"Using Focal Loss (alpha={focal_alpha}, gamma={focal_gamma}) with weights: {class_weights_for_loss}")
         
         elif self.class_weights is not None and self.config.use_weighted_loss:
             # Use class-balanced Cross Entropy Loss
@@ -1455,6 +1517,8 @@ class DeepfakeTrainer:
             self.model.unfreeze_visual_layers(epoch)
         
         epoch_loss = 0
+        valid_batch_count = 0  # Track valid batches for accurate loss averaging
+        batch_losses = []  # Track individual batch losses for statistics
         y_true, y_pred, y_probs = [], [], []
         
         train_progress = tqdm(self.train_loader, desc=f"Epoch {epoch+1}/{self.config.num_epochs} [Train]", 
@@ -1602,6 +1666,8 @@ class DeepfakeTrainer:
                         if batch_idx < 5:
                             print(f"[DEBUG] After model forward - outputs shape: {outputs.shape}")
                             print(f"[DEBUG] After model forward - labels shape: {labels.shape}")
+                            print(f"[DEBUG] Raw outputs - min: {outputs.min().item():.4f}, max: {outputs.max().item():.4f}, mean: {outputs.mean().item():.4f}")
+                            print(f"[DEBUG] Softmax probs: {torch.softmax(outputs, dim=1)[:3]}")
                         
                         # Check for NaN in outputs
                         if torch.isnan(outputs).any():
@@ -1612,8 +1678,12 @@ class DeepfakeTrainer:
                             self.optimizer.zero_grad()
                             self.nan_count += 1
                             continue
-                        # Add numerical stability to outputs
-                        outputs = torch.clamp(outputs, min=-50, max=50)  # Prevent extreme values
+                        # Add numerical stability to outputs - use more conservative range
+                        outputs = torch.clamp(outputs, min=-10, max=10)  # Prevent extreme confidence
+                        
+                        if batch_idx < 5:
+                            print(f"[DEBUG] After clamp - min: {outputs.min().item():.4f}, max: {outputs.max().item():.4f}")
+                            print(f"[DEBUG] Labels: {labels[:8]}")
                         # Check and fix batch size
                         outputs, labels, batch_valid = _check_and_fix_batch_size(outputs, labels)
                         if not batch_valid:
@@ -1710,8 +1780,8 @@ class DeepfakeTrainer:
                         self.optimizer.zero_grad()
                         self.nan_count += 1
                         continue
-                    # Add numerical stability to outputs
-                    outputs = torch.clamp(outputs, min=-50, max=50)  # Prevent extreme values
+                    # Add numerical stability to outputs - use more conservative range
+                    outputs = torch.clamp(outputs, min=-10, max=10)  # Prevent extreme confidence
                     # Check and fix batch size
                     outputs, labels, batch_valid = _check_and_fix_batch_size(outputs, labels)
                     if not batch_valid:
@@ -1779,14 +1849,17 @@ class DeepfakeTrainer:
                     self.nan_count = 0  # Reset counter after adjustment
                     self.total_batches = 0
                 
-                # Update progress bar
+                # Update progress bar with better precision (scientific notation)
                 loss_display = loss.item() if not torch.isnan(loss) else "nan"
-                train_progress.set_postfix(loss=f"{loss_display:.4f}" if isinstance(loss_display, float) else loss_display, 
+                train_progress.set_postfix(loss=f"{loss_display:.6e}" if isinstance(loss_display, float) else loss_display, 
                                          lr=f"{get_lr(self.optimizer):.6f}")
                 
                 # Accumulate loss only if it's not NaN
                 if not torch.isnan(loss):
-                    epoch_loss += loss.item()
+                    loss_val = loss.item()
+                    epoch_loss += loss_val
+                    valid_batch_count += 1  # Track valid batches for accurate averaging
+                    batch_losses.append(loss_val)  # Track for statistics
                 else:
                     print(f"[WARNING] Skipping NaN loss in accumulation at batch {batch_idx}")
                 
@@ -1851,9 +1924,29 @@ class DeepfakeTrainer:
                 self.optimizer.zero_grad()
                 continue
         
-        # Calculate average loss and metrics
-        avg_loss = epoch_loss / len(self.train_loader)
+        # Calculate average loss using valid batch count
+        if valid_batch_count > 0:
+            avg_loss = epoch_loss / valid_batch_count
+            # Log batch loss statistics for debugging
+            if batch_losses:
+                print(f"\n[Loss Statistics] Min: {min(batch_losses):.6e}, Max: {max(batch_losses):.6e}, Mean: {np.mean(batch_losses):.6e}, Std: {np.std(batch_losses):.6e}")
+                print(f"[Loss Statistics] Valid batches: {valid_batch_count}/{len(self.train_loader)}")
+        else:
+            avg_loss = 0.0
+            print("[ERROR] No valid batches! All losses were NaN or skipped!")
+        
         precision, recall, f1, auc_score, accuracy, macro_f1 = calculate_metrics(y_true, y_pred, y_probs, epoch+1)
+        
+        # Check for degenerate solution (model only predicting one class)
+        unique_preds = np.unique(y_pred)
+        if len(unique_preds) == 1:
+            print(f"\n⚠️  WARNING: DEGENERATE SOLUTION DETECTED!")
+            print(f"⚠️  Model is only predicting class {unique_preds[0]} (always {'Fake' if unique_preds[0] == 1 else 'Real'})")
+            print(f"⚠️  This indicates severe class imbalance issues. Consider:")
+            print(f"   1. Increasing class weights for minority class")
+            print(f"   2. Using Focal Loss with higher gamma (--focal_gamma 3.0)")
+            print(f"   3. Oversampling minority class (--oversample_minority)")
+            print(f"   4. Reducing learning rate to prevent overfitting to majority class\n")
         
         # Store metrics (including macro F1 for balanced evaluation)
         self.metrics['train_losses'].append(avg_loss)
@@ -1886,7 +1979,26 @@ class DeepfakeTrainer:
                     
                     # Move batch to device
                     batch = move_batch_to_device(batch, self.device, trainer=self)
-                    
+
+                    # DEBUG: Inspect validation inputs for duplication or collapse
+                    if batch_idx < 3:  # only sample first few batches
+                        for key in ['video_frames', 'audio', 'landmarks', 'skin_color_features']:
+                            if key in batch and isinstance(batch[key], torch.Tensor):
+                                try:
+                                    tensor = batch[key]
+                                    bs = tensor.shape[0]
+                                    # flatten per-sample to compute simple statistics
+                                    flat = tensor.view(bs, -1).float()
+                                    per_sample_means = flat.mean(dim=1)
+                                    per_sample_stds = flat.std(dim=1)
+                                    print(f"[VAL DEBUG] batch_idx={batch_idx} - {key} per-sample mean (first 5): {per_sample_means[:5]}")
+                                    print(f"[VAL DEBUG] batch_idx={batch_idx} - {key} per-sample std (first 5): {per_sample_stds[:5]}")
+                                    print(f"[VAL DEBUG] {key} mean std across samples: {per_sample_means.std().item():.6f}")
+                                    if float(per_sample_means.std().item()) == 0.0:
+                                        print(f"[VAL DEBUG] WARNING: All samples in this batch have identical {key} mean -> possible duplicated inputs")
+                                except Exception as dbg_e:
+                                    print(f"[VAL DEBUG] Could not compute stats for {key}: {dbg_e}")
+
                     # Get labels
                     labels = batch['label']
                     
@@ -1907,9 +2019,22 @@ class DeepfakeTrainer:
                     
                     # Accumulate predictions and labels for metrics calculation
                     y_true.extend(labels.cpu().numpy())
+                    
+                    # Calculate softmax probabilities
+                    probs = torch.softmax(outputs, dim=1)
+                    
+                    # Debug: Print first batch validation predictions
+                    if batch_idx == 0 and epoch < 3:  # First 3 epochs
+                        print(f"\n[VALIDATION DEBUG] Epoch {epoch+1}, First batch:")
+                        print(f"[VALIDATION DEBUG] Raw outputs: {outputs[:5]}")
+                        print(f"[VALIDATION DEBUG] Softmax probs: {probs[:5]}")
+                        print(f"[VALIDATION DEBUG] Predictions (argmax): {outputs.argmax(1)[:5]}")
+                        print(f"[VALIDATION DEBUG] True labels: {labels[:5]}")
+                        print(f"[VALIDATION DEBUG] Prob[Fake] mean: {probs[:, 1].mean().item():.4f}, std: {probs[:, 1].std().item():.4f}\n")
+                    
                     predictions = outputs.argmax(1).cpu().numpy()
                     y_pred.extend(predictions)
-                    y_probs.extend(torch.softmax(outputs, dim=1)[:, 1].detach().cpu().numpy())
+                    y_probs.extend(probs[:, 1].detach().cpu().numpy())
                     
                     # Visualize sample predictions periodically
                     if (batch_idx + 1) % self.config.visualization_interval == 0 and self.is_main_process:
@@ -1956,7 +2081,68 @@ class DeepfakeTrainer:
         
         # Calculate average loss and metrics
         avg_loss = epoch_loss / len(self.val_loader)
+        
+        # Calculate metrics with default threshold (0.5)
         precision, recall, f1, auc_score, accuracy, macro_f1 = calculate_metrics(y_true, y_pred, y_probs, epoch+1)
+        
+        # EXPERIMENTAL: Try class-balanced threshold for better detection
+        # With 74% Fake, 26% Real, adjust threshold to compensate for imbalance
+        if hasattr(self, 'class_weights') and self.class_weights is not None:
+            # Use inverse of class distribution as threshold adjustment
+            # If training is 74% Fake (label=1), we should be MORE conservative about predicting Fake
+            fake_ratio = 0.74  # Could calculate from training data
+            balanced_threshold = 1.0 - fake_ratio  # = 0.26 (require only 26% prob to predict Real)
+            
+            print(f"\n[THRESHOLD TUNING] Default threshold: 0.50")
+            print(f"[THRESHOLD TUNING] Class-balanced threshold: {balanced_threshold:.2f}")
+            print(f"[THRESHOLD TUNING] Testing balanced threshold...")
+            
+            # Re-calculate predictions with balanced threshold
+            y_probs_array = np.array(y_probs)
+            y_pred_balanced = (y_probs_array >= balanced_threshold).astype(int)
+            
+            # Calculate metrics with balanced threshold
+            from sklearn.metrics import precision_recall_fscore_support, roc_auc_score, accuracy_score, confusion_matrix
+            
+            precision_b, recall_b, f1_b, _ = precision_recall_fscore_support(
+                y_true, y_pred_balanced, average='binary', zero_division=0
+            )
+            accuracy_b = accuracy_score(y_true, y_pred_balanced)
+            
+            # Calculate per-class metrics
+            per_class_metrics = precision_recall_fscore_support(
+                y_true, y_pred_balanced, average=None, zero_division=0
+            )
+            macro_f1_b = np.mean(per_class_metrics[2])  # Average of F1 scores
+            
+            try:
+                auc_b = roc_auc_score(y_true, y_probs)
+            except:
+                auc_b = 0.0
+            
+            cm_balanced = confusion_matrix(y_true, y_pred_balanced)
+            
+            print(f"[THRESHOLD TUNING] Balanced threshold results:")
+            print(f"  Accuracy: {accuracy_b:.4f} (was {accuracy:.4f})")
+            print(f"  Macro F1: {macro_f1_b:.4f} (was {macro_f1:.4f})")
+            print(f"  Confusion Matrix:\n{cm_balanced}")
+            print(f"  Real (0): Recall = {per_class_metrics[1][0]:.4f}")
+            print(f"  Fake (1): Recall = {per_class_metrics[1][1]:.4f}\n")
+            
+            # Check if balanced threshold helps
+            if macro_f1_b > macro_f1:
+                print(f"✅ Balanced threshold improves Macro F1: {macro_f1:.4f} → {macro_f1_b:.4f}")
+                print(f"✅ Consider using threshold={balanced_threshold:.2f} for inference\n")
+        
+        # Check for degenerate solution in validation (model only predicting one class)
+        unique_preds = np.unique(y_pred)
+        if len(unique_preds) == 1:
+            print(f"\n⚠️  WARNING: DEGENERATE SOLUTION IN VALIDATION!")
+            print(f"⚠️  Model is only predicting class {unique_preds[0]} (always {'Fake' if unique_preds[0] == 1 else 'Real'})")
+            print(f"⚠️  The model has learned a trivial solution. Training should be restarted with:")
+            print(f"   1. Focal Loss (--loss_type focal --focal_gamma 3.0)")
+            print(f"   2. Stronger class weights (--class_weights_mode manual_extreme)")
+            print(f"   3. Lower learning rate (--learning_rate 0.00001)\n")
         
         # Store metrics (including macro F1 for balanced evaluation)
         self.metrics['val_losses'].append(avg_loss)
@@ -2641,7 +2827,7 @@ def parse_args():
     parser.add_argument('--focal_alpha', type=float, default=1.0, help='Alpha parameter for Focal Loss (weight for rare class)')
     parser.add_argument('--focal_gamma', type=float, default=2.0, help='Gamma parameter for Focal Loss (focusing parameter)')
     parser.add_argument('--oversample_minority', action='store_true', help='Oversample minority class (Real) to balance dataset')
-    parser.add_argument('--class_weights_mode', type=str, default='balanced', choices=['balanced', 'manual', 'manual_extreme', 'none'], help='How to compute class weights')
+    parser.add_argument('--class_weights_mode', type=str, default='balanced', choices=['balanced', 'sqrt_balanced', 'manual', 'manual_extreme', 'none'], help='How to compute class weights')
     
     parser.add_argument('--optimizer', type=str, default='adamw', choices=['adam', 'adamw', 'sgd'], help='Optimizer to use')
     parser.add_argument('--scheduler', type=str, default='cosine', choices=['step', 'cosine', 'cosine_with_restarts', 'plateau', 'none'], help='Learning rate scheduler')
