@@ -1,0 +1,2 @@
+python f:\deepfake\backup\Models\predict_deepfake_fixed.py f:\deepfake\backup\Models\server_checkpoints\best_model.pth F:\deepfake\backup\LAV-DF\fake_2.mp4
+python "script" "model" "fake video"
