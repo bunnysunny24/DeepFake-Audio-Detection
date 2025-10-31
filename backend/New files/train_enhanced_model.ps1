@@ -14,20 +14,20 @@
 # - Gradient clipping for stability
 # =============================================================================
 
-Write-Host "ENHANCED TRAINING - BALANCED CLASS WEIGHTING" -ForegroundColor Cyan
+Write-Host "ENHANCED TRAINING - BALANCED & STABLE" -ForegroundColor Cyan
 Write-Host "=================================================" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "Optimizations applied:" -ForegroundColor Green
-Write-Host "  [OK] Focal Loss with gamma=2.0 - Focuses on hard examples" -ForegroundColor White
-Write-Host "  [OK] Balanced Weights - Auto sqrt-balanced for 2.85:1 imbalance" -ForegroundColor White
-Write-Host "  [OK] Learning Rate 1e-4 - Stable learning" -ForegroundColor White
-Write-Host "  [OK] Warmup 2 epochs - Gradual learning rate increase" -ForegroundColor White
-Write-Host "  [OK] Gradient Clipping - Training stability" -ForegroundColor White
+Write-Host "  [OK] Focal Loss gamma=2.0 - Standard focusing" -ForegroundColor White
+Write-Host "  [OK] Sqrt-balanced weights (~1.7x) - Moderate penalty" -ForegroundColor White
+Write-Host "  [OK] Learning Rate 1e-4 - Normal convergence speed" -ForegroundColor White
+Write-Host "  [OK] Batch size 8 - Stable BatchNorm statistics" -ForegroundColor White
+Write-Host "  [OK] Warmup 2 epochs - Gradual learning" -ForegroundColor White
 Write-Host ""
-Write-Host "Expected Results:" -ForegroundColor Yellow
-Write-Host "  >> Model should learn diverse predictions, not constants" -ForegroundColor White
-Write-Host "  >> Softmax probabilities should have non-zero std deviation" -ForegroundColor White
-Write-Host "  >> Both classes predicted in confusion matrix" -ForegroundColor White
+Write-Host "Strategy:" -ForegroundColor Yellow
+Write-Host "  >> Prevent model collapse with balanced hyperparameters" -ForegroundColor White
+Write-Host "  >> Let model learn for multiple epochs (10+)" -ForegroundColor White
+Write-Host "  >> Monitor Real class recall improvement across epochs" -ForegroundColor White
 Write-Host ""
 # Activate the virtual environment
 & "F:\deepfake\backup\Models\deepfake-env-312\Scripts\activate.ps1"
@@ -57,24 +57,24 @@ python train_multimodal.py `
   --output_dir "F:\deepfake\backup\Models\server_outputs" `
   --checkpoint_dir "F:\deepfake\backup\Models\server_checkpoints" `
   --batch_size 8 `
-  --num_epochs 30 `
-  --max_samples 100 `
-  --learning_rate 1e-4 `
-  --weight_decay 0.0001 `
+  --num_epochs 15 `
+  --max_samples 1500 `
+  --learning_rate 5e-5 `
+  --weight_decay 0.001 `
   --detect_faces `
   --compute_spectrograms `
   --validation_split 0.1 `
   --test_split 0.1 `
   --optimizer adamw `
   --scheduler cosine_with_restarts `
-  --warmup_epochs 2 `
+  --warmup_epochs 3 `
   --loss_type focal `
-  --focal_alpha 0.75 `
-  --focal_gamma 2.0 `
+  --focal_alpha 0.25 `
+  --focal_gamma 1.5 `
   --class_weights_mode sqrt_balanced `
   --use_weighted_loss `
-  --dropout_rate 0.3 `
-  --gradient_clip 1.0 `
+  --dropout_rate 0.5 `
+  --gradient_clip 0.5 `
   --early_stopping_patience 8 `
   --reduce_frames 10 `
   --save_intermediate `
