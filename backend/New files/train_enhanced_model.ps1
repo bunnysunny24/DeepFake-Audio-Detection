@@ -57,8 +57,8 @@ python train_multimodal.py `
   --output_dir "F:\deepfake\backup\Models\server_outputs" `
   --checkpoint_dir "F:\deepfake\backup\Models\server_checkpoints" `
   --batch_size 8 `
-  --num_epochs 15 `
-  --max_samples 1500 `
+  --num_epochs 50 `
+  --max_samples 100 `
   --learning_rate 5e-5 `
   --weight_decay 0.001 `
   --detect_faces `
@@ -77,8 +77,6 @@ python train_multimodal.py `
   --gradient_clip 0.5 `
   --early_stopping_patience 8 `
   --reduce_frames 10 `
-  --save_intermediate `
-  --save_intermediate_interval 5 `
   --enhanced_preprocessing `
   --enhanced_augmentation `
   --enable_skin_color_analysis `

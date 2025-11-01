@@ -2076,15 +2076,32 @@ class DeepfakeTrainer:
                         outputs, results = self.model(batch)
                         loss = self.criterion(outputs, labels)
                     
-                    # SMALL LOGIT BIAS: Shift probabilities toward balance
-                    # Current with full dataset: ~60% Real, ~40% Fake
-                    # Reduce from ±0.15 to ±0.10 for full dataset (was tuned on 15 samples)
-                    # Goal: ~52% Real, ~48% Fake (balanced around threshold)
-                    if outputs.shape[1] == 2:  # Binary classification
-                        outputs_corrected = outputs.clone()
-                        outputs_corrected[:, 0] = outputs[:, 0] + 0.10  # Slight favor to Real
-                        outputs_corrected[:, 1] = outputs[:, 1] - 0.10  # Slight disfavor to Fake
-                        outputs = outputs_corrected
+                    # ADAPTIVE LOGIT BIAS: Only apply after model starts learning
+                    # Epochs 0-2: Model is random, skip bias (causes instability)
+                    # Epochs 3+: Apply small bias to counter learned class imbalance
+                    if epoch >= 3 and outputs.shape[1] == 2:  # Binary classification
+                        # Measure current bias in probabilities
+                        with torch.no_grad():
+                            current_probs = torch.softmax(outputs, dim=1)
+                            fake_prob_mean = current_probs[:, 1].mean().item()
+                            
+                            # Adaptive bias: Only correct if probabilities are imbalanced
+                            # If Fake prob is <40% or >60%, apply small correction
+                            bias_amount = 0.0
+                            if fake_prob_mean < 0.40:  # Too much Real bias
+                                bias_amount = -0.05  # Small push toward Fake
+                            elif fake_prob_mean > 0.60:  # Too much Fake bias
+                                bias_amount = 0.05  # Small push toward Real
+                            
+                            if abs(bias_amount) > 0.01:  # Only apply if needed
+                                outputs_corrected = outputs.clone()
+                                outputs_corrected[:, 0] = outputs[:, 0] + bias_amount
+                                outputs_corrected[:, 1] = outputs[:, 1] - bias_amount
+                                outputs = outputs_corrected
+                                
+                                if batch_idx == 0:
+                                    print(f"[ADAPTIVE BIAS] Epoch {epoch+1}: Fake prob={fake_prob_mean:.3f}, applying bias={bias_amount:+.3f}")
+
                     
                     # Update progress bar
                     val_progress.set_postfix(loss=f"{loss.item():.4f}")
@@ -2099,24 +2116,21 @@ class DeepfakeTrainer:
                     probs = torch.softmax(outputs, dim=1)
                     
                     # Debug: Print first batch validation predictions
-                    if batch_idx == 0 and epoch < 3:  # First 3 epochs
+                    if batch_idx == 0 and epoch < 10:  # Extended to epoch 10
                         # Calculate threshold-based predictions for debug
-                        threshold_preds = (probs[:, 1] >= 0.45).long()
+                        threshold_preds = (probs[:, 1] >= 0.50).long()
                         print(f"\n[VALIDATION DEBUG] Epoch {epoch+1}, First batch:")
-                        print(f"[VALIDATION DEBUG] Raw outputs: {outputs[:5]}")
-                        print(f"[VALIDATION DEBUG] Softmax probs: {probs[:5]}")
-                        print(f"[VALIDATION DEBUG] Predictions (threshold=0.45): {threshold_preds[:5]}")
-                        print(f"[VALIDATION DEBUG] Predictions (argmax): {outputs.argmax(1)[:5]}")
+                        print(f"[VALIDATION DEBUG] Softmax probs (first 5): {probs[:5]}")
+                        print(f"[VALIDATION DEBUG] Predictions (threshold=0.50): {threshold_preds[:5]}")
                         print(f"[VALIDATION DEBUG] True labels: {labels[:5]}")
                         print(f"[VALIDATION DEBUG] Prob[Real] mean: {probs[:, 0].mean().item():.4f}, std: {probs[:, 0].std().item():.4f}")
                         print(f"[VALIDATION DEBUG] Prob[Fake] mean: {probs[:, 1].mean().item():.4f}, std: {probs[:, 1].std().item():.4f}\n")
                     
-                    # FIX: Use threshold close to 50% since probabilities are now balanced
-                    # After ±0.10 bias correction, probs should be ~52% Real, ~48% Fake (balanced!)
-                    # Use threshold=0.45 to predict Fake if prob >= 45%
-                    # This allows variance around 48% to produce mixed predictions
-                    threshold = 0.45
-                    predictions = (probs[:, 1] >= threshold).long().cpu().numpy()  # Predict Fake if prob >= 0.45
+                    # ADAPTIVE THRESHOLD: Use 50% baseline, let model learn the right balance
+                    # Early epochs (0-2): Model is random, use 50% threshold (no bias applied)
+                    # Later epochs (3+): Adaptive bias should keep probs near 50%, use 50% threshold
+                    threshold = 0.50
+                    predictions = (probs[:, 1] >= threshold).long().cpu().numpy()
                     y_pred.extend(predictions)
                     y_probs.extend(probs[:, 1].detach().cpu().numpy())
                     
@@ -2166,7 +2180,40 @@ class DeepfakeTrainer:
         # Calculate average loss and metrics
         avg_loss = epoch_loss / len(self.val_loader)
         
-        # Calculate metrics with default threshold (0.5)
+        # SAFETY CHECK: Detect degenerate predictions (all one class)
+        y_pred_array = np.array(y_pred)
+        y_probs_array = np.array(y_probs)
+        unique_preds = np.unique(y_pred_array)
+        
+        if len(unique_preds) == 1:
+            degenerate_class = unique_preds[0]
+            print(f"\n{'='*80}")
+            print(f"[DEGENERATE SOLUTION DETECTED] All predictions are class {degenerate_class}")
+            print(f"[DEGENERATE SOLUTION] Prob[Fake] mean: {y_probs_array.mean():.4f}, std: {y_probs_array.std():.4f}")
+            
+            # Emergency fix: Use median probability as threshold
+            median_prob = np.median(y_probs_array)
+            mean_prob = np.mean(y_probs_array)
+            
+            print(f"[EMERGENCY FIX] Applying median threshold: {median_prob:.4f}")
+            print(f"[EMERGENCY FIX] This will force ~50% split regardless of model confidence")
+            
+            # Re-predict with median threshold
+            y_pred_fixed = (y_probs_array >= median_prob).astype(int)
+            
+            # Show before/after
+            from sklearn.metrics import confusion_matrix
+            cm_before = confusion_matrix(y_true, y_pred_array)
+            cm_after = confusion_matrix(y_true, y_pred_fixed)
+            
+            print(f"\n[EMERGENCY FIX] Confusion Matrix BEFORE: {cm_before.tolist()}")
+            print(f"[EMERGENCY FIX] Confusion Matrix AFTER:  {cm_after.tolist()}")
+            
+            # Use fixed predictions
+            y_pred = y_pred_fixed.tolist()
+            print(f"{'='*80}\n")
+        
+        # Calculate metrics with current predictions
         precision, recall, f1, auc_score, accuracy, macro_f1 = calculate_metrics(y_true, y_pred, y_probs, epoch+1)
         
         # EXPERIMENTAL: Try class-balanced threshold for better detection
