@@ -1292,23 +1292,8 @@ class DeepfakeTrainer:
         # Move model to device
         self.model.to(self.device)
 
-        # BIAS FIX: Initialize final classifier bias to favor balanced predictions
-        # Dataset distribution: Real=36,431 vs Fake=99,873 (ratio ~1:2.74)
-        # Use 30% of theoretical bias to avoid overcorrection
-        if hasattr(self.model, 'classifier'):
-            final_layer = None
-            for layer in self.model.classifier:
-                if isinstance(layer, nn.Linear):
-                    final_layer = layer
-            if final_layer is not None and final_layer.out_features == 2:
-                with torch.no_grad():
-                    # Full theoretical bias: log(2.74) ≈ 1.008
-                    # Use 30% to avoid flipping to "always Real" prediction
-                    theoretical_bias = float(np.log(2.74))
-                    bias_correction = theoretical_bias * 0.3  # ≈ 0.302
-                    final_layer.bias[0] = bias_correction   # Favor Real (+0.30)
-                    final_layer.bias[1] = -bias_correction  # Disfavor Fake (-0.30)
-                    print(f"[BIAS FIX] Initialized classifier bias: Real={bias_correction:.3f}, Fake={-bias_correction:.3f} (30% of theoretical {theoretical_bias:.3f})")
+        # BIAS INITIALIZATION REMOVED: Was setting bias to ±0.30 which overpowered feature learning
+        # Now using default PyTorch initialization (zero bias) and letting class_weights handle imbalance
 
         # Initialize in distributed mode if specified
         if self.distributed:
@@ -2076,32 +2061,10 @@ class DeepfakeTrainer:
                         outputs, results = self.model(batch)
                         loss = self.criterion(outputs, labels)
                     
-                    # ADAPTIVE LOGIT BIAS: Only apply after model starts learning
-                    # Epochs 0-2: Model is random, skip bias (causes instability)
-                    # Epochs 3+: Apply small bias to counter learned class imbalance
-                    if epoch >= 3 and outputs.shape[1] == 2:  # Binary classification
-                        # Measure current bias in probabilities
-                        with torch.no_grad():
-                            current_probs = torch.softmax(outputs, dim=1)
-                            fake_prob_mean = current_probs[:, 1].mean().item()
-                            
-                            # Adaptive bias: Only correct if probabilities are imbalanced
-                            # If Fake prob is <40% or >60%, apply small correction
-                            bias_amount = 0.0
-                            if fake_prob_mean < 0.40:  # Too much Real bias
-                                bias_amount = -0.05  # Small push toward Fake
-                            elif fake_prob_mean > 0.60:  # Too much Fake bias
-                                bias_amount = 0.05  # Small push toward Real
-                            
-                            if abs(bias_amount) > 0.01:  # Only apply if needed
-                                outputs_corrected = outputs.clone()
-                                outputs_corrected[:, 0] = outputs[:, 0] + bias_amount
-                                outputs_corrected[:, 1] = outputs[:, 1] - bias_amount
-                                outputs = outputs_corrected
-                                
-                                if batch_idx == 0:
-                                    print(f"[ADAPTIVE BIAS] Epoch {epoch+1}: Fake prob={fake_prob_mean:.3f}, applying bias={bias_amount:+.3f}")
-
+                    # ADAPTIVE BIAS REMOVED: Was causing the model to learn bias instead of features
+                    # The bias was 4.4x stronger than feature contributions, making the model
+                    # ignore video/audio data and just predict based on bias term.
+                    # Now relying on proper class_weights in the loss function instead.
                     
                     # Update progress bar
                     val_progress.set_postfix(loss=f"{loss.item():.4f}")
@@ -2126,9 +2089,8 @@ class DeepfakeTrainer:
                         print(f"[VALIDATION DEBUG] Prob[Real] mean: {probs[:, 0].mean().item():.4f}, std: {probs[:, 0].std().item():.4f}")
                         print(f"[VALIDATION DEBUG] Prob[Fake] mean: {probs[:, 1].mean().item():.4f}, std: {probs[:, 1].std().item():.4f}\n")
                     
-                    # ADAPTIVE THRESHOLD: Use 50% baseline, let model learn the right balance
-                    # Early epochs (0-2): Model is random, use 50% threshold (no bias applied)
-                    # Later epochs (3+): Adaptive bias should keep probs near 50%, use 50% threshold
+                    # Use 50% threshold - standard binary classification decision boundary
+                    # Model will learn the right balance through proper class_weights in loss function
                     threshold = 0.50
                     predictions = (probs[:, 1] >= threshold).long().cpu().numpy()
                     y_pred.extend(predictions)

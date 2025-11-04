@@ -45,10 +45,10 @@ $env:TORCH_CUDNN_V8_API_ENABLED = '1'  # Enable cuDNN v8 optimizations
 $env:CUDNN_BENCHMARK = '1'  # Auto-tune cuDNN kernels (faster conv ops)
 
 # CPU Thread Optimization (leave headroom for data loading workers)
-$env:OMP_NUM_THREADS = '4'  # Reduced to avoid thread contention with workers
-$env:MKL_NUM_THREADS = '4'
-$env:NUMEXPR_NUM_THREADS = '4'
-$env:OPENBLAS_NUM_THREADS = '4'
+$env:OMP_NUM_THREADS = '8'  # Increased from 4 to use more CPU power
+$env:MKL_NUM_THREADS = '8'
+$env:NUMEXPR_NUM_THREADS = '8'
+$env:OPENBLAS_NUM_THREADS = '8'
 
 # PyTorch Performance Flags
 $env:TORCH_CUDNN_BENCHMARK = '1'  # Auto-select fastest algorithms
@@ -57,7 +57,8 @@ $env:TORCH_CUDA_ARCH_LIST = '8.9'  # RTX 4060 architecture (Ada Lovelace)
 
 # Memory Optimization
 $env:PYTORCH_NO_CUDA_MEMORY_CACHING = '0'  # Use CUDA caching (faster)
-$env:CUDA_CACHE_MAXSIZE = '2147483648'  # 2GB kernel cache
+$env:CUDA_CACHE_MAXSIZE = '4294967296'  # 4GB kernel cache (increased from 2GB)
+$env:PYTORCH_CUDA_ALLOC_CONF = 'max_split_size_mb:512'  # Reduce fragmentation
 
 # Environment variables for PyTorch Distributed (single-node, single-process with DDP)
 $env:MASTER_ADDR = '127.0.0.1'
@@ -77,7 +78,7 @@ python train_multimodal.py `
   --checkpoint_dir "F:\deepfake\backup\Models\server_checkpoints" `
   --batch_size 8 `
   --num_epochs 50 `
-  --max_samples 3000 `
+  --max_samples 1000 `
   --learning_rate 5e-5 `
   --weight_decay 0.001 `
   --detect_faces `
