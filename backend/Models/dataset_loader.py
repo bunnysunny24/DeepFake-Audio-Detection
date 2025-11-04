@@ -1759,10 +1759,10 @@ def get_data_loaders(
         'batch_size': batch_size,
         'sampler': train_sampler,
         'num_workers': num_workers,
-        'pin_memory': True,
+        'pin_memory': False,  # Disabled for Windows compatibility (causes "invalid device pointer" crash)
         'drop_last': False,
         'collate_fn': collate_fn,
-        'persistent_workers': True if num_workers > 0 else False,
+        'persistent_workers': False,  # Disabled for Windows compatibility (num_workers > 0 can cause hangs)
     }
     if mp_context is not None:
         train_loader_kwargs['multiprocessing_context'] = mp_context
@@ -1774,10 +1774,10 @@ def get_data_loaders(
         'batch_size': batch_size,
         'sampler': val_sampler,
         'num_workers': num_workers,
-        'pin_memory': True,
+        'pin_memory': False,  # Disabled for Windows compatibility (causes "invalid device pointer" crash)
         'drop_last': False,
         'collate_fn': collate_fn,
-        'persistent_workers': True if num_workers > 0 else False,
+        'persistent_workers': False,  # Disabled for Windows compatibility (num_workers > 0 can cause hangs)
     }
     if mp_context is not None:
         val_loader_kwargs['multiprocessing_context'] = mp_context
@@ -1789,10 +1789,10 @@ def get_data_loaders(
         'batch_size': batch_size,
         'sampler': test_sampler,
         'num_workers': num_workers,
-        'pin_memory': True,
+        'pin_memory': False,  # Disabled for Windows compatibility (causes "invalid device pointer" crash)
         'drop_last': False,
         'collate_fn': collate_fn,
-        'persistent_workers': True if num_workers > 0 else False,
+        'persistent_workers': False,  # Disabled for Windows compatibility (num_workers > 0 can cause hangs)
     }
     if mp_context is not None:
         test_loader_kwargs['multiprocessing_context'] = mp_context
