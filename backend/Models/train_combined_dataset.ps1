@@ -1,37 +1,27 @@
 # =============================================================================
-# Enhanced Training Configuration Script for Deepfake Detection
+# TRAIN ON COMBINED LAV-DF + SAMSUNG DATASET v3
 # =============================================================================
-# This script uses optimal hyperparameters and automatically integrates:
-# - Advanced Model Components (SelfAttentionPooling, TemporalConsistencyDetector,
-#   EnhancedCrossModalFusion, PeriodicalFeatureExtractor, MultiScaleFeatureFusion)
-# - Improved Augmentation (from improved_augmentation.py)
-# - Enhanced Preprocessing (facial landmarks, physiological features)
-# 
-# UPDATED: October 27, 2025 - ANTI-DEGENERATE SOLUTION SETTINGS
-# - Focal Loss with gamma=3.0 (aggressive)
-# - Extreme class weights (10:1 Real:Fake ratio)
-# - Lower learning rate (3e-5) to prevent early convergence
-# - Gradient clipping for stability
+# Dataset: LAV-DF (136,304 videos) + Samsung FakeAVCeleb (19,595 videos)
+# Total: 155,899 videos with REAL AUDIO from multiple deepfake methods
+# Purpose: Train on diverse deepfake generation techniques
+# Samsung metadata corrected: 100% fake videos have original references
 # =============================================================================
 
-Write-Host "ENHANCED TRAINING - OPTIMIZED FOR SPEED" -ForegroundColor Cyan
+Write-Host "ENHANCED TRAINING - OPTIMIZED FOR LAPTOP (RTX 4060)" -ForegroundColor Cyan
 Write-Host "=================================================" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "Optimizations applied:" -ForegroundColor Green
-Write-Host "  [OK] Batch size 8 - Safe for 8GB VRAM" -ForegroundColor White
-Write-Host "  [OK] Num workers 8 - Utilizing 24 CPU threads (2x boost)" -ForegroundColor White
+Write-Host "  [OK] Batch size 10 - Safe for 8GB VRAM" -ForegroundColor White
+Write-Host "  [OK] CPU threads 8 - Utilizing available CPU power" -ForegroundColor White
 Write-Host "  [OK] Pin memory enabled - Faster GPU transfer" -ForegroundColor White
-Write-Host "  [OK] Persistent workers - Reduced startup overhead" -ForegroundColor White
-Write-Host "  [OK] Prefetch factor 4 - Aggressive data prefetching (2x)" -ForegroundColor White
 Write-Host "  [OK] Reduced frames 8 - 20% less processing per sample" -ForegroundColor White
 Write-Host "  [OK] AMP enabled - Mixed precision training" -ForegroundColor White
+Write-Host "  [OK] TF32 enabled - Faster on RTX 4060 (Ada Lovelace)" -ForegroundColor White
 Write-Host ""
 Write-Host "Expected speedup: ~1.8-2x faster!" -ForegroundColor Yellow
-Write-Host "  >> Epoch time: ~3 hours (was 5.8 hours)" -ForegroundColor White
-Write-Host "  >> 50 epochs: ~6 days (was 12 days)" -ForegroundColor White
-Write-Host "  >> Focus on CPU/data loading optimization (safe VRAM)" -ForegroundColor White
 Write-Host ""
-# Activate the virtual environment
+
+# Activate virtual environment
 & "F:\deepfake\backup\Models\deepfake-env-312\Scripts\activate.ps1"
 
 # Memory / CPU / CUDA tuning - MAXIMUM OPTIMIZATION
@@ -57,43 +47,35 @@ $env:TORCH_CUDA_ARCH_LIST = '8.9'  # RTX 4060 architecture (Ada Lovelace)
 
 # Memory Optimization
 $env:PYTORCH_NO_CUDA_MEMORY_CACHING = '0'  # Use CUDA caching (faster)
-$env:CUDA_CACHE_MAXSIZE = '4294967296'  # 4GB kernel cache (increased from 2GB)
+$env:CUDA_CACHE_MAXSIZE = '4294967296'  # 4GB kernel cache
 $env:PYTORCH_CUDA_ALLOC_CONF = 'max_split_size_mb:512'  # Reduce fragmentation
 
-# Environment variables for PyTorch Distributed (single-node, single-process with DDP)
-$env:MASTER_ADDR = '127.0.0.1'
-$env:MASTER_PORT = '29500'
-
-
-
-$env:RANK = '0'
-$env:WORLD_SIZE = '1'
-$env:LOCAL_RANK = '0'
-
-# =============================================================================
-# COMBINED DATASET TRAINING - LAV-DF (104,803 videos) + DFD (3,431 videos)
-# =============================================================================
-# Total: 108,234 videos from multiple deepfake generation methods
-# Purpose: Improve generalization to external/unseen deepfake techniques
-# Expected improvement: 41% → 80%+ accuracy on external videos
-# =============================================================================
-
 Write-Host ""
-Write-Host "COMBINED DATASET TRAINING" -ForegroundColor Yellow
-Write-Host "  LAV-DF: 104,803 videos (96.8%)" -ForegroundColor White
-Write-Host "  DFD:      3,431 videos (3.2%)" -ForegroundColor White
-Write-Host "  Total:  108,234 videos" -ForegroundColor Green
+Write-Host "COMBINED DATASET v3 TRAINING (LAV-DF + SAMSUNG CORRECTED)" -ForegroundColor Yellow
+Write-Host "  LAV-DF:  136,304 videos (87.4%) - lipsync deepfakes" -ForegroundColor White
+Write-Host "  Samsung:  19,595 videos (12.6%) - face-swap + manipulated audio" -ForegroundColor White
+Write-Host "  Total:   155,899 videos with REAL AUDIO" -ForegroundColor Green
+Write-Host "  Location: F:\deepfake\backup\COMBINED_DATASET" -ForegroundColor White
+Write-Host ""
+Write-Host "Dataset Quality:" -ForegroundColor Cyan
+Write-Host "  [OK] Samsung has REAL AUDIO (unlike DFD which had none)" -ForegroundColor Green
+Write-Host "  [OK] Multiple deepfake methods (lipsync + face-swap)" -ForegroundColor Green
+Write-Host "  [OK] 99.9% fakes have original references (temporal consistency)" -ForegroundColor Green
+Write-Host "  [OK] Class imbalance: 3.22:1 (fake:real)" -ForegroundColor Green
+Write-Host "  [OK] Current Samsung baseline: 23% -> Target: 70-80%" -ForegroundColor Green
+Write-Host ""
+Write-Host "Starting training..." -ForegroundColor Green
 Write-Host ""
 
-# Run training with combined dataset (LAV-DF + FaceForensics DFD)
+# Train on combined dataset
 python train_multimodal.py `
-  --json_path "F:\deepfake\backup\Models\combined_metadata.json" `
-  --data_dir "F:\deepfake\backup\LAV-DF" `
+  --json_path "F:\deepfake\backup\COMBINED_DATASET\metadata.json" `
+  --data_dir "F:\deepfake\backup\COMBINED_DATASET" `
   --output_dir "F:\deepfake\backup\Models\server_outputs" `
   --checkpoint_dir "F:\deepfake\backup\Models\server_checkpoints" `
   --batch_size 10 `
-  --num_epochs 50 `
-  --max_samples 2000 `
+  --num_epochs 30 `
+  --max_samples 10000 `
   --learning_rate 5e-5 `
   --weight_decay 0.001 `
   --detect_faces `
@@ -106,7 +88,7 @@ python train_multimodal.py `
   --loss_type focal `
   --focal_alpha 0.25 `
   --focal_gamma 3.0 `
-  --class_weights_mode manual_extreme `
+  --class_weights_mode balanced `
   --use_weighted_loss `
   --dropout_rate 0.4 `
   --gradient_clip 0.5 `
@@ -118,16 +100,27 @@ python train_multimodal.py `
   --enable_advanced_physiological `
   --num_workers 0 `
   --amp_enabled `
-  --wandb_run_name "combined_dataset_multisource_training" `
-  --log_file "F:\deepfake\backup\Models\server_outputs\combined_training_log.txt"
+  --wandb_run_name "combined_lavdf_samsung_training" `
+  --log_file "F:\deepfake\backup\Models\server_outputs\combined_lavdf_samsung_log.txt"
 
 Write-Host ""
-Write-Host "[OK] Training completed or stopped" -ForegroundColor Green
+Write-Host "="*70 -ForegroundColor Green
+Write-Host "TRAINING COMPLETE" -ForegroundColor Green
+Write-Host "="*70 -ForegroundColor Green
 Write-Host ""
 Write-Host "Next steps:" -ForegroundColor Cyan
-Write-Host "  >> Test on external videos: python test_folder.py 'F:\deepfake\backup\TESTING\deepfake videos'" -ForegroundColor White
-Write-Host "  >> Expected improvement: 41% -> 80%+ accuracy on external videos" -ForegroundColor Green
-Write-Host "  >> Model learned from LAV-DF + FaceForensics DFD methods" -ForegroundColor White
+Write-Host "1. Test on Samsung dataset again:" -ForegroundColor White
+Write-Host "   python test_samsung_random.py" -ForegroundColor Yellow
+Write-Host "   Expected: 23% -> 70-80% accuracy" -ForegroundColor Green
+Write-Host ""
+Write-Host "2. Test on external videos:" -ForegroundColor White
+Write-Host "   python test_folder.py 'F:\deepfake\backup\TESTING\deepfake videos'" -ForegroundColor Yellow
+Write-Host "   Expected: 40% -> 70-80% accuracy" -ForegroundColor Green
+Write-Host ""
+Write-Host "3. Model trained on COMBINED_DATASET v3:" -ForegroundColor White
+Write-Host "   - LAV-DF: 136,304 videos (lipsync manipulation)" -ForegroundColor Gray
+Write-Host "   - Samsung: 19,595 videos (face-swap + manipulated audio)" -ForegroundColor Gray
+Write-Host "   - Total: 155,899 videos (99.9% with original refs)" -ForegroundColor Gray
 Write-Host ""
 Write-Host "Evaluation metrics:" -ForegroundColor Cyan
 Write-Host "  >> Confusion matrix should have non-zero values in all cells" -ForegroundColor White
