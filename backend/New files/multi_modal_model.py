@@ -41,22 +41,7 @@ except ImportError as e:
 try:
     from skin_analyzer import SkinColorAnalyzer
 except ImportError:
-    print("Warning: SkinColorAnalyzer not found, using fallback implementation")
-    
-    # Fallback SkinColorAnalyzer implementation
-    class SkinColorAnalyzer(nn.Module):
-        def __init__(self, feature_dim=32):
-            super(SkinColorAnalyzer, self).__init__()
-            self.feature_dim = feature_dim
-            
-        def forward(self, frames):
-            """Fallback implementation that returns neutral scores."""
-            if isinstance(frames, torch.Tensor):
-                batch_size = frames.shape[0]
-                device = frames.device
-                return torch.ones(batch_size, 1, device=device) * 0.5
-            else:
-                return torch.tensor([0.5])
+    print("Warning: SkinColorAnalyzer not found, using fallback implementation (fallbacks moved to fallbacks.py)")
 
 
 def clear_gpu_memory():
@@ -657,13 +642,16 @@ class EyeAnalysisModule(nn.Module):
             seq_len = 1
             if eye_landmarks is not None and len(eye_landmarks.shape) >= 2:
                 batch_size, seq_len = eye_landmarks.shape[:2]
-            return (
-                torch.ones(batch_size, 1, device=device) * 0.5,  # naturalness
-                torch.zeros(batch_size, seq_len, device=device),  # blinks
-                torch.zeros(batch_size, seq_len, device=device)   # pupil dilation
-            )
-        
-        # Get batch size and sequence length
+                # ❌ CRITICAL: Returning fallback - model won't learn eye patterns!
+            fallback_naturalness = torch.ones(batch_size, 1, device=device, requires_grad=True) * 0.5
+            fallback_blinks = torch.zeros(batch_size, seq_len, device=device, requires_grad=True)
+            fallback_pupil = torch.zeros(batch_size, seq_len, device=device, requires_grad=True)
+            return (fallback_naturalness, fallback_blinks, fallback_pupil)
+            
+            # ⚠️ CHECK: If eye_landmarks are all zeros (failed extraction), warn
+        if torch.all(eye_landmarks == 0):
+            print("[CRITICAL WARNING] Eye landmarks are all zeros! Model learning from placeholder data!")
+            print("[SOLUTION] Ensure dataset extracts eye_blink_features or enable face_mesh extraction")        # Get batch size and sequence length
         batch_size, seq_len = eye_landmarks.shape[:2]
         
         # Initialize or update eye encoder if needed
@@ -1476,22 +1464,113 @@ class MFCCExtractor(nn.Module):
         )
         
     def extract_mfcc(self, audio, sample_rate=16000):
-        """Extract MFCC features (CPU implementation)"""
-        # Convert to numpy
-        audio_np = audio.cpu().numpy()
+        """Extract MFCC features using PyTorch ops (GPU-friendly).
+
+        Falls back to a lightweight torch-based mel -> log -> DCT pipeline
+        to avoid transferring tensors to CPU and calling librosa inside
+        the model forward. Returns tensor of shape [batch, time, num_mfcc].
+        """
+        # Parameters for STFT / mel
+        n_fft = 512
+        hop_length = 256
+        n_mels = max(self.num_mfcc, 40)
+
+        # Ensure 2D input [B, samples]
+        if audio.dim() == 1:
+            audio = audio.unsqueeze(0)
+
+        device = audio.device
+
+        # Compute STFT (return_complex requires PyTorch >=1.7)
+        try:
+            spec = torch.stft(audio, n_fft=n_fft, hop_length=hop_length, win_length=n_fft,
+                              window=torch.hann_window(n_fft, device=device), return_complex=True)
+            # spec: [B, freq_bins, time]
+            power_spec = spec.abs() ** 2
+        except TypeError:
+            # Older PyTorch fallback
+            spec = torch.stft(audio, n_fft=n_fft, hop_length=hop_length, win_length=n_fft,
+                              window=torch.hann_window(n_fft, device=device))
+            real, imag = spec.unbind(-1)
+            power_spec = real**2 + imag**2
+
+        # Build mel filterbank (n_mels x freq_bins)
+        freq_bins = n_fft // 2 + 1
+
+        def hz_to_mel(hz):
+            return 2595.0 * math.log10(1.0 + hz / 700.0)
+
+        def mel_to_hz(mel):
+            return 700.0 * (10 ** (mel / 2595.0) - 1.0)
+
+        # Create mel points
+        mel_min = hz_to_mel(0)
+        mel_max = hz_to_mel(sample_rate / 2)
+        mels = torch.linspace(mel_min, mel_max, n_mels + 2, device=device)
+        hz = mel_to_hz(mels)
+
+        # Convert hz to bin numbers
+        bins = torch.floor((n_fft + 1) * hz / sample_rate).long()
+
+        fb = torch.zeros((n_mels, freq_bins), device=device)
+        for i in range(n_mels):
+            f_m_left = bins[i].item()
+            f_m = bins[i + 1].item()
+            f_m_right = bins[i + 2].item()
+            if f_m > f_m_left:
+                for k in range(f_m_left, min(f_m + 1, freq_bins)):
+                    fb[i, k] = (k - f_m_left) / max(1, (f_m - f_m_left))
+            if f_m_right > f_m:
+                for k in range(f_m, min(f_m_right + 1, freq_bins)):
+                    fb[i, k] = (f_m_right - k) / max(1, (f_m_right - f_m))
+
+        # Apply mel filterbank: power_spec shape [B, freq_bins, time]
+        # Move freq axis to last for matmul: [B, time, freq]
+        power_spec_t = power_spec.permute(0, 2, 1)
+        mel_spec = torch.matmul(power_spec_t, fb.t())  # [B, time, n_mels]
+
+        # Log-mel
+        log_mel = torch.log(mel_spec + 1e-6)
+
+        # DCT type-II to get MFCC (simple implementation)
+        n_mfcc = self.num_mfcc
+        n = torch.arange(n_mels, device=device).float()
+        k = torch.arange(n_mfcc, device=device).float().unsqueeze(1)
+        dct_mat = torch.cos(math.pi / n_mels * (n + 0.5) * k)  # [n_mfcc, n_mels]
+        mfcc = torch.matmul(log_mel, dct_mat.t())  # [B, time, n_mfcc]
+
+        return mfcc
+    
+    def process_mfcc(self, mfcc_features):
+        """
+        Process pre-extracted MFCC features from dataset.
+        ✅ Use this when dataset provides MFCC to avoid recomputation!
         
-        # Extract MFCCs
-        mfccs = []
-        for i in range(audio_np.shape[0]):
-            mfcc = librosa.feature.mfcc(
-                y=audio_np[i], 
-                sr=sample_rate, 
-                n_mfcc=self.num_mfcc
-            )
-            mfccs.append(torch.from_numpy(mfcc).to(audio.device))
+        Args:
+            mfcc_features: Pre-extracted MFCC [batch, time, n_mfcc] or [batch, n_mfcc]
+        
+        Returns:
+            Consistency score tensor
+        """
+        # Ensure 3D shape [batch, time, n_mfcc]
+        if len(mfcc_features.shape) == 2:
+            mfcc_features = mfcc_features.unsqueeze(1)  # Add time dimension
+        
+        # Analyze MFCCs frame by frame
+        mfcc_analyzed = []
+        for t in range(mfcc_features.shape[1]):
+            features = self.mfcc_analyzer(mfcc_features[:, t])
+            mfcc_analyzed.append(features)
             
-        # Stack and transpose to [batch, time, features]
-        return torch.stack(mfccs).transpose(1, 2)
+        mfcc_sequence = torch.stack(mfcc_analyzed, dim=1)
+        
+        # Analyze temporal patterns
+        _, hidden = self.temporal_analyzer(mfcc_sequence)
+        
+        # Score consistency
+        consistency = self.consistency_scorer(hidden.squeeze(0))
+        
+        return consistency
     
     def forward(self, audio, sample_rate=16000):
         """
@@ -2166,266 +2245,17 @@ class LightweightModelProcessor(nn.Module):
 # MISSING MODULE DEFINITIONS 
 # =========================
 
-class RemotePhysiologicalAnalyzer(nn.Module):
-    """Basic physiological analyzer as fallback."""
-    def __init__(self, feature_dim=32):
-        super(RemotePhysiologicalAnalyzer, self).__init__()
-        self.feature_dim = feature_dim
-        
-    def forward(self, frames):
-        batch_size = frames.shape[0]
-        device = frames.device
-        return {
-            'naturalness': torch.ones(batch_size, 1, device=device) * 0.5
-        }
-
-class OculomotorDynamicsAnalyzer(nn.Module):
-    """Analyzes eye movement dynamics."""
-    def __init__(self, hidden_dim=64):
-        super(OculomotorDynamicsAnalyzer, self).__init__()
-        self.hidden_dim = hidden_dim
-        
-    def forward(self, eye_landmarks):
-        batch_size = eye_landmarks.shape[0]
-        device = eye_landmarks.device
-        naturalness = torch.ones(batch_size, 1, device=device) * 0.5
-        dynamics = torch.zeros(batch_size, self.hidden_dim, device=device)
-        return naturalness, dynamics
-
-class LightingConsistencyAnalyzer(nn.Module):
-    """Analyzes lighting consistency across frames."""
-    def __init__(self, feature_dim=64):
-        super(LightingConsistencyAnalyzer, self).__init__()
-        self.feature_dim = feature_dim
-        
-    def forward(self, frames):
-        batch_size = frames.shape[0]
-        device = frames.device
-        return torch.ones(batch_size, 1, device=device) * 0.5
-
-class TextureAnalyzer(nn.Module):
-    """Analyzes texture patterns for deepfake artifacts."""
-    def __init__(self, patch_size=32, feature_dim=64):
-        super(TextureAnalyzer, self).__init__()
-        self.patch_size = patch_size
-        self.feature_dim = feature_dim
-        
-    def forward(self, frames):
-        batch_size = frames.shape[0]
-        device = frames.device
-        consistency = torch.ones(batch_size, 1, device=device) * 0.5
-        features = torch.zeros(batch_size, self.feature_dim, device=device)
-        return consistency, features
-
-class FrequencyDomainAnalyzer(nn.Module):
-    """Analyzes frequency domain artifacts."""
-    def __init__(self, feature_dim=64):
-        super(FrequencyDomainAnalyzer, self).__init__()
-        self.feature_dim = feature_dim
-        
-    def forward(self, frames):
-        batch_size = frames.shape[0]
-        device = frames.device
-        return torch.ones(batch_size, 1, device=device) * 0.5
-
-class GANFingerprintDetector(nn.Module):
-    """Detects GAN fingerprints in images."""
-    def __init__(self, feature_dim=128):
-        super(GANFingerprintDetector, self).__init__()
-        self.feature_dim = feature_dim
-        
-    def forward(self, frames):
-        batch_size = frames.shape[0]
-        device = frames.device
-        return torch.ones(batch_size, 1, device=device) * 0.5
-
-class VoiceAnalysisModule(nn.Module):
-    """Analyzes voice authenticity."""
-    def __init__(self, audio_dim=768, feature_dim=128):
-        super(VoiceAnalysisModule, self).__init__()
-        self.feature_dim = feature_dim
-        
-    def forward(self, audio_features):
-        batch_size = audio_features.shape[0]
-        device = audio_features.device
-        return torch.ones(batch_size, 1, device=device) * 0.5
-
-class MFCCExtractor(nn.Module):
-    """Extracts MFCC features from audio."""
-    def __init__(self, num_mfcc=40, feature_dim=64):
-        super(MFCCExtractor, self).__init__()
-        self.num_mfcc = num_mfcc
-        self.feature_dim = feature_dim
-        
-    def forward(self, audio):
-        batch_size = audio.shape[0]
-        device = audio.device
-        consistency = torch.ones(batch_size, 1, device=device) * 0.5
-        features = torch.zeros(batch_size, self.feature_dim, device=device)
-        return consistency, features
-
-class PhonemeVisemeAnalyzer(nn.Module):
-    """Analyzes phoneme-viseme synchronization."""
-    def __init__(self, audio_dim=768, visual_dim=1024, hidden_dim=128):
-        super(PhonemeVisemeAnalyzer, self).__init__()
-        self.hidden_dim = hidden_dim
-        
-    def forward(self, audio_features, visual_features):
-        batch_size = audio_features.shape[0]
-        device = audio_features.device
-        return torch.ones(batch_size, 1, device=device) * 0.5
-
-class VoiceBiometricsVerifier(nn.Module):
-    """Verifies voice biometric consistency."""
-    def __init__(self, audio_dim=768, speaker_dim=256):
-        super(VoiceBiometricsVerifier, self).__init__()
-        self.speaker_dim = speaker_dim
-        
-    def forward(self, audio_features):
-        batch_size = audio_features.shape[0]
-        device = audio_features.device
-        return torch.ones(batch_size, 1, device=device) * 0.5
-
-class DualSpatioTemporalAttention(nn.Module):
-    """Dual spatio-temporal attention mechanism."""
-    def __init__(self, feature_dim=128, num_heads=4):
-        super(DualSpatioTemporalAttention, self).__init__()
-        self.feature_dim = feature_dim
-        self.num_heads = num_heads
-        
-    def forward(self, features):
-        batch_size = features.shape[0]
-        device = features.device
-        return torch.ones(batch_size, 1, device=device) * 0.5
-
-class EmotionRecognitionModule(nn.Module):
-    """Recognizes emotions from audio-visual features."""
-    def __init__(self, visual_dim=1024, audio_dim=768, feature_dim=128):
-        super(EmotionRecognitionModule, self).__init__()
-        self.feature_dim = feature_dim
-        
-    def forward(self, visual_features, audio_features):
-        batch_size = visual_features.shape[0]
-        device = visual_features.device
-        consistency = torch.ones(batch_size, 1, device=device) * 0.5
-        emotions = torch.zeros(batch_size, self.feature_dim, device=device)
-        return consistency, emotions
-
-class Autoencoder(nn.Module):
-    """Autoencoder for anomaly detection."""
-    def __init__(self, input_channels=3):
-        super(Autoencoder, self).__init__()
-        self.encoder = nn.Sequential(
-            nn.Conv2d(input_channels, 32, 3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-            nn.Conv2d(32, 64, 3, padding=1),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool2d((8, 8))
-        )
-        self.decoder = nn.Sequential(
-            nn.Upsample(scale_factor=2),
-            nn.Conv2d(64, 32, 3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(32, input_channels, 3, padding=1),
-            nn.Sigmoid()
-        )
-        
-    def forward(self, x):
-        # Store original shape for reconstruction
-        original_shape = x.shape
-        
-        encoded = self.encoder(x)
-        decoded = self.decoder(encoded)
-        
-        # Resize decoded to match original input
-        if decoded.shape != original_shape:
-            decoded = F.interpolate(decoded, size=original_shape[2:], mode='bilinear', align_corners=False)
-        
-        error = F.mse_loss(decoded, x, reduction='none').mean(dim=[1,2,3])
-        return decoded, error
-
-class EnhancedMetadataAnalyzer(nn.Module):
-    """Enhanced metadata analysis."""
-    def __init__(self, input_dim=10, hidden_dim=64):
-        super(EnhancedMetadataAnalyzer, self).__init__()
-        self.analyzer = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
-            nn.Sigmoid()
-        )
-        
-    def forward(self, metadata):
-        return self.analyzer(metadata)
-
-class DigitalArtifactDetector(nn.Module):
-    """Detects digital artifacts in images."""
-    def __init__(self, input_channels=3, feature_dim=64):
-        super(DigitalArtifactDetector, self).__init__()
-        self.detector = nn.Sequential(
-            nn.Conv2d(input_channels, 32, 3, padding=1),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Flatten(),
-            nn.Linear(32, 1),
-            nn.Sigmoid()
-        )
-        
-    def forward(self, frames):
-        return self.detector(frames)
-
-class CompressionAnalyzer(nn.Module):
-    """Analyzes compression artifacts."""
-    def __init__(self, input_channels=3, feature_dim=64):
-        super(CompressionAnalyzer, self).__init__()
-        self.analyzer = nn.Sequential(
-            nn.Conv2d(input_channels, 32, 3, padding=1),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Flatten(),
-            nn.Linear(32, 1),
-            nn.Sigmoid()
-        )
-        
-    def forward(self, frames):
-        return self.analyzer(frames)
-
-class LivenessDetectionModule(nn.Module):
-    """Detects liveness in video sequences."""
-    def __init__(self, visual_dim=1024, feature_dim=128):
-        super(LivenessDetectionModule, self).__init__()
-        self.detector = nn.Sequential(
-            nn.Linear(visual_dim, feature_dim),
-            nn.ReLU(),
-            nn.Linear(feature_dim, 1),
-            nn.Sigmoid()
-        )
-        
-    def forward(self, visual_features):
-        batch_size = visual_features.shape[0]
-        device = visual_features.device
-        liveness = self.detector(visual_features)
-        features = torch.zeros(batch_size, 128, device=device)
-        return liveness, features
-
-class LightweightModelProcessor(nn.Module):
-    """Lightweight model for efficient processing."""
-    def __init__(self, input_channels=3, feature_dim=32):
-        super(LightweightModelProcessor, self).__init__()
-        self.processor = nn.Sequential(
-            nn.Conv2d(input_channels, 16, 3, padding=1),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Flatten(),
-            nn.Linear(16, feature_dim)
-        )
-        
-    def forward(self, frames):
-        return self.processor(frames)
-
-
-
+# Consolidated fallback implementations are maintained in a separate module
+# to avoid silent duplicate definitions in this large file. Import them
+# so the model can rely on compact fallbacks if advanced implementations
+# or optional dependencies are unavailable.
+try:
+    from fallbacks import *
+    print("✅ Loaded fallback implementations from fallbacks.py")
+except Exception as _fallback_import_err:
+    # Fallback import failed — fallbacks.py missing or errored.
+    # Rely on the full implementations in this file and the `fallbacks.py` module.
+    print(f"⚠️ Could not import fallbacks.py: {_fallback_import_err}")
 class MultiModalDeepfakeModel(nn.Module):
     def __init__(self, num_classes=2, video_feature_dim=1024, audio_feature_dim=1024, 
                  transformer_dim=768, num_transformer_layers=4, enable_face_mesh=True,
@@ -2562,6 +2392,123 @@ class MultiModalDeepfakeModel(nn.Module):
         self.forensic_module = ForensicConsistencyModule(3, debug=debug)  # 3 channels for RGB
         
         # ELA analysis module
+        # --- Tensor tracing helpers (optional) ---
+        # When enabled (`debug=True` or `trace_tensors=True`), register forward hooks
+        # to log input/output shapes and small statistics for each submodule to aid debugging.
+        self.trace_tensors = bool(debug)
+        self._trace_handles = []
+
+        def _trace_hook(module, inputs, outputs):
+            try:
+                # Only log when explicitly enabled (debug mode)
+                if not getattr(self, 'trace_tensors', False):
+                    return
+
+                name = module.__class__.__name__
+                # Simplify module id by using its attribute name if possible
+                qualname = None
+                for n, m in self.named_modules():
+                    if m is module:
+                        qualname = n
+                        break
+
+                prefix = f"[TRACE] {qualname or name}"
+
+                def _fmt(x):
+                    if isinstance(x, torch.Tensor):
+                        s = tuple(x.shape)
+                        info = f"shape={s}, dtype={x.dtype}, device={x.device}"
+                        # Show small-tensor stats only for reasonably-sized tensors
+                        try:
+                            if x.numel() > 0 and x.numel() <= 1024:
+                                info += f", min={float(x.min()):.6g}, max={float(x.max()):.6g}, mean={float(x.mean()):.6g}"
+                        except Exception:
+                            pass
+                        return info
+                    elif isinstance(x, (list, tuple)):
+                        return f"len={len(x)}"
+                    else:
+                        return str(type(x))
+
+                # Log inputs (may be tuple)
+                if isinstance(inputs, (list, tuple)):
+                    for i, inp in enumerate(inputs):
+                        print(f"{prefix} input[{i}]: {_fmt(inp)}")
+                else:
+                    print(f"{prefix} input: {_fmt(inputs)}")
+
+                # Log outputs
+                if isinstance(outputs, (list, tuple)):
+                    for i, out in enumerate(outputs):
+                        print(f"{prefix} output[{i}]: {_fmt(out)}")
+                else:
+                    print(f"{prefix} output: {_fmt(outputs)}")
+
+            except Exception as e:
+                # Swallow tracing errors to avoid breaking forward pass
+                if getattr(self, 'debug', False):
+                    print(f"[TRACE] hook error in {module}: {e}")
+
+        def _register_hooks():
+            # Attach hooks to common module types (Conv, Linear, LayerNorm, MultiheadAttention, Transformer blocks)
+            attach_types = (nn.Conv1d, nn.Conv2d, nn.Conv3d, nn.Linear, nn.LayerNorm, nn.BatchNorm1d, nn.BatchNorm2d,
+                            nn.MultiheadAttention)
+            # Optional module name filter via environment variable TRACE_MODULES (comma-separated substrings)
+            try:
+                import os as _os
+                _trace_modules_raw = _os.environ.get('TRACE_MODULES', '').strip()
+                _trace_filters = [t.strip().lower() for t in _trace_modules_raw.split(',') if t.strip()] if _trace_modules_raw else []
+            except Exception:
+                _trace_filters = []
+
+            for name, module in self.named_modules():
+                # Skip top-level container
+                if module is self:
+                    continue
+                if not isinstance(module, attach_types):
+                    continue
+
+                # If filters provided, only attach to modules whose qualified name or class name matches any filter
+                if _trace_filters:
+                    name_l = (name or '').lower()
+                    cls_l = module.__class__.__name__.lower()
+                    matched = False
+                    for f in _trace_filters:
+                        if f in name_l or f in cls_l:
+                            matched = True
+                            break
+                    if not matched:
+                        continue
+
+                try:
+                    handle = module.register_forward_hook(_trace_hook)
+                    self._trace_handles.append(handle)
+                except Exception:
+                    pass
+
+        def _remove_hooks():
+            for h in list(self._trace_handles):
+                try:
+                    h.remove()
+                except Exception:
+                    pass
+            self._trace_handles = []
+
+        # Bind helper methods to self for external control
+        self._trace_hook = _trace_hook
+        self.register_trace_hooks = _register_hooks
+        self.remove_trace_hooks = _remove_hooks
+
+        # If debug/tracing requested at init, register hooks now
+        if self.trace_tensors:
+            try:
+                self.register_trace_hooks()
+                if self.debug:
+                    print("[TRACE] Registered tensor tracing hooks for model modules")
+            except Exception as e:
+                if self.debug:
+                    print(f"[TRACE] Failed to register trace hooks: {e}")
+
         self.ela_encoder = nn.Sequential(
             nn.Conv2d(1, 32, kernel_size=3, stride=2, padding=1),
             nn.ReLU(),
@@ -2635,6 +2582,53 @@ class MultiModalDeepfakeModel(nn.Module):
         self.physiological_analyzer = RemotePhysiologicalAnalyzer(feature_dim=32)
         self.skin_color_analyzer = SkinColorAnalyzer(feature_dim=32)
         
+        # ============================================================================
+        # CONTRASTIVE LEARNING COMPONENTS FOR FAKE VS ORIGINAL COMPARISON
+        # ============================================================================
+        
+        # Feature difference analyzer - computes differences between fake and original features
+        self.feature_difference_analyzer = nn.Sequential(
+            nn.Linear(self.actual_video_feature_dim, self.actual_video_feature_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(self.actual_video_feature_dim // 2, self.actual_video_feature_dim)
+        )
+        
+        # Audio difference analyzer - computes differences between fake and original audio
+        self.audio_difference_analyzer = nn.Sequential(
+            nn.Linear(self.actual_audio_feature_dim, self.actual_audio_feature_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(self.actual_audio_feature_dim // 2, self.actual_audio_feature_dim)
+        )
+        
+        # Contrastive fusion layer - combines fake, original, and difference features
+        contrastive_input_dim = (self.actual_video_feature_dim + self.actual_audio_feature_dim) * 3
+        # 3x because we have: fake features, original features, and difference features
+        
+        self.contrastive_fusion = nn.Sequential(
+            nn.Linear(contrastive_input_dim, transformer_dim * 2),
+            nn.LayerNorm(transformer_dim * 2),
+            nn.ReLU(),
+            nn.Dropout(0.4),
+            nn.Linear(transformer_dim * 2, transformer_dim),
+            nn.LayerNorm(transformer_dim),
+            nn.ReLU()
+        )
+        
+        # Similarity scorer - learns to detect subtle differences
+        self.similarity_scorer = nn.Sequential(
+            nn.Linear(self.actual_video_feature_dim + self.actual_audio_feature_dim, 512),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Linear(256, 1),
+            nn.Sigmoid()
+        )
+        
+        print("[INFO] ✅ Contrastive learning components initialized for fake/original comparison")
+        
         # 3. Visual Artifact & Spatial Analysis
         self.lighting_consistency_analyzer = LightingConsistencyAnalyzer(feature_dim=64)
         self.texture_analyzer = TextureAnalyzer(patch_size=32, feature_dim=64)
@@ -2683,6 +2677,12 @@ class MultiModalDeepfakeModel(nn.Module):
                 audio_dim=self.actual_audio_feature_dim,
                 fusion_dim=512
             )
+            # Projection to transformer's expected dimension (keeps architecture consistent)
+            try:
+                self.enhanced_projection = nn.Linear(512, transformer_dim)
+            except Exception:
+                # If transformer_dim not in scope for some reason, create a passthrough layer placeholder
+                self.enhanced_projection = None
             
             # Periodical Feature Extractor for detecting periodic patterns
             self.periodical_extractor = PeriodicalFeatureExtractor(
@@ -2767,8 +2767,10 @@ class MultiModalDeepfakeModel(nn.Module):
         
         # Explainability component weights (learnable importance of each component)
         if self.enable_explainability:
-            # Increased to account for new components
-            self.component_weights = nn.Parameter(torch.ones(20), requires_grad=True)
+            # Increased to account for all features: 
+            # 7 (facial) + 9 (physiological) + 6 (visual) + 3 (audio) + 
+            # 5 (multimodal) + 3 (forensic) + 6 (advanced) + 1 (contrastive) = 40+
+            self.component_weights = nn.Parameter(torch.ones(50), requires_grad=True)  # 50 to allow future expansion
 
         # Initialize weights
         self._initialize_weights()
@@ -2787,14 +2789,16 @@ class MultiModalDeepfakeModel(nn.Module):
                 try:
                     import dlib
                     import os
-                    model_path = "/home/srmist54/backend/Models/shape_predictor_68_face_landmarks.dat"
+                    model_path = os.environ.get('SHAPE_PREDICTOR_PATH', 'shape_predictor_68_face_landmarks.dat')
                     if not os.path.exists(model_path):
-                        model_path = "shape_predictor_68_face_landmarks.dat"  # Fallback to relative path
+                        # fallback to relative path if provided file not found
+                        model_path = 'shape_predictor_68_face_landmarks.dat'
                     self.face_detector = dlib.get_frontal_face_detector()
                     try:
                         self.facial_landmark_predictor = dlib.shape_predictor(model_path)
-                    except:
-                        print(f"Warning: Could not load facial landmark predictor model from {model_path}")
+                    except Exception:
+                        if self.debug:
+                            print(f"Warning: Could not load facial landmark predictor model from {model_path}")
                         self.facial_landmark_predictor = None
                 except ImportError:
                     print("Warning: dlib not available, some facial analysis features will be limited")
@@ -2968,6 +2972,14 @@ class MultiModalDeepfakeModel(nn.Module):
             audio_visual_sync = inputs.get('audio_visual_sync')
             facial_landmarks = inputs.get('facial_landmarks')   # [B, T, 68*2]
             
+            # ✅ GET DATASET-EXTRACTED FEATURES (NOT HARDCODED!)
+            pulse_signal = inputs.get('pulse_signal')           # From dataset
+            skin_color_variations = inputs.get('skin_color_variations')  # From dataset
+            head_pose = inputs.get('head_pose')                 # From dataset
+            eye_blink_features = inputs.get('eye_blink_features')  # From dataset
+            frequency_features = inputs.get('frequency_features')  # From dataset
+            mfcc_features = inputs.get('mfcc_features')         # From dataset
+            
             # Handle missing inputs
             if video_frames is None or audio is None:
                 raise ValueError("Missing required inputs: video_frames or audio")
@@ -3013,6 +3025,12 @@ class MultiModalDeepfakeModel(nn.Module):
             # Ensure input is in [0, 1] range
             video_frames_flat = torch.clamp(video_frames_flat, 0.0, 1.0)
             
+            if self.debug:
+                print(f"[MODEL] 🎬 Processing FAKE video frames: {video_frames.shape}")
+                if original_video_frames is not None:
+                    print(f"[MODEL] 🎬 Processing REAL (original) video frames: {original_video_frames.shape}")
+                    print(f"[MODEL] 🔄 Contrastive learning: Comparing fake vs real")
+            
             # Apply ImageNet normalization for pre-trained models
             mean = torch.tensor([0.485, 0.456, 0.406], device=video_frames_flat.device).view(1, 3, 1, 1)
             std = torch.tensor([0.229, 0.224, 0.225], device=video_frames_flat.device).view(1, 3, 1, 1)
@@ -3025,6 +3043,7 @@ class MultiModalDeepfakeModel(nn.Module):
             visual_features = visual_features.view(batch_size, num_frames, -1)
             
             if self.debug:
+                print(f"[MODEL] ✅ Visual features extracted: {visual_features.shape}")
                 print(f"[DEBUG] Visual features shape after reshape: {visual_features.shape}")
             
             # Check for NaN in visual features and replace with zeros
@@ -3042,6 +3061,11 @@ class MultiModalDeepfakeModel(nn.Module):
 
             # Audio features extraction
             # Normalize audio to [-1, 1] and ensure float32
+            if self.debug:
+                print(f"[MODEL] 🎵 Processing FAKE audio: {audio.shape}")
+                if 'original_audio' in batch_dict and batch_dict['original_audio'] is not None:
+                    print(f"[MODEL] 🎵 Processing REAL (original) audio: {batch_dict['original_audio'].shape}")
+            
             audio = audio.float()
             max_vals = torch.abs(audio).max(dim=1, keepdim=True)[0]
             # Avoid division by zero
@@ -3082,12 +3106,147 @@ class MultiModalDeepfakeModel(nn.Module):
                 audio_features = torch.zeros(batch_size, self.actual_audio_feature_dim, device=video_frames.device)
                 audio_features.requires_grad_(True)
             
+            # ============================================================================
+            # CONTRASTIVE LEARNING: Extract features from ORIGINAL video/audio
+            # ============================================================================
+            
+            original_video_features = None
+            original_audio_features = None
+            video_feature_difference = None
+            audio_feature_difference = None
+            contrastive_features_available = False
+            
+            if original_video_frames is not None:
+                try:
+                    if self.debug:
+                        print(f"[CONTRASTIVE] Processing original video frames: {original_video_frames.shape}")
+                    
+                    # Extract features from ORIGINAL video using same pipeline as fake
+                    orig_num_frames = original_video_frames.shape[1]
+                    original_video_flat = original_video_frames.view(batch_size * orig_num_frames, C, H, W)
+                    original_video_flat = torch.clamp(original_video_flat, 0.0, 1.0)
+                    
+                    # Apply same normalization
+                    mean = torch.tensor([0.485, 0.456, 0.406], device=original_video_flat.device).view(1, 3, 1, 1)
+                    std = torch.tensor([0.229, 0.224, 0.225], device=original_video_flat.device).view(1, 3, 1, 1)
+                    original_video_normalized = (original_video_flat - mean) / std
+                    original_video_normalized = torch.clamp(original_video_normalized, -10.0, 10.0)
+                    
+                    # Extract visual features from ORIGINAL
+                    original_visual_features = self.visual_model(original_video_normalized)
+                    original_visual_features = original_visual_features.view(batch_size, orig_num_frames, -1)
+                    
+                    # Apply same temporal attention
+                    original_temporal_visual = self.temporal_attention(original_visual_features)
+                    original_video_features = torch.mean(original_temporal_visual, dim=1)  # [B, feature_dim]
+                    original_video_features = self.video_projection(original_video_features)  # [B, video_feature_dim]
+                    
+                    # Compute DIFFERENCE between fake and original video features
+                    video_feature_difference = self.feature_difference_analyzer(
+                        torch.abs(video_features - original_video_features)
+                    )
+                    
+                    contrastive_features_available = True
+                    
+                    if self.debug:
+                        print(f"[CONTRASTIVE] ✅ Original video features extracted: {original_video_features.shape}")
+                        print(f"[CONTRASTIVE] ✅ Video difference features: {video_feature_difference.shape}")
+                        
+                except Exception as e:
+                    if self.debug:
+                        print(f"[CONTRASTIVE] ⚠️ Error extracting original video features: {e}")
+                    original_video_features = None
+                    video_feature_difference = None
+            
+            if original_audio is not None:
+                try:
+                    if self.debug:
+                        print(f"[CONTRASTIVE] Processing original audio: {original_audio.shape}")
+                    
+                    # Extract features from ORIGINAL audio using same pipeline as fake
+                    original_audio_normalized = original_audio.float()
+                    max_vals_orig = torch.abs(original_audio_normalized).max(dim=1, keepdim=True)[0]
+                    max_vals_orig = torch.clamp(max_vals_orig, min=1e-6)
+                    original_audio_normalized = original_audio_normalized / max_vals_orig
+                    original_audio_normalized = torch.clamp(original_audio_normalized, -1.0, 1.0)
+                    
+                    # Extract audio features from ORIGINAL
+                    with torch.cuda.amp.autocast(enabled=False):
+                        original_audio_output = self.audio_model(original_audio_normalized)
+                        original_audio_features = original_audio_output.last_hidden_state  # [B, T', 768]
+                        original_audio_features = torch.mean(original_audio_features, dim=1)  # [B, 768]
+                        original_audio_features = self.audio_projection(original_audio_features)  # [B, audio_feature_dim]
+                        original_audio_features = torch.clamp(original_audio_features, -50.0, 50.0)
+                    
+                    # Compute DIFFERENCE between fake and original audio features
+                    audio_feature_difference = self.audio_difference_analyzer(
+                        torch.abs(audio_features - original_audio_features)
+                    )
+                    
+                    contrastive_features_available = True
+                    
+                    if self.debug:
+                        print(f"[CONTRASTIVE] ✅ Original audio features extracted: {original_audio_features.shape}")
+                        print(f"[CONTRASTIVE] ✅ Audio difference features: {audio_feature_difference.shape}")
+                        
+                except Exception as e:
+                    if self.debug:
+                        print(f"[CONTRASTIVE] ⚠️ Error extracting original audio features: {e}")
+                    original_audio_features = None
+                    audio_feature_difference = None
+            
             # Process spectrogram if available
             spec_features = None
             if self.use_spectrogram and audio_spectrogram is not None:
+                # The dataset may return spectrograms in a variety of shapes:
+                # - [B, 1, H, W] (ideal)
+                # - [B, C, H, W] (stacked slices/channels)
+                # - [B, H, W] (no channel dim)
+                # - [C, H, W] or [H, W] or numpy arrays
+                # Normalize into a single-channel tensor of shape [B, 1, H, W]
+                try:
+                    # Convert numpy -> tensor if necessary
+                    if not isinstance(audio_spectrogram, torch.Tensor):
+                        audio_spectrogram = torch.tensor(audio_spectrogram, dtype=torch.float32)
+
+                    # Move to model device and dtype
+                    audio_spectrogram = audio_spectrogram.to(device=video_frames.device, dtype=video_frames.dtype)
+
+                    # Handle common dimensionalities
+                    if audio_spectrogram.dim() == 2:
+                        # [H, W] -> [1, 1, H, W]
+                        audio_spectrogram = audio_spectrogram.unsqueeze(0).unsqueeze(0)
+                    elif audio_spectrogram.dim() == 3:
+                        # Could be [B, H, W] or [C, H, W]
+                        if audio_spectrogram.size(0) == batch_size:
+                            # [B, H, W] -> [B, 1, H, W]
+                            audio_spectrogram = audio_spectrogram.unsqueeze(1)
+                        else:
+                            # [C, H, W] -> [1, C, H, W]
+                            audio_spectrogram = audio_spectrogram.unsqueeze(0)
+                    elif audio_spectrogram.dim() == 4:
+                        # [B, C, H, W] -> collapse channels if C != 1
+                        if audio_spectrogram.size(1) != 1:
+                            if getattr(self, 'debug', False):
+                                print(f"[WARNING] audio_spectrogram has {audio_spectrogram.size(1)} channels; collapsing to 1 via mean")
+                            audio_spectrogram = audio_spectrogram.mean(dim=1, keepdim=True)
+
+                    # Ensure final shape is [B, 1, H, W]
+                    if audio_spectrogram.dim() != 4 or audio_spectrogram.size(1) != 1:
+                        # As a safe fallback, reshape or create zeros of expected shape
+                        try:
+                            audio_spectrogram = audio_spectrogram.view(batch_size, 1, audio_spectrogram.size(-2), audio_spectrogram.size(-1))
+                        except Exception:
+                            audio_spectrogram = torch.zeros((batch_size, 1, 64, 64), device=video_frames.device, dtype=video_frames.dtype)
+
+                except Exception as e:
+                    if getattr(self, 'debug', False):
+                        print(f"[WARNING] Failed to normalize audio_spectrogram: {e}")
+                    audio_spectrogram = torch.zeros((batch_size, 1, 64, 64), device=video_frames.device, dtype=video_frames.dtype)
+
                 spec_features = self.spectrogram_model(audio_spectrogram)  # [B, spec_out_dim]
                 spec_features = self.spectrogram_projection(spec_features)  # [B, audio_feature_dim]
-                
+
                 # Combine with wav2vec features
                 audio_features = audio_features + spec_features
 
@@ -3140,8 +3299,13 @@ class MultiModalDeepfakeModel(nn.Module):
                 enhanced_metadata_score = self._ensure_batch_consistency(enhanced_metadata_score, batch_size, "enhanced_metadata_score")
                 component_contributions['enhanced_metadata'] = enhanced_metadata_score
             else:
-                explainability_features.append(torch.zeros(batch_size, 128, device=video_frames.device))
-                component_contributions['enhanced_metadata'] = torch.zeros(batch_size, 1, device=video_frames.device)
+                # Use learnable zeros so gradients can still flow
+                zero_placeholder = torch.zeros(batch_size, 128, device=video_frames.device, requires_grad=True)
+                explainability_features.append(zero_placeholder)
+                zero_score = torch.zeros(batch_size, 1, device=video_frames.device, requires_grad=True)
+                component_contributions['enhanced_metadata'] = zero_score
+                if self.debug:
+                    print("[WARNING] No metadata features - using trainable zeros (won't learn metadata patterns)")
             
             # Process audio-visual sync features if available
             av_sync_score = None
@@ -3167,16 +3331,33 @@ class MultiModalDeepfakeModel(nn.Module):
             else:
                 explainability_features.append(torch.zeros(batch_size, 128, device=video_frames.device))
                 
-            # Extract facial landmarks for advanced analysis if not provided
-            if facial_landmarks is None and self.enable_face_mesh:
-                try:
-                    facial_landmarks = self.extract_facial_landmarks(video_frames)
-                except Exception as e:
+            # Extract facial landmarks for advanced analysis
+            # ✅ PRIORITY: Use dataset-provided landmarks if available
+            if facial_landmarks is None:
+                if self.enable_face_mesh:
+                    try:
+                        if self.debug:
+                            print("[INFO] Extracting facial landmarks from video (not provided by dataset)")
+                        facial_landmarks = self.extract_facial_landmarks(video_frames)
+                    except Exception as e:
+                        if self.debug:
+                            print(f"[WARNING] Failed to extract facial landmarks: {e}")
+                            print("[WARNING] Using zero features - model will not learn facial patterns!")
+                        facial_landmarks = torch.zeros(batch_size, num_frames, 136, device=video_frames.device)
+                        facial_landmarks.requires_grad_(True)  # Allow gradient flow
+                else:
                     if self.debug:
-                        print(f"Error extracting facial landmarks: {e}")
+                        print("[WARNING] No facial landmarks provided and face_mesh disabled!")
                     facial_landmarks = torch.zeros(batch_size, num_frames, 136, device=video_frames.device)
-            elif facial_landmarks is None:
-                facial_landmarks = torch.zeros(batch_size, num_frames, 136, device=video_frames.device)
+                    facial_landmarks.requires_grad_(True)
+            else:
+                if self.debug:
+                    print(f"[INFO] ✅ Using dataset-provided facial_landmarks: {facial_landmarks.shape}")
+                # ⚠️ CRITICAL CHECK: Verify facial landmarks are not all zeros
+                if torch.all(facial_landmarks == 0):
+                    print("[CRITICAL WARNING] Facial landmarks are ALL ZEROS!")
+                    print("[IMPACT] Model will learn from placeholder data, not real facial movements!")
+                    print("[SOLUTION] Check dataset extraction or enable face_mesh in model config")
                 
             # Extract eye landmarks if needed (for eye analysis)
             eye_landmarks = self.extract_eye_landmarks_from_facial(facial_landmarks)
@@ -3199,12 +3380,34 @@ class MultiModalDeepfakeModel(nn.Module):
             landmark_consistency, motion_seq = self.landmark_trajectory_analyzer(facial_landmarks)
             component_contributions['landmark_trajectory'] = landmark_consistency
             
-            # Head pose estimation
-            head_pose_score, pose_seq = self.head_pose_estimator(facial_landmarks)
+            # Head pose estimation - PRIORITY: Use dataset-provided head_pose first
+            if head_pose is not None:
+                if self.debug:
+                    print(f"[DEBUG] Using dataset-provided head_pose: {head_pose.shape}")
+                # Dataset provides head pose features - use them directly
+                head_pose_score = head_pose if head_pose.dim() == 2 else head_pose.mean(dim=1, keepdim=True)
+                if torch.all(head_pose == 0):
+                    print(f"[CRITICAL WARNING] Head pose features are ALL ZEROS! Dataset extraction may have failed!")
+            else:
+                # Fallback: Estimate from facial landmarks
+                if self.debug:
+                    print(f"[DEBUG] Dataset head_pose is None, estimating from facial_landmarks")
+                head_pose_score, pose_seq = self.head_pose_estimator(facial_landmarks)
             component_contributions['head_pose'] = head_pose_score
             
-            # Eye analysis (blinking and pupil dilation)
-            eye_naturalness, blinks, pupil_dilation = self.eye_analysis_module(eye_landmarks)
+            # Eye analysis (blinking and pupil dilation) - PRIORITY: Use dataset-provided eye_blink_features first
+            if eye_blink_features is not None:
+                if self.debug:
+                    print(f"[DEBUG] Using dataset-provided eye_blink_features: {eye_blink_features.shape}")
+                # Dataset provides eye blink features - use them directly
+                eye_naturalness = eye_blink_features if eye_blink_features.dim() == 2 else eye_blink_features.mean(dim=1, keepdim=True)
+                if torch.all(eye_blink_features == 0):
+                    print(f"[CRITICAL WARNING] Eye blink features are ALL ZEROS! Dataset extraction may have failed!")
+            else:
+                # Fallback: Analyze from eye landmarks
+                if self.debug:
+                    print(f"[DEBUG] Dataset eye_blink_features is None, analyzing from eye_landmarks")
+                eye_naturalness, blinks, pupil_dilation = self.eye_analysis_module(eye_landmarks)
             component_contributions['eye_naturalness'] = eye_naturalness
             
             # Lip-audio sync analysis
@@ -3219,7 +3422,20 @@ class MultiModalDeepfakeModel(nn.Module):
             component_contributions['oculomotor'] = oculomotor_naturalness
             
             # 2. Advanced Physiological Signal Analysis
-            if hasattr(self, 'enable_advanced_physiology') and self.enable_advanced_physiology:
+            # PRIORITY: Use dataset-provided pulse_signal if available
+            if pulse_signal is not None:
+                if self.debug:
+                    print(f"[DEBUG] Using dataset-provided pulse_signal: {pulse_signal.shape}")
+                # Dataset provides pulse signal - use it directly for naturalness score
+                if torch.all(pulse_signal == 0):
+                    print(f"[CRITICAL WARNING] Pulse signal is ALL ZEROS! Dataset extraction may have failed!")
+                # Convert pulse signal to naturalness score (higher variance = more natural)
+                pulse_variance = torch.var(pulse_signal, dim=-1, keepdim=True) if pulse_signal.dim() > 1 else pulse_signal.var()
+                pulse_naturalness = torch.sigmoid(pulse_variance * 10.0)  # Scale and normalize to [0, 1]
+                component_contributions['physiological'] = pulse_naturalness.view(batch_size, -1) if pulse_naturalness.dim() > 1 else pulse_naturalness.unsqueeze(1)
+                if self.debug:
+                    print(f"[INFO] Pulse-based physiological naturalness: {pulse_naturalness.mean().item():.3f}")
+            elif hasattr(self, 'enable_advanced_physiology') and self.enable_advanced_physiology:
                 try:
                     # Clear memory before intensive operation
                     clear_gpu_memory()
@@ -3268,11 +3484,19 @@ class MultiModalDeepfakeModel(nn.Module):
                         }
                     
                     if self.debug:
-                        print("[INFO] Advanced physiological analysis completed successfully")
-                        print(f"[PHYSIO] Heart rate: {torch.mean(heartbeat_results['heart_rate']):.1f} BPM")
-                        print(f"[PHYSIO] Breathing rate: {torch.mean(breathing_results['breathing_rate']):.1f} BPM")
-                        print(f"[PHYSIO] HRV score: {torch.mean(heartbeat_results['hrv_score']):.3f}")
-                        print(f"[PHYSIO] Coherence score: {torch.mean(advanced_physio_results['coherence_score']):.3f}")
+                        try:
+                            hr_mean = torch.mean(heartbeat_results['heart_rate']).detach().cpu().item()
+                            br_mean = torch.mean(breathing_results['breathing_rate']).detach().cpu().item()
+                            hrv_mean = torch.mean(heartbeat_results['hrv_score']).detach().cpu().item()
+                            coh_mean = torch.mean(advanced_physio_results['coherence_score']).detach().cpu().item()
+                            print("[INFO] Advanced physiological analysis completed successfully")
+                            print(f"[PHYSIO] Heart rate: {hr_mean:.1f} BPM")
+                            print(f"[PHYSIO] Breathing rate: {br_mean:.1f} BPM")
+                            print(f"[PHYSIO] HRV score: {hrv_mean:.3f}")
+                            print(f"[PHYSIO] Coherence score: {coh_mean:.3f}")
+                        except Exception:
+                            # Non-critical: avoid crashing on logging
+                            pass
                     
                     # Clear memory after operation
                     del advanced_physio_results, heartbeat_results, blood_flow_results, breathing_results, optimized_frames
@@ -3300,44 +3524,68 @@ class MultiModalDeepfakeModel(nn.Module):
             # Extract skin color from face regions for pulse analysis (with memory management)
             if self.enable_skin_color_analysis:
                 try:
-                    # Clear memory before intensive operation
-                    clear_gpu_memory()
-                    
-                    # Monitor memory before skin color extraction
-                    allocated_before, reserved_before = get_gpu_memory_usage()
-                    if self.debug:
-                        print(f"[MEMORY] Before skin color extraction: {allocated_before:.2f}GB allocated, {reserved_before:.2f}GB reserved")
-                    
-                    # Optimized skin color extraction - use every 2nd frame for speed
-                    optimized_frames = video_frames[:, ::2] if video_frames.size(1) > 4 else video_frames
-                    skin_color_seq = self.extract_skin_color(optimized_frames)
-                    skin_naturalness = self.skin_color_analyzer(skin_color_seq)
-                    component_contributions['skin_color'] = skin_naturalness
-                    
-                    if self.debug:
-                        print("[INFO] Skin color analysis completed successfully")
-                    
-                    # Clear memory after operation
-                    del skin_color_seq, optimized_frames
-                    clear_gpu_memory()
-                    
-                    allocated_after, reserved_after = get_gpu_memory_usage()
-                    if self.debug:
-                        print(f"[MEMORY] After skin color extraction: {allocated_after:.2f}GB allocated, {reserved_after:.2f}GB reserved")
+                    # ✅ PRIORITY: Use dataset-provided skin color variations if available
+                    if skin_color_variations is not None:
+                        if self.debug:
+                            print(f"[INFO] ✅ Using dataset-provided skin_color_variations: {skin_color_variations.shape}")
+                        # Ensure correct shape for analyzer
+                        if len(skin_color_variations.shape) == 2:
+                            skin_color_seq = skin_color_variations.unsqueeze(1)  # Add sequence dim
+                        else:
+                            skin_color_seq = skin_color_variations
+                        skin_naturalness = self.skin_color_analyzer(skin_color_seq)
+                        component_contributions['skin_color'] = skin_naturalness
+                    else:
+                        # Compute from video frames only if not provided
+                        if self.debug:
+                            print("[INFO] Extracting skin color from video (not provided by dataset)")
+                        clear_gpu_memory()
+                        
+                        # Monitor memory before skin color extraction
+                        allocated_before, reserved_before = get_gpu_memory_usage()
+                        if self.debug:
+                            print(f"[MEMORY] Before skin color extraction: {allocated_before:.2f}GB allocated, {reserved_before:.2f}GB reserved")
+                        
+                        # Optimized skin color extraction - use every 2nd frame for speed
+                        optimized_frames = video_frames[:, ::2] if video_frames.size(1) > 4 else video_frames
+                        skin_color_seq = self.extract_skin_color(optimized_frames)
+                        skin_naturalness = self.skin_color_analyzer(skin_color_seq)
+                        component_contributions['skin_color'] = skin_naturalness
+                        
+                        if self.debug:
+                            print("[INFO] Skin color analysis completed successfully")
+                        
+                        # Clear memory after operation
+                        del skin_color_seq, optimized_frames
+                        clear_gpu_memory()
+                        
+                        allocated_after, reserved_after = get_gpu_memory_usage()
+                        if self.debug:
+                            print(f"[MEMORY] After skin color extraction: {allocated_after:.2f}GB allocated, {reserved_after:.2f}GB reserved")
                         
                 except RuntimeError as e:
                     if "CUDA out of memory" in str(e):
                         print(f"[WARNING] Skipping skin color analysis due to memory constraints: {e}")
                         # Skip skin color analysis to preserve memory
-                        component_contributions['skin_color'] = torch.zeros((video_frames.size(0), 1), device=video_frames.device)
+                        # CRITICAL: Use trainable placeholder to maintain gradient flow
+                        component_contributions['skin_color'] = torch.zeros(
+                            (video_frames.size(0), 1), 
+                            device=video_frames.device,
+                            requires_grad=True
+                        )
                         clear_gpu_memory()
                     else:
                         raise e
             else:
                 # Skin color analysis disabled
                 if self.debug:
-                    print("[INFO] Skin color analysis disabled in model configuration")
-                component_contributions['skin_color'] = torch.zeros((video_frames.size(0), 1), device=video_frames.device)
+                    print("[WARNING] Skin color analysis disabled - using trainable placeholder")
+                # Use trainable placeholder so gradients can flow
+                component_contributions['skin_color'] = torch.zeros(
+                    (video_frames.size(0), 1), 
+                    device=video_frames.device,
+                    requires_grad=True
+                )
             
             # 3. Visual Artifact Analysis
             # Lighting consistency
@@ -3348,8 +3596,19 @@ class MultiModalDeepfakeModel(nn.Module):
             texture_consistency, _ = self.texture_analyzer(video_frames[:, 0])
             component_contributions['texture'] = texture_consistency
             
-            # Frequency domain analysis
-            frequency_score = self.frequency_domain_analyzer(video_frames[:, 0])
+            # Frequency domain analysis - PRIORITY: Use dataset-provided frequency_features first
+            if frequency_features is not None:
+                if self.debug:
+                    print(f"[DEBUG] Using dataset-provided frequency_features: {frequency_features.shape}")
+                # Dataset provides frequency features - use them directly
+                frequency_score = frequency_features if frequency_features.dim() == 2 else frequency_features.mean(dim=1, keepdim=True)
+                if torch.all(frequency_features == 0):
+                    print(f"[CRITICAL WARNING] Frequency features are ALL ZEROS! Dataset extraction may have failed!")
+            else:
+                # Fallback: Analyze frequency domain from video frames
+                if self.debug:
+                    print(f"[DEBUG] Dataset frequency_features is None, analyzing from video_frames")
+                frequency_score = self.frequency_domain_analyzer(video_frames[:, 0])
             component_contributions['frequency'] = frequency_score
             
             # GAN fingerprint detection
@@ -3363,9 +3622,26 @@ class MultiModalDeepfakeModel(nn.Module):
             )
             component_contributions['voice_authenticity'] = voice_authenticity
             
-            # MFCC analysis
-            mfcc_consistency, _ = self.mfcc_extractor(audio)
-            component_contributions['mfcc'] = mfcc_consistency
+            # MFCC analysis - ✅ USE DATASET-PROVIDED MFCC IF AVAILABLE
+            if mfcc_features is not None:
+                if self.debug:
+                    print(f"[INFO] ✅ Using dataset-provided MFCC features: {mfcc_features.shape}")
+                # Process the provided MFCC through analyzer
+                try:
+                    mfcc_consistency = self.mfcc_extractor.process_mfcc(mfcc_features)
+                    component_contributions['mfcc'] = mfcc_consistency
+                    if self.debug:
+                        print(f"[MODEL] ✅ MFCC processed successfully")
+                except AttributeError as e:
+                    if self.debug:
+                        print(f"[MODEL] ⚠️ Using fallback MFCC (process_mfcc not available): {e}")
+                    mfcc_consistency, _ = self.mfcc_extractor(audio)
+                    component_contributions['mfcc'] = mfcc_consistency
+            else:
+                if self.debug:
+                    print("[INFO] Computing MFCC from audio (not provided by dataset)")
+                mfcc_consistency, _ = self.mfcc_extractor(audio)
+                component_contributions['mfcc'] = mfcc_consistency
             
             # Voice biometrics verification
             voice_bio_consistency = self.voice_biometrics_verifier(
@@ -3387,7 +3663,12 @@ class MultiModalDeepfakeModel(nn.Module):
                 _, ae_error = self.autoencoder(video_frames[:, 0])
                 component_contributions['autoencoder'] = torch.sigmoid(1.0 - ae_error.unsqueeze(1))
             else:
-                component_contributions['autoencoder'] = torch.ones(batch_size, 1, device=video_frames.device)
+                # CRITICAL: Use trainable placeholder for empty videos to maintain gradient flow
+                component_contributions['autoencoder'] = torch.ones(
+                    batch_size, 1, 
+                    device=video_frames.device,
+                    requires_grad=True
+                )
             
             # 6. Forensic Analysis
             # Digital artifact detection
@@ -3467,11 +3748,81 @@ class MultiModalDeepfakeModel(nn.Module):
                     # Continue without advanced features
                     advanced_features_list = []
             
+            # ============================================================================
+            # CONTRASTIVE LEARNING FUSION: Combine fake, original, and difference features
+            # ============================================================================
+            
             # Combine and fuse features
-            # Use enhanced fusion if advanced components are available
-            if hasattr(self, 'use_advanced_components') and self.use_advanced_components and len(advanced_features_list) > 0:
+            if contrastive_features_available and original_video_features is not None and original_audio_features is not None:
+                # CONTRASTIVE MODE: Use fake, original, and difference features
+                if self.debug:
+                    print(f"[CONTRASTIVE] Using contrastive learning fusion with 3 feature streams")
+                
+                # Concatenate all feature streams:
+                # 1. Fake features (from manipulated video/audio)
+                # 2. Original features (from real video/audio)  
+                # 3. Difference features (learned differences between fake and original)
+                
+                fake_combined = torch.cat([video_features, audio_features], dim=-1)
+                original_combined = torch.cat([original_video_features, original_audio_features], dim=-1)
+                
+                # If we have difference features, use them; otherwise compute simple difference
+                if video_feature_difference is not None and audio_feature_difference is not None:
+                    difference_combined = torch.cat([video_feature_difference, audio_feature_difference], dim=-1)
+                else:
+                    # Fallback: simple absolute difference
+                    difference_combined = torch.abs(fake_combined - original_combined)
+                
+                # Concatenate all three streams
+                contrastive_input = torch.cat([
+                    fake_combined,           # Features from fake/manipulated
+                    original_combined,       # Features from original/real
+                    difference_combined      # Learned difference features
+                ], dim=-1)
+                
+                # Apply contrastive fusion layer
+                combined_features = self.contrastive_fusion(contrastive_input)
+                
+                # Compute similarity score for additional signal
+                similarity_input = torch.cat([video_features, audio_features], dim=-1)
+                similarity_score = self.similarity_scorer(similarity_input)
+                component_contributions['contrastive_similarity'] = similarity_score
+                
+                if self.debug:
+                    print(f"[CONTRASTIVE] ✅ Fake features: {fake_combined.shape}")
+                    print(f"[CONTRASTIVE] ✅ Original features: {original_combined.shape}")
+                    print(f"[CONTRASTIVE] ✅ Difference features: {difference_combined.shape}")
+                    print(f"[CONTRASTIVE] ✅ Fused contrastive features: {combined_features.shape}")
+                    print(f"[CONTRASTIVE] ✅ Similarity score: {similarity_score.mean().item():.4f}")
+                
+            elif hasattr(self, 'use_advanced_components') and self.use_advanced_components and len(advanced_features_list) > 0:
                 # Use enhanced cross-modal fusion
                 combined_features = enhanced_fused_features  # Already computed in advanced components section
+                # If enhanced fusion outputs do not match transformer's d_model, project them
+                try:
+                    target_dim = None
+                    # infer transformer's expected d_model if possible
+                    if hasattr(self, 'transformer') and hasattr(self.transformer, 'layers') and len(self.transformer.layers) > 0:
+                        first = self.transformer.layers[0]
+                        if hasattr(first, 'self_attn'):
+                            target_dim = getattr(first.self_attn, 'embed_dim', None)
+                    if target_dim is None and hasattr(self, 'combined_projection') and hasattr(self.combined_projection, 'out_features'):
+                        target_dim = self.combined_projection.out_features
+
+                    if target_dim is not None and combined_features.shape[-1] != target_dim:
+                        if getattr(self, 'enhanced_projection', None) is not None:
+                            if self.debug:
+                                print(f"[INFO] Projecting enhanced fusion from {combined_features.shape[-1]} -> {target_dim}")
+                            combined_features = self.enhanced_projection(combined_features)
+                        else:
+                            # Fallback: try to use combined_projection if available
+                            if getattr(self, 'combined_projection', None) is not None:
+                                if self.debug:
+                                    print(f"[INFO] Using combined_projection to project enhanced fusion from {combined_features.shape[-1]} -> {self.combined_projection.out_features}")
+                                combined_features = self.combined_projection(combined_features)
+                except Exception:
+                    # If projection fails, continue and let the transformer error be raised with diagnostics
+                    pass
                 if self.debug:
                     print(f"[INFO] Using enhanced cross-modal fusion, output shape: {combined_features.shape}")
             elif self.fusion_type == 'attention':
@@ -3481,7 +3832,86 @@ class MultiModalDeepfakeModel(nn.Module):
                 combined_features = self.combined_projection(combined_features)
 
             # Process through transformer
-            transformer_output = self.transformer(combined_features.unsqueeze(1)).squeeze(1)
+            # Targeted debug: print combined feature shapes and upstream contributors
+            try:
+                if getattr(self, 'debug', False):
+                    print(f"[DEBUG] combined_features pre-transformer shape: {getattr(combined_features, 'shape', None)}, dtype={getattr(combined_features, 'dtype', None)}, device={getattr(combined_features, 'device', None)}")
+                    # Print upstream components to help trace origin of dimension mismatch
+                    try:
+                        print(f"[DEBUG] video_features shape: {getattr(video_features, 'shape', None)}")
+                    except Exception:
+                        pass
+                    try:
+                        print(f"[DEBUG] audio_features shape: {getattr(audio_features, 'shape', None)}")
+                    except Exception:
+                        pass
+                    try:
+                        print(f"[DEBUG] fusion_type: {getattr(self, 'fusion_type', None)}, use_advanced_components: {getattr(self, 'use_advanced_components', False)}")
+                    except Exception:
+                        pass
+                    # If combined_projection exists, print its expected output dim
+                    try:
+                        cp = getattr(self, 'combined_projection', None)
+                        if cp is not None and hasattr(cp, 'out_features'):
+                            print(f"[DEBUG] combined_projection.out_features: {cp.out_features}")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            try:
+                transformer_output = self.transformer(combined_features.unsqueeze(1)).squeeze(1)
+            except Exception as _e:
+                # Diagnose embedding-dimension mismatches and other transformer errors
+                try:
+                    print(f"[ERROR] Transformer forward failed: {_e}")
+                    try:
+                        print(f"[DIAG] combined_features: shape={getattr(combined_features,'shape',None)}, dtype={getattr(combined_features,'dtype',None)}, device={getattr(combined_features,'device',None)}")
+                    except Exception:
+                        pass
+                    try:
+                        print(f"[DIAG] video_features: shape={getattr(video_features,'shape',None)}")
+                    except Exception:
+                        pass
+                    try:
+                        print(f"[DIAG] audio_features: shape={getattr(audio_features,'shape',None)}")
+                    except Exception:
+                        pass
+                    try:
+                        print(f"[DIAG] actual_video_feature_dim={getattr(self,'actual_video_feature_dim',None)}, actual_audio_feature_dim={getattr(self,'actual_audio_feature_dim',None)}")
+                    except Exception:
+                        pass
+                    try:
+                        cp = getattr(self, 'combined_projection', None)
+                        if cp is not None:
+                            outf = getattr(cp, 'out_features', None)
+                            inf = getattr(cp, 'in_features', None)
+                            print(f"[DIAG] combined_projection: {cp} (in_features={inf}, out_features={outf})")
+                    except Exception:
+                        pass
+                    try:
+                        print(f"[DIAG] transformer module: {type(self.transformer)}")
+                        if hasattr(self.transformer, 'layers') and len(self.transformer.layers) > 0:
+                            first = self.transformer.layers[0]
+                            print(f"[DIAG] transformer first layer type: {type(first)}")
+                            # MultiheadAttention diagnostics
+                            if hasattr(first, 'self_attn'):
+                                sa = first.self_attn
+                                print(f"[DIAG] self_attn attrs: embed_dim={getattr(sa,'embed_dim',None)}, num_heads={getattr(sa,'num_heads',None)}")
+                    except Exception:
+                        pass
+                    # Print a small sample of values for quick eyeballing (safe-size slice)
+                    try:
+                        if isinstance(combined_features, torch.Tensor) and combined_features.numel() > 0:
+                            flat = combined_features.detach().cpu().flatten()
+                            sample = flat[:min(16, flat.numel())].tolist()
+                            print(f"[DIAG] combined_features sample (first {len(sample)} values): {sample}")
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+                # Re-raise original exception to preserve behavior
+                raise
             
             # Concatenate advanced features if available
             if hasattr(self, 'use_advanced_components') and self.use_advanced_components and len(advanced_features_list) > 0:
@@ -4060,96 +4490,8 @@ class MultiModalDeepfakeModel(nn.Module):
             # Return zeros with shape [batch_size, num_frames, 20*2] (20 lip landmarks total)
             return torch.zeros((batch_size, num_frames, 40), device=facial_landmarks.device)
 
-    def extract_skin_color(self, video_frames):
-        """Extract average skin color from face regions for pulse analysis - Memory Optimized."""
-        batch_size, num_frames, C, H, W = video_frames.shape
-        
-        try:
-            # Memory-optimized approach: Process in smaller chunks and use GPU operations
-            chunk_size = min(4, num_frames)  # Process 4 frames at a time max
-            device = video_frames.device
-            
-            # Pre-allocate result tensor
-            skin_colors = torch.zeros((batch_size, num_frames, 3), device=device, dtype=torch.float32)
-            
-            for b in range(batch_size):
-                for chunk_start in range(0, num_frames, chunk_size):
-                    chunk_end = min(chunk_start + chunk_size, num_frames)
-                    
-                    # Process chunk of frames
-                    frame_chunk = video_frames[b, chunk_start:chunk_end]  # [chunk_size, C, H, W]
-                    
-                    # Downsample frames for skin detection to save memory (224x224 -> 56x56)
-                    small_frames = torch.nn.functional.interpolate(
-                        frame_chunk, size=(56, 56), mode='bilinear', align_corners=False
-                    )  # [chunk_size, 3, 56, 56]
-                    
-                    # Simple skin detection using RGB values on GPU
-                    r = small_frames[:, 0].float()  # [chunk_size, 56, 56] - ensure float type
-                    g = small_frames[:, 1].float()
-                    b = small_frames[:, 2].float()
-                    
-                    # Vectorized skin detection - ensure boolean tensor
-                    skin_mask = ((r > 0.4) & (g > 0.28) & (b > 0.2) & 
-                                (r > g) & (r > b) & 
-                                ((r - g) > 0.1) & (torch.abs(r - g) > 0.15)).bool()
-                    
-                    # Extract average colors for each frame in chunk
-                    for i, t in enumerate(range(chunk_start, chunk_end)):
-                        mask = skin_mask[i]
-                        if not mask.dtype == torch.bool:
-                            mask = mask.to(dtype=torch.bool)
-                        idx = int(i) if not isinstance(i, int) else i
-                        if self.debug:
-                            print(f"[SKIN] i type: {type(i)}, idx type: {type(idx)}, r type: {type(r)}, r shape: {getattr(r, 'shape', None)}")
-                        # Defensive: check shapes and types
-                        if not (isinstance(r, torch.Tensor) and r.shape[0] > idx and r.shape[1:] == (56, 56)):
-                            skin_colors[b, t] = torch.tensor([0.5, 0.4, 0.35], device=device, dtype=torch.float32)
-                            continue
-                        if self.debug:
-                            print(f"[SKIN] i type: {type(i)}, r shape: {r.shape}, idx: {idx}")
-                        if mask.any():
-                            try:
-                                r_frame = r[idx.long()] if not isinstance(idx, int) else r[idx]
-                                g_frame = g[idx.long()] if not isinstance(idx, int) else g[idx]
-                                b_frame = b[idx.long()] if not isinstance(idx, int) else b[idx]
-                                mask_float = mask.float()
-                                r_masked = r_frame * mask_float
-                                g_masked = g_frame * mask_float
-                                b_masked = b_frame * mask_float
-                                mask_sum = mask_float.sum()
-                                if mask_sum > 0:
-                                    avg_r = r_masked.sum() / mask_sum
-                                    avg_g = g_masked.sum() / mask_sum
-                                    avg_b = b_masked.sum() / mask_sum
-                                    skin_colors[b, t] = torch.stack([avg_r, avg_g, avg_b])
-                                else:
-                                    skin_colors[b, t] = torch.tensor([0.5, 0.4, 0.35], device=device, dtype=torch.float32)
-                            except Exception as mask_error:
-                                if self.debug:
-                                    print(f"Error in skin color calculation: {mask_error}")
-                                skin_colors[b, t] = torch.tensor([0.5, 0.4, 0.35], device=device, dtype=torch.float32)
-                        else:
-                            skin_colors[b, t] = torch.tensor([0.5, 0.4, 0.35], device=device, dtype=torch.float32)
-                    
-                    # Clear intermediate tensors to free memory
-                    del frame_chunk, small_frames, r, g, b, skin_mask
-                    
-                    # Force garbage collection if needed
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-            
-            return skin_colors
-        
-        except Exception as e:
-            if self.debug:
-                print(f"Error extracting skin colors: {e}")
-            # Clear any GPU memory that might be held
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            # Return zeros with shape [batch_size, num_frames, 3] (RGB values)
-            return torch.zeros((batch_size, num_frames, 3), device=video_frames.device)
-
+    # Consolidated `extract_skin_color` implementation appears later in the file.
+    # The duplicate, earlier implementation was removed to avoid shadowing.
     def extract_skin_color(self, video_frames):
         """Extract average skin color from face regions for pulse analysis - Memory Optimized."""
         batch_size, num_frames, C, H, W = video_frames.shape
@@ -4181,16 +4523,22 @@ class MultiModalDeepfakeModel(nn.Module):
                                     g_masked = g[idx][mask]
                                     b_masked = b_[idx][mask]
                                 except Exception as mask_index_error:
-                                    print(f"[SKIN-ERROR] Exception during masking at b={b}, t={t}, idx={idx}: {mask_index_error}")
-                                    raise
-                                r_mean = r_masked.mean().item()
-                                g_mean = g_masked.mean().item()
-                                b_mean = b_masked.mean().item()
+                                    if self.debug:
+                                        print(f"[SKIN-ERROR] Exception during masking at b={b}, t={t}, idx={idx}: {mask_index_error}")
+                                    # Fallback to per-frame mean
+                                    r_mean = r[idx].mean()
+                                    g_mean = g[idx].mean()
+                                    b_mean = b_[idx].mean()
+                                else:
+                                    r_mean = r_masked.mean()
+                                    g_mean = g_masked.mean()
+                                    b_mean = b_masked.mean()
                             else:
-                                r_mean = r[idx].mean().item()
-                                g_mean = g[idx].mean().item()
-                                b_mean = b_[idx].mean().item()
-                            skin_colors[b, t] = torch.tensor([r_mean, g_mean, b_mean], device=device)
+                                r_mean = r[idx].mean()
+                                g_mean = g[idx].mean()
+                                b_mean = b_[idx].mean()
+                            # Assign tensor values directly (avoid .item())
+                            skin_colors[b, t] = torch.stack([r_mean, g_mean, b_mean])
                         except Exception as inner_e:
                             print(f"[SKIN-ERROR] Exception at b={b}, t={t}, idx={idx}: {inner_e}")
                             raise

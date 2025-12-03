@@ -1,7 +1,33 @@
 """
 🔥 IMPROVED DEEPFAKE DETECTION TRAINING SCRIPT 🔥
 
-Key Improvements for Class Imbalance & Overfitting:
+# Global debug flag for verbose logging
+DEBUG_MODE = False
+
+# Quick helper: if user requests symbol listing, do it before importing heavy modules
+import sys
+if '--print_model_symbols' in sys.argv:
+    import os, re
+    from collections import Counter
+    model_path = os.path.join(os.path.dirname(__file__), 'multi_modal_model.py')
+    if os.path.exists(model_path):
+        try:
+            with open(model_path, 'r', encoding='utf-8') as mf:
+                content = mf.read()
+            matches = re.findall(r'^\s*(class|def)\s+([A-Za-z_][A-Za-z0-9_]*)', content, flags=re.MULTILINE)
+            names = [name for _kind, name in matches]
+            counts = Counter(names)
+
+            print('\nCount Name')
+            print('----- ----')
+            for name, cnt in counts.most_common():
+                print(f"{cnt:5d} {name}")
+            print('')
+        except Exception as e:
+            print(f"[ERROR] Failed to read model file: {e}")
+    else:
+        print(f"[ERROR] Model file not found: {model_path}")
+    sys.exit(0)
 
 ✅ CLASS IMBALANCE FIXES:
    - Focal Loss: Focuses on hard examples, reduces easy example weight
@@ -28,48 +54,221 @@ Usage Examples:
   python train_multimodal.py --class_weights_mode balanced --oversample_minority --dropout_rate 0.5
 """
 
-from multi_modal_model import MultiModalDeepfakeModel
-from dataset_loader import get_data_loaders, get_transforms, get_transforms_enhanced
+"""
+Lightweight imports first; heavy/optional imports (visualization, sklearn, wandb, cv2, pandas)
+are loaded lazily inside functions so the module can be imported for quick checks
+like `--print_model_symbols` without failing when optional deps are missing.
+"""
 import torch
-from skin_analyzer import SkinColorAnalyzer
 import torch.nn as nn
 import torch.nn.functional as F  # Added for Focal Loss
 import torch.optim as optim
 from torch.cuda.amp import GradScaler, autocast
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from sklearn.metrics import precision_recall_fscore_support, confusion_matrix, roc_auc_score, accuracy_score, precision_score, recall_score, f1_score  # Added more metrics
-import matplotlib
-matplotlib.use('Agg')  # Set non-interactive backend for server environments
-import matplotlib.pyplot as plt
-import seaborn as sns
 import warnings
 import os
 import numpy as np
 import json
 import time
-from datetime import datetime, timedelta  # Added timedelta for distributed timeout
-from tqdm import tqdm
-import cv2
-from pathlib import Path
-import pandas as pd
-import wandb
-import argparse
 from datetime import datetime, timedelta
+from tqdm import tqdm
+import argparse
 import shutil
 import torch.multiprocessing as mp
 import traceback
-import glob
 import atexit
 import gc
 import signal
 import sys
+from pathlib import Path
+
+# Graceful shutdown flag and cleanup
+_GLOBAL_SHUTDOWN_FLAG = {'requested': False}
+
+
+def request_shutdown():
+    _GLOBAL_SHUTDOWN_FLAG['requested'] = True
+
+
+def is_shutdown_requested():
+    return _GLOBAL_SHUTDOWN_FLAG.get('requested', False)
+
+
+def cleanup_and_exit(trainer=None, save_checkpoint=True, reason="signal"):
+    """Attempt to save checkpoints, close logging, release GPU resources and terminate DDP safely.
+
+    This function is safe to call multiple times.
+    """
+    try:
+        print(f"[CLEANUP] Cleanup requested due to {reason}")
+        request_shutdown()
+        # Save checkpoint if trainer provided
+        if trainer is not None and save_checkpoint:
+            try:
+                # Prefer trainer.save_checkpoint if available
+                if hasattr(trainer, 'save_checkpoint'):
+                    trainer.save_checkpoint(tag=f'exit_{reason}')
+                    print("[CLEANUP] Checkpoint saved via trainer.save_checkpoint()")
+                else:
+                    # Try to save model state_dict
+                    state = {
+                        'model_state_dict': getattr(trainer.model, 'state_dict', lambda: None)(),
+                        'optimizer_state_dict': getattr(trainer.optimizer, 'state_dict', lambda: None)(),
+                        'epoch': getattr(trainer, 'epoch', -1)
+                    }
+                    ckpt_path = os.path.join(getattr(trainer, 'checkpoint_dir', '.'), f'checkpoint_exit_{reason}.pth')
+                    torch.save(state, ckpt_path)
+                    print(f"[CLEANUP] Checkpoint saved to {ckpt_path}")
+            except Exception as e:
+                print(f"[CLEANUP] Failed to save checkpoint: {e}")
+
+        # Attempt to close wandb safely if present
+        try:
+            import wandb
+            try:
+                wandb.finish(timeout=30)
+                print("[CLEANUP] wandb.finish() called")
+            except Exception:
+                try:
+                    wandb.join()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Destroy process group if initialized
+        try:
+            if dist.is_available() and dist.is_initialized():
+                try:
+                    dist.barrier(timeout=30)
+                except Exception:
+                    pass
+                try:
+                    dist.destroy_process_group()
+                    print("[CLEANUP] Distributed process group destroyed")
+                except Exception as e:
+                    print(f"[CLEANUP] Error destroying process group: {e}")
+        except Exception:
+            pass
+
+        # Clear CUDA cache
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                print("[CLEANUP] torch.cuda.empty_cache() called")
+        except Exception:
+            pass
+
+        # Force garbage collection
+        try:
+            gc.collect()
+        except Exception:
+            pass
+
+    except Exception as top_e:
+        print(f"[CLEANUP] Top-level cleanup error: {top_e}")
+
+
+def _signal_handler(signum, frame):
+    # Soft-request shutdown and let training loop exit gracefully
+    print(f"[SIGNAL] Caught signal {signum}. Requesting graceful shutdown...")
+    request_shutdown()
+
+
+# Register signal handlers for SIGINT/SIGTERM
+try:
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
+except Exception:
+    # Some platforms or contexts may not allow signal handling
+    pass
+
+# Optional/lazy imports - try to import now but if they fail set fallbacks to None
+try:
+    from multi_modal_model import MultiModalDeepfakeModel
+except Exception as _e:
+    MultiModalDeepfakeModel = None
+    _MULTIMODAL_IMPORT_ERROR = _e
+
+try:
+    # dataset loading utilities are heavy; if missing, raise when used
+    from dataset_loader import get_data_loaders, get_transforms, get_transforms_enhanced
+except Exception as _e:
+    get_data_loaders = None
+    get_transforms = None
+    get_transforms_enhanced = None
+    _DATA_LOADER_IMPORT_ERROR = _e
+
+try:
+    from skin_analyzer import SkinColorAnalyzer
+except Exception:
+    SkinColorAnalyzer = None
+
+# Quick delegation: if user wants the paired fake/original training path, run the
+# dedicated pairwise trainer we added (`train_pairwise_smoke.py`) and exit. This
+# re-uses the hardened `MultiModalDeepfakeDataset` with `load_originals_always=True`.
+if '--use_paired' in sys.argv:
+    try:
+        # Import and run the pairwise smoke trainer with sensible defaults.
+        from train_pairwise_smoke import main as _paired_main
+        # Remove our flag so argparse in the module doesn't see it twice
+        sys.argv = [a for a in sys.argv if a != '--use_paired']
+        # Run with defaults; the module accepts CLI args if present
+        _paired_main()
+        sys.exit(0)
+    except Exception as _e:
+        print(f"[ERROR] Failed to launch pairwise trainer: {_e}")
+        # fallthrough to normal training
 
 # 🧼 PROCESS SAFETY: Set multiprocessing method early and force it
 try:
     mp.set_start_method('spawn', force=True)
 except RuntimeError:
     pass  # Already set
+
+
+def _format_shape_info(x):
+    try:
+        if isinstance(x, torch.Tensor):
+            return f"Tensor shape={tuple(x.shape)}, dtype={x.dtype}, device={x.device}"
+        elif isinstance(x, (list, tuple)):
+            return f"List/Tuple len={len(x)}"
+        elif hasattr(x, 'shape'):
+            return f"Has shape attribute: {getattr(x, 'shape', None)}"
+        else:
+            return f"Type={type(x)}"
+    except Exception as e:
+        return f"<error formatting shape: {e}>"
+
+
+def log_batch_shapes(batch, prefix="batch"):
+    """Log shapes/types for items in a batch or results dict. Guarded by DEBUG_MODE.
+
+    Use `globals().get('DEBUG_MODE', False)` to avoid NameError in different contexts.
+    """
+    if not globals().get('DEBUG_MODE', False):
+        return
+    try:
+        print(f"[SHAPES] {prefix} contents:")
+        if isinstance(batch, dict):
+            for k, v in batch.items():
+                try:
+                    info = _format_shape_info(v)
+                    # For small tensors show min/max as well to detect degenerate values
+                    if isinstance(v, torch.Tensor) and v.numel() > 0 and v.numel() <= 1000:
+                        try:
+                            info += f", min={v.min().item():.6g}, max={v.max().item():.6g}, mean={v.mean().item():.6g}"
+                        except Exception:
+                            pass
+                    print(f"  - {k}: {info}")
+                except Exception as e:
+                    print(f"  - {k}: <error retrieving shape: {e}>")
+        else:
+            print(f"  - {prefix}: {_format_shape_info(batch)}")
+    except Exception as e:
+        print(f"[SHAPES] Error logging shapes for {prefix}: {e}")
+
 
 # 🔧 FIX NCCL GPU MAPPING WARNING: Set CUDA device IMMEDIATELY for distributed training
 if "LOCAL_RANK" in os.environ:
@@ -232,11 +431,12 @@ def visualize_attention_maps(frames, attention_maps, save_dir, sample_idx, epoch
 def plot_metrics(train_values, val_values, metric_name, epoch, save_dir="plots"):
     """Plot training and validation metrics on the same graph and save to file."""
     try:
-        # Ensure matplotlib uses a non-interactive backend
-        plt.switch_backend('Agg')
-        
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+
         os.makedirs(save_dir, exist_ok=True)
-        
+
         plt.figure(figsize=(10, 6))
         plt.plot(range(1, len(train_values) + 1), train_values, label=f"Train {metric_name}", color="blue", marker="o")
         plt.plot(range(1, len(val_values) + 1), val_values, label=f"Validation {metric_name}", color="red", marker="o")
@@ -245,12 +445,12 @@ def plot_metrics(train_values, val_values, metric_name, epoch, save_dir="plots")
         plt.ylabel(metric_name.capitalize())
         plt.legend()
         plt.grid(True)
-        
+
         # Save plot
         plot_path = os.path.join(save_dir, f"{metric_name}_epoch_{epoch}.png")
         plt.savefig(plot_path, dpi=150, bbox_inches='tight')
         plt.close()
-        
+
         print(f"[DEBUG] Plot saved successfully: {plot_path}")
         return plot_path
         
@@ -266,26 +466,44 @@ def plot_metrics(train_values, val_values, metric_name, epoch, save_dir="plots")
 def plot_confusion_matrix(y_true, y_pred, epoch, save_dir="plots"):
     """Plot confusion matrix and save to file."""
     try:
-        # Ensure matplotlib uses a non-interactive backend
-        plt.switch_backend('Agg')
-        
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        try:
+            import seaborn as sns
+        except Exception:
+            sns = None
+
         os.makedirs(save_dir, exist_ok=True)
-        
-        cm = confusion_matrix(y_true, y_pred)
-        
+
+        # Try using sklearn's confusion_matrix if available, else compute simple numpy-based CM
+        try:
+            from sklearn.metrics import confusion_matrix as _conf
+            cm = _conf(y_true, y_pred)
+        except Exception:
+            # simple 2x2 confusion
+            cm = np.zeros((2, 2), dtype=int)
+            for t, p in zip(y_true, y_pred):
+                cm[int(t), int(p)] += 1
+
         plt.figure(figsize=(8, 6))
-        sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", cbar=False)
+        if sns is not None:
+            sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", cbar=False)
+        else:
+            plt.imshow(cm, cmap='Blues')
+            for (i, j), val in np.ndenumerate(cm):
+                plt.text(j, i, int(val), ha='center', va='center')
+
         plt.title(f"Confusion Matrix - Epoch {epoch}")
         plt.xlabel("Predicted Label")
         plt.ylabel("True Label")
-        plt.xticks([0.5, 1.5], ["Real", "Fake"])
-        plt.yticks([0.5, 1.5], ["Real", "Fake"])
-        
-        # Save plot
+        plt.xticks([0, 1], ["Real", "Fake"])
+        plt.yticks([0, 1], ["Real", "Fake"])
+
         cm_path = os.path.join(save_dir, f"confusion_matrix_epoch_{epoch}.png")
         plt.savefig(cm_path, dpi=150, bbox_inches='tight')
         plt.close()
-        
+
         print(f"[DEBUG] Confusion matrix saved successfully: {cm_path}")
         return cm_path
         
@@ -304,24 +522,59 @@ def calculate_metrics(y_true, y_pred, y_probs, epoch, return_dict=False):
     y_true = np.array(y_true)
     y_pred = np.array(y_pred)
     y_probs = np.array(y_probs)
-    
-    accuracy = accuracy_score(y_true, y_pred)
-    precision, recall, f1, _ = precision_recall_fscore_support(y_true, y_pred, average="binary", zero_division=0)
-    confusion = confusion_matrix(y_true, y_pred)
-    
-    # Per-class metrics (Real=0, Fake=1)
-    precision_per_class = precision_score(y_true, y_pred, average=None, zero_division=0)
-    recall_per_class = recall_score(y_true, y_pred, average=None, zero_division=0)
-    f1_per_class = f1_score(y_true, y_pred, average=None, zero_division=0)
-    
-    # Macro F1 (average of both classes) - better for imbalanced data
-    macro_f1 = f1_score(y_true, y_pred, average='macro', zero_division=0)
-    
-    # Handle case where we might have only one class in the batch
+    # Try to import sklearn metrics lazily; provide lightweight fallbacks if missing
     try:
-        auc_score = roc_auc_score(y_true, y_probs)
-    except ValueError:
-        auc_score = 0.0
+        from sklearn.metrics import precision_recall_fscore_support, confusion_matrix, roc_auc_score, accuracy_score, precision_score, recall_score, f1_score
+        _sklearn_available = True
+    except Exception:
+        _sklearn_available = False
+
+    if _sklearn_available:
+        accuracy = accuracy_score(y_true, y_pred)
+        precision, recall, f1, _ = precision_recall_fscore_support(y_true, y_pred, average="binary", zero_division=0)
+        confusion = confusion_matrix(y_true, y_pred)
+
+        # Per-class metrics (Real=0, Fake=1)
+        precision_per_class = precision_score(y_true, y_pred, average=None, zero_division=0)
+        recall_per_class = recall_score(y_true, y_pred, average=None, zero_division=0)
+        f1_per_class = f1_score(y_true, y_pred, average=None, zero_division=0)
+
+        # Macro F1 (average of both classes)
+        macro_f1 = f1_score(y_true, y_pred, average='macro', zero_division=0)
+
+        try:
+            auc_score = roc_auc_score(y_true, y_probs)
+        except Exception:
+            auc_score = 0.0
+    else:
+        # Lightweight fallbacks (binary case)
+        accuracy = float(np.mean(y_true == y_pred)) if y_true.size > 0 else 0.0
+
+        # binary precision/recall/f1
+        tp = int(np.sum((y_true == 1) & (y_pred == 1))) if y_true.size > 0 else 0
+        fp = int(np.sum((y_true == 0) & (y_pred == 1))) if y_true.size > 0 else 0
+        fn = int(np.sum((y_true == 1) & (y_pred == 0))) if y_true.size > 0 else 0
+
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = (2 * precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+
+        # simple confusion matrix
+        confusion = np.zeros((2, 2), dtype=int)
+        for t, p in zip(y_true.tolist(), y_pred.tolist()):
+            confusion[int(t), int(p)] += 1
+
+        precision_per_class = [precision, precision]
+        recall_per_class = [recall, recall]
+        f1_per_class = [f1, f1]
+        macro_f1 = float(np.mean(f1_per_class))
+
+        try:
+            # Approximate AUC using rank method if possible
+            from sklearn.metrics import roc_auc_score as _roc
+            auc_score = _roc(y_true, y_probs)
+        except Exception:
+            auc_score = 0.0
 
     print(f"Epoch {epoch} Metrics:")
     print(f"- Accuracy    : {accuracy:.4f}")
@@ -423,9 +676,18 @@ class FocalLoss(nn.Module):
             return focal_loss
 
 
-def save_visualizations(inputs, outputs, results, epoch, sample_idx, viz_dir):
+def save_visualizations(inputs, outputs, results, epoch, sample_idx, viz_dir, model=None):
     """Save visualizations of model predictions and attention maps."""
     os.makedirs(viz_dir, exist_ok=True)
+    # Local (optional) visualization imports to avoid hard dependency at module import
+    try:
+        import cv2
+    except Exception:
+        cv2 = None
+    try:
+        import matplotlib.pyplot as plt
+    except Exception:
+        plt = None
     
     try:
         # Get input video frames
@@ -438,17 +700,22 @@ def save_visualizations(inputs, outputs, results, epoch, sample_idx, viz_dir):
         # Extract a sample video
         sample_frames = video_frames[sample_idx, :max_viz_frames].cpu()
         
-        # Save original frames
+        # Save original frames (skip if cv2 missing)
         frames_dir = os.path.join(viz_dir, f'sample_{sample_idx}_epoch_{epoch}')
         os.makedirs(frames_dir, exist_ok=True)
-        
-        for t in range(max_viz_frames):
-            frame = sample_frames[t].permute(1, 2, 0).numpy()
-            frame = (frame * 255).astype(np.uint8)
-            cv2.imwrite(
-                os.path.join(frames_dir, f'frame_{t}.jpg'),
-                cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-            )
+        if cv2 is not None:
+            for t in range(max_viz_frames):
+                frame = sample_frames[t].permute(1, 2, 0).numpy()
+                frame = (frame * 255).astype(np.uint8)
+                try:
+                    cv2.imwrite(
+                        os.path.join(frames_dir, f'frame_{t}.jpg'),
+                        cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                    )
+                except Exception as _e:
+                    print(f"Warning: failed to write frame image: {_e}")
+        else:
+            print("[VIS] cv2 not available - skipping frame image writes")
         
         # Save model explanation if available
         if 'explanation' in results and results['explanation'] is not None:
@@ -457,28 +724,30 @@ def save_visualizations(inputs, outputs, results, epoch, sample_idx, viz_dir):
             # Save highlighted regions if available
             if 'highlighted_regions' in explanation and explanation['highlighted_regions']:
                 regions = explanation['highlighted_regions']
-                
+
                 for region in regions:
                     if len(region) >= 3:
                         batch_idx, frame_idx, score = region
                         if batch_idx == sample_idx and frame_idx < max_viz_frames:
+                            if cv2 is None:
+                                continue
                             frame = sample_frames[frame_idx].permute(1, 2, 0).numpy()
                             frame = (frame * 255).astype(np.uint8)
-                            
                             # Add highlight overlay for suspicious regions
                             highlight = np.zeros_like(frame)
                             highlight[:, :, 0] = 255  # Red channel
-                            
                             # Apply highlight with transparency
                             alpha = min(0.7, score * 5)  # Scale by score
-                            highlighted_frame = cv2.addWeighted(
-                                frame, 1 - alpha, highlight, alpha, 0
-                            )
-                            
-                            cv2.imwrite(
-                                os.path.join(frames_dir, f'frame_{frame_idx}_highlighted.jpg'),
-                                cv2.cvtColor(highlighted_frame, cv2.COLOR_RGB2BGR)
-                            )
+                            try:
+                                highlighted_frame = cv2.addWeighted(
+                                    frame, 1 - alpha, highlight, alpha, 0
+                                )
+                                cv2.imwrite(
+                                    os.path.join(frames_dir, f'frame_{frame_idx}_highlighted.jpg'),
+                                    cv2.cvtColor(highlighted_frame, cv2.COLOR_RGB2BGR)
+                                )
+                            except Exception as _e:
+                                print(f"Warning: failed to write highlighted frame: {_e}")
             
             # Save explanation to text file
             with open(os.path.join(frames_dir, 'explanation.txt'), 'w') as f:
@@ -499,20 +768,23 @@ def save_visualizations(inputs, outputs, results, epoch, sample_idx, viz_dir):
                     f.write(f"\nOverall confidence: {explanation['confidence']:.4f}\n")
         
         # Generate and save attention maps if model has this capability
-        if 'model' in locals() and hasattr(model, 'get_attention_maps'):
-            try:
+        # Accept optional `model` parameter (pass trainer.model when calling).
+        # If model is not provided, skip attention-map generation gracefully.
+        try:
+            model_obj = locals().get('model', None)
+            if model_obj is not None and hasattr(model_obj, 'get_attention_maps'):
                 with torch.no_grad():
-                    attention_maps = model.get_attention_maps(inputs)
+                    attention_maps = model_obj.get_attention_maps(inputs)
                     if attention_maps is not None:
                         visualize_attention_maps(
-                            sample_frames, 
-                            attention_maps[sample_idx], 
-                            frames_dir, 
-                            sample_idx, 
+                            sample_frames,
+                            attention_maps[sample_idx],
+                            frames_dir,
+                            sample_idx,
                             epoch
                         )
-            except Exception as e:
-                print(f"Error generating attention maps: {e}")
+        except Exception as e:
+            print(f"Error generating attention maps: {e}")
                 
         # NEW: Visualize facial landmarks if available
         if 'facial_landmarks' in inputs and inputs['facial_landmarks'] is not None:
@@ -652,10 +924,39 @@ def clear_gpu_cache():
 def get_gpu_memory_usage():
     """Get current GPU memory usage."""
     if torch.cuda.is_available():
-        allocated = torch.cuda.memory_allocated() / 1024**3  # GB
-        reserved = torch.cuda.memory_reserved() / 1024**3   # GB
-        return allocated, reserved
+        try:
+            # Ensure all async CUDA work is finished so memory reads are accurate
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+        try:
+            allocated = torch.cuda.memory_allocated() / 1024**3  # GB
+            reserved = torch.cuda.memory_reserved() / 1024**3   # GB
+            return allocated, reserved
+        except Exception:
+            return 0.0, 0.0
     return 0, 0
+
+
+def _read_trace_toggle_file(path=None):
+    """Read trace toggle file. Returns None (no-file), True (enable), False (disable).
+
+    The file should contain a single char: '1' to enable tracing, '0' to disable.
+    """
+    try:
+        if path is None:
+            path = os.path.join(os.path.dirname(__file__), 'trace_toggle.txt')
+        if not os.path.exists(path):
+            return None
+        with open(path, 'r') as fh:
+            txt = fh.read().strip()
+        if txt == '1':
+            return True
+        if txt == '0':
+            return False
+        return None
+    except Exception:
+        return None
 
 def check_memory_and_reduce_batch_size(batch, max_retries=3, trainer=None):
     """Check memory usage and reduce batch size if needed."""
@@ -666,42 +967,33 @@ def check_memory_and_reduce_batch_size(batch, max_retries=3, trainer=None):
             allocated, reserved = get_gpu_memory_usage()
             if allocated > 35.0:  # If using more than 35GB, reduce batch size
                 new_batch_size = max(1, current_batch_size // 2)
-                print(f"[MEMORY] Reducing batch size from {current_batch_size} to {new_batch_size} (allocated: {allocated:.2f}GB)")
-                
+                if globals().get('DEBUG_MODE', False):
+                    print(f"[MEMORY] Reducing batch size from {current_batch_size} to {new_batch_size} (allocated: {allocated:.2f}GB)")
                 # Track memory warnings
                 if trainer is not None:
                     trainer.memory_warnings += 1
-                
-                # Create smaller batch - ENSURE ALL COMPONENTS ARE REDUCED CONSISTENTLY
+                # Consistently truncate all batch elements
                 reduced_batch = {}
                 for key, value in batch.items():
-                    if isinstance(value, torch.Tensor):
-                        if value.size(0) > new_batch_size:
-                            reduced_batch[key] = value[:new_batch_size]
-                        else:
-                            reduced_batch[key] = value
-                    elif isinstance(value, list):
-                        if len(value) > new_batch_size:
-                            reduced_batch[key] = value[:new_batch_size]
-                        else:
-                            reduced_batch[key] = value
+                    if isinstance(value, torch.Tensor) and value.size(0) == current_batch_size:
+                        reduced_batch[key] = value[:new_batch_size]
+                    elif isinstance(value, list) and len(value) == current_batch_size:
+                        reduced_batch[key] = value[:new_batch_size]
                     else:
                         reduced_batch[key] = value
-                
                 # Verify batch consistency after reduction
                 actual_batch_size = len(reduced_batch['label']) if 'label' in reduced_batch else new_batch_size
-                if actual_batch_size != new_batch_size:
+                if actual_batch_size != new_batch_size and globals().get('DEBUG_MODE', False):
                     print(f"[WARNING] Batch size inconsistency after reduction: expected {new_batch_size}, got {actual_batch_size}")
-                
                 batch = reduced_batch
                 current_batch_size = new_batch_size
                 clear_gpu_cache()
             else:
                 break
         except Exception as e:
-            print(f"[MEMORY] Error checking memory usage: {e}")
+            if globals().get('DEBUG_MODE', False):
+                print(f"[MEMORY] Error checking memory usage: {e}")
             break
-    
     return batch
 
 def move_batch_to_device(batch, device, trainer=None):
@@ -762,33 +1054,23 @@ class DeepfakeTrainer:
         
         # Print configuration improvements
         self.print_training_improvements()
-        
-        # In distributed mode, synchronize directory paths across all processes
-        if self.distributed:
-            # Wait for main process to create directories
-            if dist.is_initialized():
-                dist.barrier()
-            
-            # Non-main processes need to get the directory paths from main process
-            if not self.is_main_process:
-                # Find the most recent run directory created by main process
-                import glob
-                run_pattern = os.path.join(self.config.output_dir, "run_*")
-                run_dirs = glob.glob(run_pattern)
-                if run_dirs:
-                    # Get the most recent run directory
-                    self.run_dir = max(run_dirs, key=os.path.getctime)
-                    self.log_dir = os.path.join(self.run_dir, "logs")
-                    self.viz_dir = os.path.join(self.run_dir, "visualizations")
-                    self.plot_dir = os.path.join(self.run_dir, "plots")
-                    print(f"[Rank {self.local_rank}] Using shared run directory: {self.run_dir}")
-                else:
-                    print(f"[Rank {self.local_rank}] Warning: No run directory found, using fallback")
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    self.run_dir = os.path.join(self.config.output_dir, f"run_{timestamp}")
-                    self.log_dir = os.path.join(self.run_dir, "logs")
-                    self.viz_dir = os.path.join(self.run_dir, "visualizations")
-                    self.plot_dir = os.path.join(self.run_dir, "plots")
+        # (Removed misplaced epoch-level diagnostics that referenced epoch local variables.)
+        # Set up run directories (fix indentation)
+        run_dirs = [d for d in os.listdir(self.config.output_dir) if d.startswith("run_")]
+        if run_dirs:
+            self.run_dir = max(run_dirs, key=lambda d: os.path.getctime(os.path.join(self.config.output_dir, d)))
+            self.run_dir = os.path.join(self.config.output_dir, self.run_dir)
+            self.log_dir = os.path.join(self.run_dir, "logs")
+            self.viz_dir = os.path.join(self.run_dir, "visualizations")
+            self.plot_dir = os.path.join(self.run_dir, "plots")
+            print(f"[Rank {self.local_rank}] Using shared run directory: {self.run_dir}")
+        else:
+            print(f"[Rank {self.local_rank}] Warning: No run directory found, using fallback")
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.run_dir = os.path.join(self.config.output_dir, f"run_{timestamp}")
+            self.log_dir = os.path.join(self.run_dir, "logs")
+            self.viz_dir = os.path.join(self.run_dir, "visualizations")
+            self.plot_dir = os.path.join(self.run_dir, "plots")
             
             # Another barrier to ensure all processes have the correct paths
             if dist.is_initialized():
@@ -810,6 +1092,16 @@ class DeepfakeTrainer:
         
         # Set seed for reproducibility
         set_seed(config.seed)
+
+        # If user requested faster (less deterministic) mode, enable cudnn benchmark
+        # This allows PyTorch to autotune cuDNN kernels for better throughput.
+        if getattr(config, 'fast_mode', False):
+            try:
+                torch.backends.cudnn.deterministic = False
+                torch.backends.cudnn.benchmark = True
+                print("[PERF] fast_mode enabled: cudnn.benchmark=True, deterministic=False")
+            except Exception as e:
+                print(f"[PERF] Failed to enable fast_mode cudnn settings: {e}")
         
         # Initialize data loaders
         self.setup_data()
@@ -994,21 +1286,31 @@ class DeepfakeTrainer:
     def setup_wandb(self):
         """Initialize Weights & Biases for experiment tracking."""
         try:
+            # Import wandb lazily to avoid hard dependency at module import
+            global wandb
+            try:
+                import wandb as _wandb
+                wandb = _wandb
+            except Exception as _e:
+                print(f"[Rank {self.local_rank}] Warning: wandb import failed: {_e} - disabling wandb")
+                self.config.use_wandb = False
+                return
+
             # Set wandb to offline mode for distributed training to avoid conflicts
             if self.distributed:
                 os.environ['WANDB_MODE'] = 'offline'
                 os.environ['WANDB_SILENT'] = 'true'
-            
+
             project_name = self.config.wandb_project or "deepfake-detection"
             run_name = self.config.wandb_run_name or f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            
+
             # Define detailed tags for better tracking
             tags = [
                 f"backbone_visual:{self.config.backbone_visual}",
                 f"backbone_audio:{self.config.backbone_audio}",
                 f"fusion:{self.config.fusion_type}"
             ]
-            
+
             # Add enhanced feature tags
             if hasattr(self.config, 'detect_faces') and self.config.detect_faces:
                 tags.append("facial_analysis")
@@ -1016,11 +1318,14 @@ class DeepfakeTrainer:
                 tags.append("enhanced_preprocessing")
             if hasattr(self.config, 'enhanced_augmentation') and self.config.enhanced_augmentation:
                 tags.append("enhanced_augmentation")
-            
+
             # Add distributed training tag
             if self.distributed:
-                tags.append(f"distributed_{dist.get_world_size()}gpus")
-            
+                try:
+                    tags.append(f"distributed_{dist.get_world_size()}gpus")
+                except Exception:
+                    pass
+
             wandb.init(
                 project=project_name,
                 name=run_name,
@@ -1029,7 +1334,7 @@ class DeepfakeTrainer:
                 mode='offline' if self.distributed else 'online',  # Offline mode for distributed
                 settings=wandb.Settings(start_method="thread")  # Use thread start method
             )
-            
+
             print(f"[Rank {self.local_rank}] Weights & Biases initialized: {project_name}/{run_name}")
             if self.distributed:
                 print(f"[Rank {self.local_rank}] Note: W&B running in offline mode for distributed training")
@@ -1219,7 +1524,9 @@ class DeepfakeTrainer:
             temporal_features=self.config.temporal_features,
             enhanced_preprocessing=getattr(self.config, 'enhanced_preprocessing', True),
             enhanced_augmentation=getattr(self.config, 'enhanced_augmentation', False),
-            multiprocessing_context="spawn"  # 🧼 SAFETY: Prevent GPU context corruption in multiprocessing
+            multiprocessing_context="spawn",  # 🧼 SAFETY: Prevent GPU context corruption in multiprocessing
+            class_weights_mode=getattr(self.config, 'class_weights_mode', 'balanced'),  # ✅ FIX: Pass class_weights_mode
+            oversample_minority=getattr(self.config, 'oversample_minority', False)
         )
         
         # Unpack result - handle optional mixup_fn
@@ -1253,6 +1560,11 @@ class DeepfakeTrainer:
             self.class_weights = None
 
         # Initialize model
+        # Allow enabling model-level tensor tracing via environment variable TRACE_TENSORS=1
+        enable_trace = os.environ.get('TRACE_TENSORS', '0') == '1'
+        if enable_trace:
+            print("[TRACE] TRACE_TENSORS=1 detected — model will be constructed with debug/tracing enabled")
+
         self.model = MultiModalDeepfakeModel(
             num_classes=self.config.num_classes,
             video_feature_dim=self.config.video_feature_dim,
@@ -1267,7 +1579,7 @@ class DeepfakeTrainer:
             use_spectrogram=self.config.use_spectrogram,
             detect_deepfake_type=self.config.detect_deepfake_type,
             num_deepfake_types=self.config.num_deepfake_types,
-            debug=self.config.debug,
+            debug=(self.config.debug or enable_trace),
             enable_skin_color_analysis=getattr(self.config, 'enable_skin_color_analysis', False),
             enable_advanced_physiological=getattr(self.config, 'enable_advanced_physiological', False)
             # Note: Dropout regularization is handled within the model architecture
@@ -1292,6 +1604,45 @@ class DeepfakeTrainer:
         # Move model to device
         self.model.to(self.device)
 
+        # ============================================================================
+        # MODEL PARAMETER SUMMARY
+        # ============================================================================
+        total_params = sum(p.numel() for p in self.model.parameters())
+        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        non_trainable_params = total_params - trainable_params
+        
+        # Calculate model size in MB (float32 = 4 bytes per parameter)
+        model_size_mb = (total_params * 4) / (1024 * 1024)
+        
+        print("\n" + "="*70)
+        print("📊 MODEL PARAMETER SUMMARY")
+        print("="*70)
+        print(f"Total Parameters:       {total_params:,}")
+        print(f"Trainable Parameters:   {trainable_params:,}")
+        print(f"Non-trainable Params:   {non_trainable_params:,}")
+        print(f"Model Size (FP32):      {model_size_mb:.2f} MB")
+        print(f"Expected Checkpoint:    ~{model_size_mb * 2:.2f} MB (with optimizer state)")
+        
+        # Component breakdown
+        print("\n📦 Component Breakdown:")
+        component_params = {}
+        for name, module in self.model.named_children():
+            params = sum(p.numel() for p in module.parameters())
+            if params > 0:
+                component_params[name] = params
+                pct = (params / total_params) * 100
+                print(f"  {name:30s}: {params:>12,} ({pct:5.1f}%)")
+        
+        # Show top 5 largest components
+        if component_params:
+            sorted_components = sorted(component_params.items(), key=lambda x: x[1], reverse=True)[:5]
+            print("\n🔝 Top 5 Largest Components:")
+            for name, params in sorted_components:
+                pct = (params / total_params) * 100
+                print(f"  {name:30s}: {params:>12,} ({pct:5.1f}%)")
+        
+        print("="*70 + "\n")
+        
         # BIAS INITIALIZATION REMOVED: Was setting bias to ±0.30 which overpowered feature learning
         # Now using default PyTorch initialization (zero bias) and letting class_weights handle imbalance
 
@@ -1303,20 +1654,35 @@ class DeepfakeTrainer:
             # Explicitly set the device before DDP wrapping to avoid GPU mapping warnings
             torch.cuda.set_device(self.local_rank)
             self.model = self.model.to(self.device)
-            
             # Wrap model with DDP, explicitly specifying device_ids to avoid warnings
-            self.model = DDP(
-                self.model, 
-                device_ids=[self.local_rank], 
-                output_device=self.local_rank,
-                find_unused_parameters=True,  # Re-enable to handle dynamic parameter usage
-                static_graph=False  # Disable static graph to allow dynamic parameter usage
-            )
+            try:
+                # Some PyTorch versions may not accept `static_graph` kwarg; try the full call first
+                self.model = DDP(
+                    self.model,
+                    device_ids=[self.local_rank],
+                    output_device=self.local_rank,
+                    find_unused_parameters=True,
+                    static_graph=False
+                )
+            except TypeError:
+                # Fallback for older PyTorch versions without the `static_graph` parameter
+                try:
+                    self.model = DDP(
+                        self.model,
+                        device_ids=[self.local_rank],
+                        output_device=self.local_rank,
+                        find_unused_parameters=True
+                    )
+                except Exception as e:
+                    print(f"[Rank {self.local_rank}] ❌ Failed to wrap model with DDP: {e}")
+                    print(f"[Rank {self.local_rank}] Falling back to single-GPU/DataParallel mode")
+                    # Leave model on device (already moved above)
+            except Exception as e:
+                print(f"[Rank {self.local_rank}] ❌ Failed to wrap model with DDP: {e}")
+                print(f"[Rank {self.local_rank}] Falling back to single-GPU/DataParallel mode")
             
-            # Note: Static graph disabled due to dynamic parameter usage in multimodal model
-            
-            print(f"[Rank {self.local_rank}] Model wrapped with DDP on device {self.local_rank}")
-            print(f"[Rank {self.local_rank}] Dynamic parameter detection enabled (find_unused_parameters=True)")
+            # Note: Static graph disabled for dynamic parameter usage in multimodal model when supported
+            print(f"[Rank {self.local_rank}] Model device setup complete")
         # Enable DataParallel for multi-GPU if available and not using distributed
         elif torch.cuda.device_count() > 1:
             print(f"[INFO] Using DataParallel on {torch.cuda.device_count()} GPUs.")
@@ -1533,6 +1899,34 @@ class DeepfakeTrainer:
             print(f"[RANK {self.local_rank}] Starting training epoch {epoch+1} with {len(self.train_loader)} batches")
         
         for batch_idx, batch in enumerate(train_progress):
+            # Runtime trace toggle: check a file to enable/disable model forward-hooks without restart
+            try:
+                desired = _read_trace_toggle_file()
+                if desired is not None and hasattr(self, 'model'):
+                    # If desired == False -> disable tracing
+                    if desired is False and getattr(self.model, 'trace_tensors', False):
+                        try:
+                            if hasattr(self.model, 'remove_trace_hooks'):
+                                self.model.remove_trace_hooks()
+                            self.model.trace_tensors = False
+                            if self.is_main_process:
+                                print('[TRACE TOGGLE] Tracing disabled via trace_toggle.txt')
+                        except Exception as e:
+                            if self.is_main_process:
+                                print(f'[TRACE TOGGLE] Failed to remove trace hooks: {e}')
+                    # If desired == True -> enable tracing
+                    if desired is True and not getattr(self.model, 'trace_tensors', False):
+                        try:
+                            if hasattr(self.model, 'register_trace_hooks'):
+                                self.model.trace_tensors = True
+                                self.model.register_trace_hooks()
+                            if self.is_main_process:
+                                print('[TRACE TOGGLE] Tracing enabled via trace_toggle.txt')
+                        except Exception as e:
+                            if self.is_main_process:
+                                print(f'[TRACE TOGGLE] Failed to register trace hooks: {e}')
+            except Exception:
+                pass
             # Skip batches if resuming from a checkpoint
             if hasattr(self, 'start_batch') and epoch == getattr(self, 'start_epoch', 0) and batch_idx < self.start_batch:
                 if self.is_main_process and batch_idx % 10 == 0:
@@ -1571,6 +1965,43 @@ class DeepfakeTrainer:
                 # Move batch to device with timeout protection
                 print(f"[RANK {self.local_rank}] Moving batch {batch_idx} to device...")
                 batch = move_batch_to_device(batch, self.device, trainer=self)
+                # Detailed shape logging (guarded)
+                log_batch_shapes(batch, prefix=f"after_move_to_device train batch {batch_idx}")
+                # GPU memory usage after moving batch to device (helpful when OS tools show N/A)
+                try:
+                    if torch.cuda.is_available() and self.is_main_process:
+                        allocated_gb, reserved_gb = get_gpu_memory_usage()
+                        print(f"[GPU] After move_to_device batch {batch_idx}: allocated={allocated_gb:.2f}GB reserved={reserved_gb:.2f}GB")
+                        try:
+                            max_reserved = torch.cuda.max_memory_reserved() / 1024**3
+                            print(f"[GPU] torch.cuda.max_memory_reserved: {max_reserved:.2f}GB")
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+                # Filter out placeholder samples marked with label == -1 (dataset fallbacks)
+                try:
+                    labels_tmp = batch.get('label', None)
+                    if isinstance(labels_tmp, torch.Tensor):
+                        labels_cpu = labels_tmp.detach()
+                        if (labels_cpu == -1).any():
+                            mask = (labels_cpu != -1)
+                            keep_idx = mask.nonzero(as_tuple=False).squeeze(1)
+                            num_removed = int((~mask).sum().item())
+                            if keep_idx.numel() == 0:
+                                print(f"[INFO] All samples in batch {batch_idx} are placeholders. Skipping batch.")
+                                continue
+                            # Rebuild tensors/lists in batch to keep only valid indices
+                            for k, v in list(batch.items()):
+                                if isinstance(v, torch.Tensor) and v.shape[0] == labels_cpu.shape[0]:
+                                    batch[k] = v[keep_idx]
+                                elif isinstance(v, list) and len(v) == labels_cpu.shape[0]:
+                                    idxs = keep_idx.cpu().tolist()
+                                    batch[k] = [v[i] for i in idxs]
+                            print(f"[INFO] Filtered {num_removed} placeholder samples from batch {batch_idx} (kept {keep_idx.numel()})")
+                except Exception as filter_e:
+                    print(f"[WARNING] Could not filter placeholder samples at batch {batch_idx}: {filter_e}")
                 
                 if batch_idx == 0:
                     load_time = time.time() - start_time
@@ -1664,7 +2095,24 @@ class DeepfakeTrainer:
                             if 'audio' in batch:
                                 print(f"[DEBUG] Before model forward - audio shape: {batch['audio'].shape}")
                         
+                        # Timed forward pass (synchronize to get accurate GPU timing)
+                        t_forward_start = time.time()
                         outputs, results = self.model(batch)
+                        try:
+                            if torch.cuda.is_available():
+                                torch.cuda.synchronize()
+                        except Exception:
+                            pass
+                        t_forward_end = time.time()
+                        if self.is_main_process:
+                            print(f"[TIMING] Model forward batch {batch_idx}: {t_forward_end - t_forward_start:.3f}s")
+                        # Log shapes after forward
+                        log_batch_shapes(batch, prefix=f"post_forward_input train batch {batch_idx}")
+                        if isinstance(outputs, torch.Tensor):
+                            if globals().get('DEBUG_MODE', False):
+                                print(f"[SHAPES] outputs: shape={tuple(outputs.shape)}, dtype={outputs.dtype}, device={outputs.device}")
+                        if isinstance(results, dict):
+                            log_batch_shapes(results, prefix=f"post_forward_results train batch {batch_idx}")
                         
                         # Debug: Check output shapes after model forward pass
                         if batch_idx < 5:
@@ -1673,33 +2121,44 @@ class DeepfakeTrainer:
                             print(f"[DEBUG] Raw outputs - min: {outputs.min().item():.4f}, max: {outputs.max().item():.4f}, mean: {outputs.mean().item():.4f}")
                             print(f"[DEBUG] Softmax probs: {torch.softmax(outputs, dim=1)[:3]}")
                         
-                        # Check for NaN in outputs
-                        if torch.isnan(outputs).any():
-                            print(f"[ERROR] NaN detected in model outputs at batch {batch_idx}")
-                            print(f"[DEBUG] Output shape: {outputs.shape}")
-                            print(f"[DEBUG] Output stats - min: {outputs.min()}, max: {outputs.max()}, mean: {outputs.mean()}")
-                            # Reset optimizer state and skip this batch
+                        # Check for NaN/Inf in outputs
+                        if torch.isnan(outputs).any() or torch.isinf(outputs).any():
+                            print(f"[ERROR] NaN or Inf detected in model outputs at batch {batch_idx}")
+                            if globals().get('DEBUG_MODE', False):
+                                print(f"[DEBUG] Output shape: {outputs.shape}")
+                                print(f"[DEBUG] Output stats - min: {outputs.min()}, max: {outputs.max()}, mean: {outputs.mean()}")
                             self.optimizer.zero_grad()
                             self.nan_count += 1
                             continue
-                        # Add numerical stability to outputs - use more conservative range
                         outputs = torch.clamp(outputs, min=-10, max=10)  # Prevent extreme confidence
-                        
-                        if batch_idx < 5:
+                        if batch_idx < 5 and globals().get('DEBUG_MODE', False):
                             print(f"[DEBUG] After clamp - min: {outputs.min().item():.4f}, max: {outputs.max().item():.4f}")
                             print(f"[DEBUG] Labels: {labels[:8]}")
-                        # Check and fix batch size
                         outputs, labels, batch_valid = _check_and_fix_batch_size(outputs, labels)
                         if not batch_valid:
                             print(f"[ERROR] Cannot fix batch size mismatch, skipping batch {batch_idx}")
                             self.optimizer.zero_grad()
                             continue
+                        
+                        # Debug: Log values before loss computation
+                        if batch_idx < 3:
+                            print(f"[DEBUG] Batch {batch_idx} - outputs range: [{outputs.min().item():.4f}, {outputs.max().item():.4f}]")
+                            print(f"[DEBUG] Batch {batch_idx} - labels: {labels[:4].tolist()}")
+                        
                         loss = self.criterion(outputs, labels)
-                        # Check for NaN in loss
-                        if torch.isnan(loss):
-                            print(f"[ERROR] NaN loss detected at batch {batch_idx}")
-                            print(f"[DEBUG] Labels: {labels}")
-                            print(f"[DEBUG] Outputs: {outputs}")
+                        
+                        # Log loss value for all batches
+                        if self.is_main_process:
+                            print(f"[LOSS] Batch {batch_idx}: {loss.item():.6f}")
+                        
+                        # Check for NaN/Inf in loss
+                        if torch.isnan(loss) or torch.isinf(loss):
+                            print(f"[ERROR] NaN or Inf loss detected at batch {batch_idx}")
+                            print(f"[DEBUG] Loss value: {loss.item()}")
+                            print(f"[DEBUG] Outputs stats - min: {outputs.min().item()}, max: {outputs.max().item()}, mean: {outputs.mean().item()}")
+                            print(f"[DEBUG] Labels: {labels.tolist()}")
+                            self.optimizer.zero_grad()
+                            self.nan_count += 1
                             continue
                         # Add regularization for deepfake type if enabled
                         if self.config.detect_deepfake_type and 'deepfake_type' in results and results['deepfake_type'] is not None:
@@ -1764,6 +2223,13 @@ class DeepfakeTrainer:
                         
                         self.scaler.step(self.optimizer)
                         self.scaler.update()
+                        # GPU memory usage after optimizer step
+                        try:
+                            if torch.cuda.is_available() and self.is_main_process:
+                                allocated_gb, reserved_gb = get_gpu_memory_usage()
+                                print(f"[GPU] After optimizer step batch {batch_idx}: allocated={allocated_gb:.2f}GB reserved={reserved_gb:.2f}GB")
+                        except Exception:
+                            pass
                         
                     except Exception as scaler_error:
                         print(f"[ERROR] AMP scaler error at batch {batch_idx}: {scaler_error}")
@@ -1774,31 +2240,81 @@ class DeepfakeTrainer:
                         print(f"[INFO] Recreated AMP scaler with fresh state")
                         continue
                 else:
+                    # Timed forward pass for non-AMP path
+                    t_forward_start = time.time()
                     outputs, results = self.model(batch)
-                    # Check for NaN in outputs
-                    if torch.isnan(outputs).any():
-                        print(f"[ERROR] NaN detected in model outputs at batch {batch_idx}")
-                        print(f"[DEBUG] Output shape: {outputs.shape}")
-                        print(f"[DEBUG] Output stats - min: {outputs.min()}, max: {outputs.max()}, mean: {outputs.mean()}")
-                        # Reset optimizer state and skip this batch
+                    try:
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+                    except Exception:
+                        pass
+                    t_forward_end = time.time()
+                    if self.is_main_process:
+                        print(f"[TIMING] Model forward (no AMP) batch {batch_idx}: {t_forward_end - t_forward_start:.3f}s")
+                    # Check for NaN/Inf in outputs
+                    # Check for NaN/Inf in outputs
+                    if torch.isnan(outputs).any() or torch.isinf(outputs).any():
+                        print(f"[ERROR] NaN or Inf detected in model outputs at batch {batch_idx}")
+                        if globals().get('DEBUG_MODE', False):
+                            print(f"[DEBUG] Output shape: {outputs.shape}")
+                            print(f"[DEBUG] Output stats - min: {outputs.min()}, max: {outputs.max()}, mean: {outputs.mean()}")
                         self.optimizer.zero_grad()
                         self.nan_count += 1
                         continue
-                    # Add numerical stability to outputs - use more conservative range
                     outputs = torch.clamp(outputs, min=-10, max=10)  # Prevent extreme confidence
-                    # Check and fix batch size
                     outputs, labels, batch_valid = _check_and_fix_batch_size(outputs, labels)
                     if not batch_valid:
                         print(f"[ERROR] Cannot fix batch size mismatch, skipping batch {batch_idx}")
                         self.optimizer.zero_grad()
                         continue
+                    
+                    # Debug: Log values before loss computation
+                    if batch_idx < 3:
+                        print(f"[DEBUG] Batch {batch_idx} - outputs range: [{outputs.min().item():.4f}, {outputs.max().item():.4f}]")
+                        print(f"[DEBUG] Batch {batch_idx} - labels: {labels[:4].tolist()}")
+                    
                     loss = self.criterion(outputs, labels)
-                    # Check for NaN in loss
-                    if torch.isnan(loss):
-                        print(f"[ERROR] NaN loss detected at batch {batch_idx}")
-                        print(f"[DEBUG] Labels: {labels}")
-                        print(f"[DEBUG] Outputs: {outputs}")
+                    
+                    # Log loss value for all batches
+                    if self.is_main_process:
+                        print(f"[LOSS] Batch {batch_idx}: {loss.item():.6f}")
+                    
+                    # Check for NaN/Inf in loss
+                    if torch.isnan(loss) or torch.isinf(loss):
+                        print(f"[ERROR] NaN or Inf loss detected at batch {batch_idx}")
+                        print(f"[DEBUG] Loss value: {loss.item()}")
+                        print(f"[DEBUG] Outputs stats - min: {outputs.min().item()}, max: {outputs.max().item()}, mean: {outputs.mean().item()}")
+                        print(f"[DEBUG] Labels: {labels.tolist()}")
+                        self.optimizer.zero_grad()
+                        self.nan_count += 1
                         continue
+                    
+                    # Backward pass (no AMP)
+                    loss.backward()
+                    
+                    # Gradient clipping
+                    if self.config.gradient_clip > 0:
+                        if hasattr(self.model, 'clip_gradients'):
+                            self.model.clip_gradients(max_norm=self.config.gradient_clip)
+                        else:
+                            nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clip)
+                    
+                    # Optimizer step
+                    self.optimizer.zero_grad()
+                    self.optimizer.step()
+                    
+                    # Track metrics
+                    epoch_loss += loss.item()
+                    valid_batch_count += 1
+                    batch_losses.append(loss.item())
+                    
+                    # Store predictions
+                    probs = torch.softmax(outputs, dim=1)
+                    _, preds = torch.max(outputs, 1)
+                    y_true.extend(labels.cpu().numpy())
+                    y_pred.extend(preds.cpu().numpy())
+                    y_probs.extend(probs[:, 1].detach().cpu().numpy())
+                    
                     # Add regularization for deepfake type if enabled
                     if self.config.detect_deepfake_type and 'deepfake_type' in results and results['deepfake_type'] is not None:
                         if 'deepfake_type' in batch and batch['deepfake_type'] is not None:
@@ -1806,150 +2322,21 @@ class DeepfakeTrainer:
                             deepfake_type_target = batch['deepfake_type']
                             if isinstance(deepfake_type_target, list):
                                 deepfake_type_target = torch.tensor(deepfake_type_target, device=outputs.device, dtype=torch.long)
-                            elif not isinstance(deepfake_type_target, torch.Tensor):
-                                deepfake_type_target = torch.tensor([deepfake_type_target], device=outputs.device, dtype=torch.long)
-                            
-                            # Ensure batch size consistency
-                            if deepfake_type_target.shape[0] != results['deepfake_type'].shape[0]:
-                                min_batch = min(deepfake_type_target.shape[0], results['deepfake_type'].shape[0])
-                                deepfake_type_target = deepfake_type_target[:min_batch]
-                                deepfake_type_pred = results['deepfake_type'][:min_batch]
-                            else:
-                                deepfake_type_pred = results['deepfake_type']
-                            
-                            try:
-                                deepfake_type_loss = nn.CrossEntropyLoss()(deepfake_type_pred, deepfake_type_target)
-                                if not torch.isnan(deepfake_type_loss):
-                                    loss += self.config.deepfake_type_weight * deepfake_type_loss
-                            except Exception as e:
-                                if getattr(self.config, 'debug', False):
-                                    print(f"[WARNING] Error computing deepfake type loss: {e}")
-                                # Skip deepfake type loss if there's an error
-                    # Backward pass
-                    loss.backward()
-                    
-                    # DEBUG: Check classifier gradients and input diversity (first few batches only)
-                    if batch_idx < 3:
-                        # Check if classifier has gradients
-                        classifier_has_grad = False
-                        classifier_grad_norm = 0.0
-                        for name, param in self.model.named_parameters():
-                            if 'classifier' in name and param.grad is not None:
-                                classifier_has_grad = True
-                                classifier_grad_norm += param.grad.norm().item()
-                        
-                        if classifier_has_grad:
-                            print(f"[TRAIN DEBUG] Batch {batch_idx}: Classifier grad norm: {classifier_grad_norm:.6f}")
-                        else:
-                            print(f"[TRAIN DEBUG] Batch {batch_idx}: WARNING - Classifier has no gradients!")
-                        
-                        # Check output diversity
-                        output_std = outputs.std(dim=0)
-                        print(f"[TRAIN DEBUG] Batch {batch_idx}: Output std per class: {output_std}")
-                        print(f"[TRAIN DEBUG] Batch {batch_idx}: Output mean: {outputs.mean(dim=0)}")
-                    
-                    # Check for NaN in gradients using model method
-                    if hasattr(self.model, 'check_for_nan_gradients') and self.model.check_for_nan_gradients():
-                        print(f"[ERROR] Skipping backward pass due to NaN gradients at batch {batch_idx}")
-                        self.optimizer.zero_grad()
-                        continue
-                    # Apply model's gradient clipping
-                    if hasattr(self.model, 'clip_gradients'):
-                        self.model.clip_gradients(max_norm=1.0)
-                    # Additional gradient clipping if configured
-                    elif self.config.gradient_clip > 0:
-                        nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clip)
-                    self.optimizer.step()
-                
-                # Update learning rate with warmup if enabled
-                if self.warmup_scheduler is not None and epoch < self.config.warmup_epochs:
-                    self.warmup_scheduler.step()
-                
-                # Track total batches and check for excessive NaN occurrence
-                self.total_batches += 1
-                if self.total_batches > 0 and self.nan_count / self.total_batches > 0.1:  # If more than 10% NaN
-                    print(f"[WARNING] High NaN rate detected ({self.nan_count}/{self.total_batches}). Reducing learning rate.")
-                    for param_group in self.optimizer.param_groups:
-                        param_group['lr'] *= 0.5
-                    self.nan_count = 0  # Reset counter after adjustment
-                    self.total_batches = 0
-                
-                # Update progress bar with better precision (scientific notation)
-                loss_display = loss.item() if not torch.isnan(loss) else "nan"
-                train_progress.set_postfix(loss=f"{loss_display:.6e}" if isinstance(loss_display, float) else loss_display, 
-                                         lr=f"{get_lr(self.optimizer):.6f}")
-                
-                # Accumulate loss only if it's not NaN
-                if not torch.isnan(loss):
-                    loss_val = loss.item()
-                    epoch_loss += loss_val
-                    valid_batch_count += 1  # Track valid batches for accurate averaging
-                    batch_losses.append(loss_val)  # Track for statistics
-                else:
-                    print(f"[WARNING] Skipping NaN loss in accumulation at batch {batch_idx}")
-                
-                # Accumulate predictions and labels for metrics calculation
-                y_true.extend(labels.cpu().numpy())
-                predictions = outputs.argmax(1).cpu().numpy()
-                y_pred.extend(predictions)
-                y_probs.extend(torch.softmax(outputs, dim=1)[:, 1].detach().cpu().numpy())
-                
-                # Log batch results to WandB
-                if self.config.use_wandb and self.is_main_process and batch_idx % self.config.log_interval == 0:
-                    # Log component weights if available
-                    component_weights = {}
-                    if 'component_weights' in results and results['component_weights'] is not None:
-                        for i, weight in enumerate(results['component_weights']):
-                            component_weights[f'component_weight_{i}'] = weight.item()
-                    
-                    wandb.log({
-                        'batch_loss': loss.item(),
-                        'learning_rate': get_lr(self.optimizer),
-                        'batch': batch_idx + epoch * len(self.train_loader),
-                        **component_weights
-                    })
-                    
-                # Save intermediate checkpoint if enabled (before any exception handling)
-                if self.is_main_process:
-                    self.save_intermediate_checkpoint(epoch, batch_idx)
-                
-                # Visualize sample predictions periodically
-                if (batch_idx + 1) % self.config.visualization_interval == 0 and self.is_main_process:
-                    try:
-                        sample_idx = np.random.randint(min(4, outputs.size(0)))
-                        save_visualizations(
-                            batch, outputs, results, 
-                            epoch + 1, sample_idx, 
-                            os.path.join(self.viz_dir, f"train_epoch_{epoch+1}")
-                        )
-                    except Exception as vis_error:
-                        print(f"Error visualizing predictions: {vis_error}")
-                
-            except torch.cuda.OutOfMemoryError as oom_error:
-                print(f"[CUDA OOM] Out of memory error in training batch {batch_idx}: {oom_error}")
-                print(f"[CUDA OOM] Attempting to recover by clearing cache and reducing batch size...")
-                
-                # Track OOM errors
-                self.oom_errors += 1
-                
-                # Clear GPU cache
-                clear_gpu_cache()
-                
-                # Skip this batch and continue
-                self.optimizer.zero_grad()
-                continue
-                
+                            if self.distributed:
+                                # Do not re-run full distributed initialization inside the training loop.
+                                # If the process group is missing, warn and continue rather than attempting
+                                # heavyweight re-initialization here.
+                                if not dist.is_initialized():
+                                    print(f"[Rank {self.local_rank}] ⚠️ distributed=True but process group not initialized. Skipping re-init inside loop.")
             except Exception as e:
                 print(f"Error in training batch {batch_idx}: {e}")
                 import traceback
                 traceback.print_exc()
-                
                 # Clear GPU cache on any error to prevent memory leaks
                 clear_gpu_cache()
                 self.optimizer.zero_grad()
                 continue
-        
-        # Calculate average loss using valid batch count
+# Calculate average loss using valid batch count
         if valid_batch_count > 0:
             avg_loss = epoch_loss / valid_batch_count
             # Log batch loss statistics for debugging
@@ -2015,6 +2402,29 @@ class DeepfakeTrainer:
                     
                     # Move batch to device
                     batch = move_batch_to_device(batch, self.device, trainer=self)
+                    log_batch_shapes(batch, prefix=f"after_move_to_device val batch {batch_idx}")
+
+                    # Filter out placeholder samples marked with label == -1 in validation
+                    try:
+                        labels_tmp = batch.get('label', None)
+                        if isinstance(labels_tmp, torch.Tensor):
+                            labels_cpu = labels_tmp.detach()
+                            if (labels_cpu == -1).any():
+                                mask = (labels_cpu != -1)
+                                keep_idx = mask.nonzero(as_tuple=False).squeeze(1)
+                                num_removed = int((~mask).sum().item())
+                                if keep_idx.numel() == 0:
+                                    print(f"[INFO] Validation batch {batch_idx} contains only placeholders. Skipping batch.")
+                                    continue
+                                for k, v in list(batch.items()):
+                                    if isinstance(v, torch.Tensor) and v.shape[0] == labels_cpu.shape[0]:
+                                        batch[k] = v[keep_idx]
+                                    elif isinstance(v, list) and len(v) == labels_cpu.shape[0]:
+                                        idxs = keep_idx.cpu().tolist()
+                                        batch[k] = [v[i] for i in idxs]
+                                print(f"[INFO] Filtered {num_removed} placeholder samples from validation batch {batch_idx} (kept {keep_idx.numel()})")
+                    except Exception as filter_e:
+                        print(f"[WARNING] Could not filter placeholder samples in validation at batch {batch_idx}: {filter_e}")
 
                     # DEBUG: Inspect validation inputs for duplication or collapse
                     if batch_idx < 3:  # only sample first few batches
@@ -2059,6 +2469,13 @@ class DeepfakeTrainer:
                             loss = self.criterion(outputs, labels)
                     else:
                         outputs, results = self.model(batch)
+                        # Log shapes after forward
+                        log_batch_shapes(batch, prefix=f"post_forward_input train batch {batch_idx}")
+                        if isinstance(outputs, torch.Tensor):
+                            if globals().get('DEBUG_MODE', False):
+                                print(f"[SHAPES] outputs: shape={tuple(outputs.shape)}, dtype={outputs.dtype}, device={outputs.device}")
+                        if isinstance(results, dict):
+                            log_batch_shapes(results, prefix=f"post_forward_results train batch {batch_idx}")
                         loss = self.criterion(outputs, labels)
                     
                     # ADAPTIVE BIAS REMOVED: Was causing the model to learn bias instead of features
@@ -2101,9 +2518,10 @@ class DeepfakeTrainer:
                         try:
                             sample_idx = np.random.randint(min(4, outputs.size(0)))
                             save_visualizations(
-                                batch, outputs, results, 
-                                epoch + 1, sample_idx, 
-                                os.path.join(self.viz_dir, f"val_epoch_{epoch+1}")
+                                batch, outputs, results,
+                                epoch + 1, sample_idx,
+                                os.path.join(self.viz_dir, f"val_epoch_{epoch+1}"),
+                                model=self.model
                             )
                         except Exception as vis_error:
                             print(f"Error visualizing predictions: {vis_error}")
@@ -2264,25 +2682,34 @@ class DeepfakeTrainer:
                 
                 # Create feature importance chart
                 if component_importance:
-                    plt.figure(figsize=(12, 6))
-                    keys = sorted(component_importance.keys())
-                    values = [component_importance[k] for k in keys]
-                    
-                    # Sort by value
-                    sorted_indices = np.argsort(values)
-                    sorted_keys = [keys[i] for i in sorted_indices]
-                    sorted_values = [values[i] for i in sorted_indices]
-                    
-                    plt.barh(sorted_keys, sorted_values)
-                    plt.title("Feature Importance Scores")
-                    plt.xlabel("Average Contribution")
-                    plt.tight_layout()
-                    
-                    feature_importance_path = os.path.join(self.plot_dir, f"feature_importance_epoch_{epoch+1}.png")
-                    plt.savefig(feature_importance_path)
-                    plt.close()
-                    
-                    wandb.log({f"feature_importance_epoch_{epoch+1}": wandb.Image(feature_importance_path)})
+                    try:
+                        import matplotlib
+                        matplotlib.use('Agg')
+                        import matplotlib.pyplot as plt
+                    except Exception:
+                        plt = None
+
+                    if plt is None:
+                        print("[VIS] matplotlib not available - skipping validation feature importance plot")
+                    else:
+                        keys = sorted(component_importance.keys())
+                        values = [component_importance[k] for k in keys]
+                        # Sort by value
+                        sorted_indices = np.argsort(values)
+                        sorted_keys = [keys[i] for i in sorted_indices]
+                        sorted_values = [values[i] for i in sorted_indices]
+
+                        plt.figure(figsize=(12, 6))
+                        plt.barh(sorted_keys, sorted_values)
+                        plt.title("Feature Importance Scores")
+                        plt.xlabel("Average Contribution")
+                        plt.tight_layout()
+
+                        feature_importance_path = os.path.join(self.plot_dir, f"feature_importance_epoch_{epoch+1}.png")
+                        plt.savefig(feature_importance_path)
+                        plt.close()
+
+                        wandb.log({f"feature_importance_epoch_{epoch+1}": wandb.Image(feature_importance_path)})
         
         # Return metrics (include macro F1)
         return avg_loss, accuracy, precision, recall, f1, auc_score, macro_f1
@@ -2313,7 +2740,30 @@ class DeepfakeTrainer:
                 try:
                     # Move batch to device
                     batch = move_batch_to_device(batch, self.device, trainer=self)
-                    
+                    log_batch_shapes(batch, prefix=f"after_move_to_device test batch {batch_idx}")
+
+                    # Filter out placeholder samples marked with label == -1 in testing
+                    try:
+                        labels_tmp = batch.get('label', None)
+                        if isinstance(labels_tmp, torch.Tensor):
+                            labels_cpu = labels_tmp.detach()
+                            if (labels_cpu == -1).any():
+                                mask = (labels_cpu != -1)
+                                keep_idx = mask.nonzero(as_tuple=False).squeeze(1)
+                                num_removed = int((~mask).sum().item())
+                                if keep_idx.numel() == 0:
+                                    print(f"[INFO] Test batch {batch_idx} contains only placeholders. Skipping batch.")
+                                    continue
+                                for k, v in list(batch.items()):
+                                    if isinstance(v, torch.Tensor) and v.shape[0] == labels_cpu.shape[0]:
+                                        batch[k] = v[keep_idx]
+                                    elif isinstance(v, list) and len(v) == labels_cpu.shape[0]:
+                                        idxs = keep_idx.cpu().tolist()
+                                        batch[k] = [v[i] for i in idxs]
+                                print(f"[INFO] Filtered {num_removed} placeholder samples from test batch {batch_idx} (kept {keep_idx.numel()})")
+                    except Exception as filter_e:
+                        print(f"[WARNING] Could not filter placeholder samples in testing at batch {batch_idx}: {filter_e}")
+
                     # Get labels and file paths
                     labels = batch['label']
                     file_paths = batch.get('file_path', ['unknown'] * len(labels))
@@ -2322,9 +2772,21 @@ class DeepfakeTrainer:
                     if self.amp_enabled:
                         with autocast():
                             outputs, results = self.model(batch)
+                            # Log shapes after forward inside AMP path
+                            log_batch_shapes(batch, prefix=f"post_forward_input train batch {batch_idx}")
+                            if isinstance(outputs, torch.Tensor) and globals().get('DEBUG_MODE', False):
+                                print(f"[SHAPES] outputs: shape={tuple(outputs.shape)}, dtype={outputs.dtype}, device={outputs.device}")
+                            if isinstance(results, dict):
+                                log_batch_shapes(results, prefix=f"post_forward_results train batch {batch_idx}")
                             loss = self.criterion(outputs, labels)
                     else:
                         outputs, results = self.model(batch)
+                        # Log shapes after forward
+                        log_batch_shapes(batch, prefix=f"post_forward_input train batch {batch_idx}")
+                        if isinstance(outputs, torch.Tensor) and globals().get('DEBUG_MODE', False):
+                            print(f"[SHAPES] outputs: shape={tuple(outputs.shape)}, dtype={outputs.dtype}, device={outputs.device}")
+                        if isinstance(results, dict):
+                            log_batch_shapes(results, prefix=f"post_forward_results train batch {batch_idx}")
                         loss = self.criterion(outputs, labels)
                     
                     # Update progress bar
@@ -2399,7 +2861,8 @@ class DeepfakeTrainer:
                             save_visualizations(
                                 batch, outputs, results, 
                                 0, sample_idx, 
-                                os.path.join(self.viz_dir, "test_results")
+                                os.path.join(self.viz_dir, "test_results"),
+                                model=self.model
                             )
                         except Exception as vis_error:
                             print(f"Error visualizing predictions: {vis_error}")
@@ -2439,11 +2902,30 @@ class DeepfakeTrainer:
         
         # Save detailed results to CSV
         if self.is_main_process:
-            # Basic results
-            results_df = pd.DataFrame(results_data)
-            results_path = os.path.join(self.log_dir, "test_results.csv")
-            results_df.to_csv(results_path, index=False)
-            print(f"Test results saved to: {results_path}")
+            # Basic results: try pandas, fallback to csv module if pandas is not available
+            try:
+                import pandas as pd
+            except Exception:
+                pd = None
+
+            if pd is not None:
+                results_df = pd.DataFrame(results_data)
+                results_path = os.path.join(self.log_dir, "test_results.csv")
+                results_df.to_csv(results_path, index=False)
+                print(f"Test results saved to: {results_path}")
+            else:
+                # Fallback: write CSV manually
+                import csv
+                results_path = os.path.join(self.log_dir, "test_results.csv")
+                os.makedirs(os.path.dirname(results_path), exist_ok=True)
+                with open(results_path, 'w', newline='', encoding='utf-8') as csvfile:
+                    writer = csv.writer(csvfile)
+                    headers = list(results_data.keys())
+                    writer.writerow(headers)
+                    rows = zip(*[results_data[h] for h in headers])
+                    for row in rows:
+                        writer.writerow(row)
+                print(f"Test results saved (csv fallback) to: {results_path}")
             
             # Add component results to detailed analysis DataFrame
             for key, values in detailed_component_results.items():
@@ -2457,31 +2939,41 @@ class DeepfakeTrainer:
             
             # Create feature importance visualization
             if detailed_component_results:
+                try:
+                    import matplotlib
+                    matplotlib.use('Agg')
+                    import matplotlib.pyplot as plt
+                except Exception:
+                    plt = None
+
+                if plt is None:
+                    print("[VIS] matplotlib not available - skipping feature importance plot")
+                else:
                 # Calculate average importance for each component
-                component_importance = {}
-                for key, values in detailed_component_results.items():
-                    if values:
-                        component_importance[key] = np.mean(values)
-                
-                # Sort components by importance
-                sorted_components = sorted(component_importance.items(), key=lambda x: x[1], reverse=True)
-                
-                # Create feature importance chart
-                plt.figure(figsize=(12, 8))
-                component_names = [item[0] for item in sorted_components]
-                component_values = [item[1] for item in sorted_components]
-                
-                plt.barh(component_names, component_values)
-                plt.title("Component Importance in Deepfake Detection")
-                plt.xlabel("Average Contribution")
-                plt.tight_layout()
-                
-                feature_importance_path = os.path.join(self.plot_dir, "feature_importance_test.png")
-                plt.savefig(feature_importance_path)
-                plt.close()
-                
-                if self.config.use_wandb:
-                    wandb.log({"feature_importance_test": wandb.Image(feature_importance_path)})
+                    component_importance = {}
+                    for key, values in detailed_component_results.items():
+                        if values:
+                            component_importance[key] = np.mean(values)
+
+                    # Sort components by importance
+                    sorted_components = sorted(component_importance.items(), key=lambda x: x[1], reverse=True)
+
+                    # Create feature importance chart
+                    plt.figure(figsize=(12, 8))
+                    component_names = [item[0] for item in sorted_components]
+                    component_values = [item[1] for item in sorted_components]
+
+                    plt.barh(component_names, component_values)
+                    plt.title("Component Importance in Deepfake Detection")
+                    plt.xlabel("Average Contribution")
+                    plt.tight_layout()
+
+                    feature_importance_path = os.path.join(self.plot_dir, "feature_importance_test.png")
+                    plt.savefig(feature_importance_path)
+                    plt.close()
+
+                    if self.config.use_wandb:
+                        wandb.log({"feature_importance_test": wandb.Image(feature_importance_path)})
         
         return avg_loss, metrics_dict
     
@@ -2498,58 +2990,64 @@ class DeepfakeTrainer:
         else:
             print(f"🚀 Starting from epoch {start_epoch+1}")
         
-        for epoch in range(start_epoch, self.config.num_epochs):
-            epoch_start_time = time.time()
-            
-            # Training phase
-            train_loss, train_acc, train_precision, train_recall, train_f1, train_auc, train_macro_f1 = self.train_epoch(epoch)
-            
-            # Validation phase
-            val_loss, val_acc, val_precision, val_recall, val_f1, val_auc, val_macro_f1 = self.validate_epoch(epoch)
-            
-            # Update learning rate scheduler if using plateau scheduler
-            if self.scheduler is not None:
-                if self.config.scheduler == 'plateau':
-                    # ReduceLROnPlateau step with macro F1 (better for imbalanced data)
-                    self.scheduler.step(val_macro_f1)
-                else:
-                    self.scheduler.step()
-            
-            # Calculate epoch time
-            epoch_time = time.time() - epoch_start_time
-            
-            # Print epoch summary
-            if self.is_main_process:
-                epoch_summary = f"\nEpoch {epoch+1}/{self.config.num_epochs} completed in {epoch_time:.2f}s"
-                # Keep the star in console output but use (key) for log file
-                train_metrics_console = f"Train - Loss: {train_loss:.4f}, Accuracy: {train_acc:.4f}, F1: {train_f1:.4f}, Macro F1: {train_macro_f1:.4f} ⭐, AUC: {train_auc:.4f}"
-                val_metrics_console = f"Val   - Loss: {val_loss:.4f}, Accuracy: {val_acc:.4f}, F1: {val_f1:.4f}, Macro F1: {val_macro_f1:.4f} ⭐, AUC: {val_auc:.4f}"
-                
-                # Plain text versions for log file (no emoji)
-                train_metrics = f"Train - Loss: {train_loss:.4f}, Accuracy: {train_acc:.4f}, F1: {train_f1:.4f}, Macro F1: {train_macro_f1:.4f} (key), AUC: {train_auc:.4f}"
-                val_metrics = f"Val   - Loss: {val_loss:.4f}, Accuracy: {val_acc:.4f}, F1: {val_f1:.4f}, Macro F1: {val_macro_f1:.4f} (key), AUC: {val_auc:.4f}"
-                
-                print(train_metrics_console)
-                print(val_metrics_console)
-                
-                print(epoch_summary)
-                
-                # Log to file if specified
-                if self.log_file:
-                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    self.log_file.write(f"{timestamp} - {epoch_summary}\n")
-                    self.log_file.write(f"{timestamp} - {train_metrics}\n")
-                    self.log_file.write(f"{timestamp} - {val_metrics}\n")
+        # Respect external shutdown signal set by signal handlers/cleanup
+        try:
+            for epoch in range(start_epoch, self.config.num_epochs):
+                if is_shutdown_requested():
+                    print(f"[SHUTDOWN] Shutdown requested before starting epoch {epoch}. Exiting training loop.")
+                    break
+
+                epoch_start_time = time.time()
+
+                # Training phase
+                train_loss, train_acc, train_precision, train_recall, train_f1, train_auc, train_macro_f1 = self.train_epoch(epoch)
+
+                # Validation phase
+                val_loss, val_acc, val_precision, val_recall, val_f1, val_auc, val_macro_f1 = self.validate_epoch(epoch)
+
+                # Update learning rate scheduler if using plateau scheduler
+                if self.scheduler is not None:
+                    if self.config.scheduler == 'plateau':
+                        # ReduceLROnPlateau step with macro F1 (better for imbalanced data)
+                        self.scheduler.step(val_macro_f1)
+                    else:
+                        self.scheduler.step()
+
+                # Calculate epoch time
+                epoch_time = time.time() - epoch_start_time
+
+                # Print epoch summary
+                if self.is_main_process:
+                    epoch_summary = f"\nEpoch {epoch+1}/{self.config.num_epochs} completed in {epoch_time:.2f}s"
+                    # Keep the star in console output but use (key) for log file
+                    train_metrics_console = f"Train - Loss: {train_loss:.4f}, Accuracy: {train_acc:.4f}, F1: {train_f1:.4f}, Macro F1: {train_macro_f1:.4f} ⭐, AUC: {train_auc:.4f}"
+                    val_metrics_console = f"Val   - Loss: {val_loss:.4f}, Accuracy: {val_acc:.4f}, F1: {val_f1:.4f}, Macro F1: {val_macro_f1:.4f} ⭐, AUC: {val_auc:.4f}"
                     
-                    # Log additional metrics in CSV format for easy analysis
-                    self.log_file.write(f"EPOCH_CSV,{epoch+1},{train_loss:.6f},{train_acc:.6f},{train_precision:.6f},{train_recall:.6f},{train_f1:.6f},{train_macro_f1:.6f},{train_auc:.6f},")
-                    self.log_file.write(f"{val_loss:.6f},{val_acc:.6f},{val_precision:.6f},{val_recall:.6f},{val_f1:.6f},{val_macro_f1:.6f},{val_auc:.6f}\n")
+                    # Plain text versions for log file (no emoji)
+                    train_metrics = f"Train - Loss: {train_loss:.4f}, Accuracy: {train_acc:.4f}, F1: {train_f1:.4f}, Macro F1: {train_macro_f1:.4f} (key), AUC: {train_auc:.4f}"
+                    val_metrics = f"Val   - Loss: {val_loss:.4f}, Accuracy: {val_acc:.4f}, F1: {val_f1:.4f}, Macro F1: {val_macro_f1:.4f} (key), AUC: {val_auc:.4f}"
                     
-                    self.log_file.flush()
-                
+                    print(train_metrics_console)
+                    print(val_metrics_console)
+                    
+                    print(epoch_summary)
+                    
+                    # Log to file if specified
+                    if self.log_file:
+                        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        self.log_file.write(f"{timestamp} - {epoch_summary}\n")
+                        self.log_file.write(f"{timestamp} - {train_metrics}\n")
+                        self.log_file.write(f"{timestamp} - {val_metrics}\n")
+                        
+                        # Log additional metrics in CSV format for easy analysis
+                        self.log_file.write(f"EPOCH_CSV,{epoch+1},{train_loss:.6f},{train_acc:.6f},{train_precision:.6f},{train_recall:.6f},{train_f1:.6f},{train_macro_f1:.6f},{train_auc:.6f},")
+                        self.log_file.write(f"{val_loss:.6f},{val_acc:.6f},{val_precision:.6f},{val_recall:.6f},{val_f1:.6f},{val_macro_f1:.6f},{val_auc:.6f}\n")
+                        
+                        self.log_file.flush()
+                        
                 # Save checkpoint (use macro F1 for balanced evaluation)
                 self.save_checkpoint(epoch, val_acc, val_macro_f1)
-                
+
                 # Plot metrics with error handling
                 print("[DEBUG] Starting to generate plots...")
                 try:
@@ -2574,7 +3072,7 @@ class DeepfakeTrainer:
                     print(f"❌ Error generating plots: {e}")
                     import traceback
                     traceback.print_exc()
-                
+                    
                 # Log epoch metrics to WandB
                 if self.config.use_wandb:
                     wandb.log({
@@ -2626,6 +3124,10 @@ class DeepfakeTrainer:
                         self.log_file.flush()
                     
                     break
+        except KeyboardInterrupt:
+            print("[SHUTDOWN] KeyboardInterrupt received. Running cleanup and exiting training.")
+            cleanup_and_exit(trainer=self, save_checkpoint=True, reason='KeyboardInterrupt')
+            return
         
         # Print training summary
         if self.is_main_process:
@@ -2713,42 +3215,79 @@ class DeepfakeTrainer:
             f"checkpoint_epoch_{epoch+1}_acc_{accuracy:.4f}_f1_{f1_score:.4f}.pth"
         )
         
-        model_state_dict = self.model.module.state_dict() if self.distributed else self.model.state_dict()
-        
-        checkpoint = {
-            'epoch': epoch + 1,
-            'model_state_dict': model_state_dict,
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler is not None else None,
-            'accuracy': accuracy,
-            'f1_score': f1_score,
-            'timestamp': datetime.now().strftime("%Y%m%d_%H%M%S")
-        }
-        
-        torch.save(checkpoint, checkpoint_path)
-        print(f"Checkpoint saved: {checkpoint_path}")
+        try:
+            # Handle distributed/DataParallel models
+            if self.distributed:
+                model_state_dict = self.model.module.state_dict()
+            elif hasattr(self.model, 'module'):
+                model_state_dict = self.model.module.state_dict()
+            else:
+                model_state_dict = self.model.state_dict()
+            
+            checkpoint = {
+                'epoch': epoch + 1,
+                'model_state_dict': model_state_dict,
+                'optimizer_state_dict': self.optimizer.state_dict(),
+                'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler is not None else None,
+                'accuracy': accuracy,
+                'f1_score': f1_score,
+                'timestamp': datetime.now().strftime("%Y%m%d_%H%M%S"),
+                'config': vars(self.config)  # Save config for reproducibility
+            }
+            
+            torch.save(checkpoint, checkpoint_path)
+            
+            # Log file size
+            file_size_mb = os.path.getsize(checkpoint_path) / (1024 * 1024)
+            print(f"✅ Checkpoint saved: {checkpoint_path}")
+            print(f"   File size: {file_size_mb:.2f} MB")
+            
+        except Exception as e:
+            print(f"❌ Error saving checkpoint: {e}")
+            import traceback
+            traceback.print_exc()
     
     def save_best_model(self, epoch, accuracy, f1_score):
         """Save best model checkpoint."""
         best_model_path = os.path.join(self.run_checkpoint_dir, "best_model.pth")
         
-        model_state_dict = self.model.module.state_dict() if self.distributed else self.model.state_dict()
-        
-        checkpoint = {
-            'epoch': epoch + 1,
-            'model_state_dict': model_state_dict,
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler is not None else None,
-            'accuracy': accuracy,
-            'f1_score': f1_score,
-            'timestamp': datetime.now().strftime("%Y%m%d_%H%M%S")
-        }
-        
-        torch.save(checkpoint, best_model_path)
-        print(f"Best model saved: {best_model_path}")
-        
-        # Copy to fixed best model location for easy reference
-        shutil.copy(best_model_path, os.path.join(self.model_dir, "best_model.pth"))
+        try:
+            # Handle distributed/DataParallel models
+            if self.distributed:
+                model_state_dict = self.model.module.state_dict()
+            elif hasattr(self.model, 'module'):
+                model_state_dict = self.model.module.state_dict()
+            else:
+                model_state_dict = self.model.state_dict()
+            
+            checkpoint = {
+                'epoch': epoch + 1,
+                'model_state_dict': model_state_dict,
+                'optimizer_state_dict': self.optimizer.state_dict(),
+                'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler is not None else None,
+                'accuracy': accuracy,
+                'f1_score': f1_score,
+                'timestamp': datetime.now().strftime("%Y%m%d_%H%M%S"),
+                'config': vars(self.config)  # Save config for reproducibility
+            }
+            
+            torch.save(checkpoint, best_model_path)
+            
+            # Log file size
+            file_size_mb = os.path.getsize(best_model_path) / (1024 * 1024)
+            print(f"🏆 Best model saved: {best_model_path}")
+            print(f"   Epoch: {epoch+1} | Accuracy: {accuracy:.4f} | F1: {f1_score:.4f}")
+            print(f"   File size: {file_size_mb:.2f} MB")
+            
+            # Copy to fixed best model location for easy reference
+            fixed_best_path = os.path.join(self.model_dir, "best_model.pth")
+            shutil.copy(best_model_path, fixed_best_path)
+            print(f"   Copied to: {fixed_best_path}")
+            
+        except Exception as e:
+            print(f"❌ Error saving best model: {e}")
+            import traceback
+            traceback.print_exc()
     
     def load_best_model(self):
         """Load the best model for testing."""
@@ -2768,6 +3307,234 @@ class DeepfakeTrainer:
             self.model.load_state_dict(checkpoint['model_state_dict'], strict=False)
         
         print(f"Best model loaded (Epoch {checkpoint['epoch']}, Accuracy: {checkpoint['accuracy']:.4f}, F1: {checkpoint['f1_score']:.4f})")
+
+    def run_pairwise(self, max_pairs=1000, steps=500, pairwise_batch_size=8, ckpt_interval=100, save_dir=None, amp_enabled=None):
+        """
+        Run a pairwise training routine that builds batches containing both the fake
+        sample and its corresponding original sample. For each minibatch from
+        `self.train_loader` we build a combined batch of shape [2*B, ...] where
+        the first B samples are fakes and the next B are their originals. Labels
+        are set to 1 for fake and 0 for original. Facial features and other
+        per-sample tensors are concatenated in the same order so the model sees
+        aligned pairs.
+
+        The method supports AMP when `self.amp_enabled` is True (or when
+        `amp_enabled=True` is passed). Checkpoints are saved to
+        `self.run_checkpoint_dir/pairwise` by default.
+        """
+        # Resolve AMP preference
+        amp = self.amp_enabled if amp_enabled is None else bool(amp_enabled)
+        scaler = GradScaler() if amp else None
+
+        # Prepare checkpoint/save directory
+        if save_dir is None:
+            save_dir = os.path.join(self.run_checkpoint_dir, 'pairwise')
+        os.makedirs(save_dir, exist_ok=True)
+
+        # Basic training mode
+        self.model.train()
+
+        processed_pairs = 0
+        step = 0
+
+        train_iter = iter(self.train_loader)
+
+        print(f"[PAIRWISE] Starting pairwise training: max_pairs={max_pairs}, steps={steps}, batch_size={pairwise_batch_size}")
+
+        while processed_pairs < max_pairs and step < steps and not is_shutdown_requested():
+            try:
+                batch = next(train_iter)
+            except StopIteration:
+                train_iter = iter(self.train_loader)
+                try:
+                    batch = next(train_iter)
+                except StopIteration:
+                    print("[PAIRWISE] Train loader empty, stopping pairwise loop")
+                    break
+
+            # Filter placeholder samples (label == -1)
+            try:
+                labels_tmp = batch.get('label', None)
+                if isinstance(labels_tmp, torch.Tensor):
+                    labels_cpu = labels_tmp.detach()
+                    if (labels_cpu == -1).any():
+                        mask_keep = (labels_cpu != -1)
+                        keep_idx = mask_keep.nonzero(as_tuple=False).squeeze(1)
+                        if keep_idx.numel() == 0:
+                            continue
+                        for k, v in list(batch.items()):
+                            if isinstance(v, torch.Tensor) and v.shape[0] == labels_cpu.shape[0]:
+                                batch[k] = v[keep_idx]
+                            elif isinstance(v, list) and len(v) == labels_cpu.shape[0]:
+                                idxs = keep_idx.cpu().tolist()
+                                batch[k] = [v[i] for i in idxs]
+            except Exception as e:
+                print(f"[PAIRWISE] Warning: could not filter placeholders: {e}")
+
+            # Ensure originals exist in batch
+            if 'original_video_frames' not in batch or batch.get('original_video_frames') is None:
+                # Skip non-paired samples
+                continue
+
+            # Move individual tensors to device (do not convert lists yet)
+            batch = move_batch_to_device(batch, self.device, trainer=self)
+
+            # Extract tensors (expect shapes: [B, T, C, H, W] and [B, L])
+            fake_v = batch.get('video_frames')
+            orig_v = batch.get('original_video_frames')
+            fake_a = batch.get('audio')
+            orig_a = batch.get('original_audio')
+
+            # Some datasets may return originals as lists or tensors; attempt to coerce
+            if not isinstance(orig_v, torch.Tensor):
+                try:
+                    orig_v = torch.stack([torch.tensor(x) if not isinstance(x, torch.Tensor) else x for x in orig_v], dim=0).to(self.device)
+                except Exception:
+                    # Skip if we cannot form originals
+                    continue
+
+            if orig_a is None and fake_a is not None:
+                # If original audio missing, use zeros with same length as fake audio
+                orig_a = torch.zeros_like(fake_a)
+
+            # Build combined batch by concatenating fake then original
+            try:
+                combined_video = torch.cat([fake_v, orig_v], dim=0)
+            except Exception as e:
+                print(f"[PAIRWISE] Error concatenating video tensors: {e}")
+                continue
+
+            if fake_a is not None and orig_a is not None:
+                try:
+                    combined_audio = torch.cat([fake_a, orig_a], dim=0)
+                except Exception:
+                    combined_audio = None
+            else:
+                combined_audio = None
+
+            # Concatenate optional per-sample features if present (face_embeddings, facial_landmarks, etc.)
+            combined = {
+                'video_frames': combined_video,
+                'audio': combined_audio
+            }
+
+            for key in ['face_embeddings', 'facial_landmarks', 'metadata_features', 'ela_features', 'pulse_signal', 'head_pose', 'eye_blink_features', 'frequency_features']:
+                if key in batch and batch[key] is not None:
+                    val = batch[key]
+                    if isinstance(val, torch.Tensor):
+                        try:
+                            combined[key] = torch.cat([val, val], dim=0) if False else torch.cat([val, val], dim=0)
+                        except Exception:
+                            # Try simpler concatenation when originals are provided separately
+                            orig_key = 'original_' + key if ('original_' + key) in batch else None
+                            if orig_key and batch.get(orig_key) is not None:
+                                try:
+                                    combined[key] = torch.cat([val, batch[orig_key]], dim=0)
+                                except Exception:
+                                    # fallback: expand val to match
+                                    combined[key] = torch.cat([val, val], dim=0)
+                            else:
+                                combined[key] = torch.cat([val, val], dim=0)
+
+            # Build labels: first B = fake (1), next B = original (0)
+            B = fake_v.shape[0]
+            labels_combined = torch.cat([torch.ones(B, dtype=torch.long, device=self.device), torch.zeros(B, dtype=torch.long, device=self.device)], dim=0)
+
+            # Prepare fake_mask if provided: make mask for combined batch
+            fake_mask_combined = None
+            if 'fake_mask' in batch and batch['fake_mask'] is not None:
+                try:
+                    # batch['fake_mask'] may be list of lists or tensor [B, T]
+                    fm = batch['fake_mask']
+                    if isinstance(fm, list):
+                        fm = [torch.tensor(m, dtype=torch.float32) for m in fm]
+                        # Pad to same length
+                        max_t = max([m.numel() for m in fm]) if fm else 0
+                        fm_tensors = []
+                        for m in fm:
+                            if m.numel() < max_t:
+                                pad = torch.zeros(max_t - m.numel(), dtype=torch.float32, device=self.device)
+                                fm_tensors.append(torch.cat([m.to(self.device), pad]))
+                            else:
+                                fm_tensors.append(m.to(self.device))
+                        fm_stack = torch.stack(fm_tensors, dim=0)
+                    elif isinstance(fm, torch.Tensor):
+                        fm_stack = fm.to(self.device)
+                    else:
+                        fm_stack = None
+                    if fm_stack is not None:
+                        zeros = torch.zeros_like(fm_stack)
+                        fake_mask_combined = torch.cat([fm_stack, zeros], dim=0)
+                        combined['fake_mask'] = fake_mask_combined
+                except Exception as e:
+                    if getattr(self, 'is_main_process', True):
+                        print(f"[PAIRWISE] Warning: failed to prepare fake_mask: {e}")
+
+            # Move combined optional fields to device if not already
+            for k, v in list(combined.items()):
+                if isinstance(v, torch.Tensor):
+                    combined[k] = v.to(self.device)
+
+            # Training step (single step per combined minibatch)
+            try:
+                self.optimizer.zero_grad()
+                if amp:
+                    with autocast():
+                        outputs, results = self.model(combined)
+                        loss = self.criterion(outputs, labels_combined)
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(self.optimizer)
+                    if hasattr(self.model, 'clip_gradients'):
+                        self.model.clip_gradients(max_norm=self.config.gradient_clip)
+                    else:
+                        nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clip)
+                    scaler.step(self.optimizer)
+                    scaler.update()
+                else:
+                    outputs, results = self.model(combined)
+                    loss = self.criterion(outputs, labels_combined)
+                    loss.backward()
+                    if hasattr(self.model, 'clip_gradients'):
+                        self.model.clip_gradients(max_norm=self.config.gradient_clip)
+                    else:
+                        nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clip)
+                    self.optimizer.step()
+
+                processed_pairs += B
+                step += 1
+
+                if self.is_main_process and step % 10 == 0:
+                    print(f"[PAIRWISE] Step {step}: processed_pairs={processed_pairs}, loss={loss.item():.6f}")
+
+                if step % ckpt_interval == 0:
+                    # Save checkpoint for pairwise run
+                    ckpt_path = os.path.join(save_dir, f"pairwise_step_{step}_pairs_{processed_pairs}.pth")
+                    try:
+                        model_state = self.model.module.state_dict() if self.distributed else self.model.state_dict()
+                        torch.save({
+                            'step': step,
+                            'processed_pairs': processed_pairs,
+                            'model_state_dict': model_state,
+                            'optimizer_state_dict': self.optimizer.state_dict(),
+                            'timestamp': datetime.now().strftime('%Y%m%d_%H%M%S')
+                        }, ckpt_path)
+                        if self.is_main_process:
+                            print(f"[PAIRWISE] Checkpoint saved: {ckpt_path}")
+                    except Exception as e:
+                        print(f"[PAIRWISE] Failed to save checkpoint: {e}")
+
+            except Exception as e:
+                print(f"[PAIRWISE] Error during training step: {e}")
+                import traceback
+                traceback.print_exc()
+                # Clear gradients and continue
+                try:
+                    self.optimizer.zero_grad()
+                except Exception:
+                    pass
+                continue
+
+        print(f"[PAIRWISE] Finished pairwise training: processed_pairs={processed_pairs}, steps={step}")
     
     def print_training_improvements(self):
         """Print the training improvements for class imbalance and overfitting."""
@@ -2900,7 +3667,7 @@ def parse_args():
     parser.add_argument('--temporal_features', action='store_true', help='Compute temporal consistency features')
     parser.add_argument('--enhanced_preprocessing', action='store_true', help='Enable enhanced preprocessing features (physiological, etc.)')
     parser.add_argument('--enhanced_augmentation', action='store_true', help='Enable enhanced data augmentation')
-    parser.add_argument('--enable_skin_color_analysis', action='store_true', default=True, help='Enable skin color analysis (memory intensive, enabled by default)')
+    parser.add_argument('--enable_skin_color_analysis', action='store_true', default=False, help='Enable skin color analysis (memory intensive)')
     parser.add_argument('--enable_advanced_physiological', action='store_true', help='Enable advanced physiological analysis (heartbeat, blood flow, breathing)')
     parser.add_argument('--physiological_fps', type=int, default=30, help='Frame rate for physiological signal analysis')
     parser.add_argument('--resume_checkpoint', type=str, default=None, help='Path to checkpoint file to resume training from')
@@ -2952,7 +3719,7 @@ def parse_args():
     # Misc parameters
     parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
     parser.add_argument('--device', type=str, default='cuda', help='Device to use (cuda or cpu)')
-    parser.add_argument('--amp_enabled', action='store_true', default=True, help='Enable automatic mixed precision (default: True)')
+    parser.add_argument('--amp_enabled', action='store_true', default=False, help='Enable automatic mixed precision (AMP)')
     parser.add_argument('--debug', action='store_true', help='Enable debug mode')
     parser.add_argument('--pretrained_path', type=str, default=None, help='Path to pretrained model weights')
     

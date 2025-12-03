@@ -280,6 +280,7 @@ class DigitalHeartbeatDetector(nn.Module):
         Returns:
             Dictionary with heartbeat analysis results
         """
+        assert face_frames.dim() == 5, f"Input must be [batch, frames, channels, height, width], got {face_frames.shape}"
         try:
             # Extract face ROI for rPPG analysis
             rgb_signals = self.extract_face_roi(face_frames)  # [batch, frames, 3]
@@ -359,10 +360,13 @@ class BloodFlowSkinAnalyzer(nn.Module):
         self.temporal_analyzer = nn.Sequential(
             nn.Conv1d(3, 32, kernel_size=3, padding=1),
             nn.ReLU(),
+            nn.BatchNorm1d(32),
             nn.Conv1d(32, 64, kernel_size=3, padding=1),
             nn.ReLU(),
+            nn.BatchNorm1d(64),
             nn.Conv1d(64, 32, kernel_size=3, padding=1),
-            nn.ReLU()
+            nn.ReLU(),
+            nn.BatchNorm1d(32)
         )
         
         # Blood flow pattern classifier
@@ -378,13 +382,23 @@ class BloodFlowSkinAnalyzer(nn.Module):
         
     def segment_skin_regions(self, frames):
         """Segment skin regions from facial frames."""
+        # Robust skin segmentation using YCrCb color space
         batch_size, num_frames, C, H, W = frames.shape
-        
         skin_masks = []
         for t in range(num_frames):
-            masks = self.skin_segmenter(frames[:, t])  # [batch, 1, H, W]
-            skin_masks.append(masks)
-        
+            frame = frames[:, t]  # [batch, 3, H, W]
+            # Convert to numpy for YCrCb segmentation
+            frame_np = frame.detach().cpu().numpy()
+            batch_masks = []
+            for b in range(batch_size):
+                img = frame_np[b].transpose(1, 2, 0)  # [H, W, 3]
+                img_uint8 = (img * 255).astype(np.uint8)
+                img_ycrcb = cv2.cvtColor(img_uint8, cv2.COLOR_RGB2YCrCb)
+                y, cr, cb = cv2.split(img_ycrcb)
+                mask = ((cr > 135) & (cr < 180) & (cb > 85) & (cb < 135)).astype(np.float32)
+                batch_masks.append(torch.tensor(mask, dtype=frames.dtype, device=frames.device))
+            batch_masks = torch.stack(batch_masks)  # [batch, H, W]
+            skin_masks.append(batch_masks.unsqueeze(1))  # [batch, 1, H, W]
         return torch.stack(skin_masks, dim=1)  # [batch, frames, 1, H, W]
     
     def extract_skin_color_signals(self, frames, skin_masks):
@@ -456,6 +470,7 @@ class BloodFlowSkinAnalyzer(nn.Module):
         Returns:
             Dictionary with blood flow analysis results
         """
+        assert face_frames.dim() == 5, f"Input must be [batch, frames, channels, height, width], got {face_frames.shape}"
         try:
             # Segment skin regions
             skin_masks = self.segment_skin_regions(face_frames)
@@ -536,10 +551,13 @@ class BreathingPatternDetector(nn.Module):
         self.pattern_analyzer = nn.Sequential(
             nn.Conv1d(2, 32, kernel_size=3, padding=1),  # Chest + nostril signals
             nn.ReLU(),
+            nn.BatchNorm1d(32),
             nn.Conv1d(32, 64, kernel_size=3, padding=1),
             nn.ReLU(),
+            nn.BatchNorm1d(64),
             nn.Conv1d(64, 32, kernel_size=3, padding=1),
-            nn.ReLU()
+            nn.ReLU(),
+            nn.BatchNorm1d(32)
         )
         
         # Breathing rate estimator
@@ -714,6 +732,7 @@ class BreathingPatternDetector(nn.Module):
         Returns:
             Dictionary with breathing pattern analysis results
         """
+        assert face_frames.dim() == 5, f"Input must be [batch, frames, channels, height, width], got {face_frames.shape}"
         try:
             # Detect chest movement
             chest_signals = self.detect_chest_movement(face_frames)  # [batch, frames, 1]
@@ -850,6 +869,7 @@ class AdvancedPhysiologicalAnalyzer(nn.Module):
         Returns:
             Comprehensive physiological analysis results
         """
+        assert face_frames.dim() == 5, f"Input must be [batch, frames, channels, height, width], got {face_frames.shape}"
         # Individual analyses
         heartbeat_results = self.heartbeat_detector(face_frames)
         blood_flow_results = self.blood_flow_analyzer(face_frames)

@@ -1,3 +1,5 @@
+import logging
+import io
 import torch.nn.functional as F
 import scipy
 from scipy import signal
@@ -5,21 +7,24 @@ import json
 import os
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader, SubsetRandomSampler
+from torch.utils.data import Dataset, DataLoader, SubsetRandomSampler, Subset, WeightedRandomSampler
 from torchvision import transforms
 import torchaudio
 import cv2
 import warnings
-import traceback
 import random
 import math
 import librosa
 import uuid
 import multiprocessing
-import uuid
 import dlib
 from audiomentations import Compose, AddGaussianNoise, PitchShift, TimeStretch, Shift
 import albumentations as A
+
+# Module logger
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    logging.basicConfig(level=logging.INFO)
 
 # Import our improved augmentation techniques
 try:
@@ -51,7 +56,7 @@ class MultiModalDeepfakeDataset(Dataset):
     # This is typically handled in the training script, not the dataset itself, for best flexibility.
     def __init__(self, json_path, data_dir, max_frames=16, audio_length=8000, transform=None, audio_transform=None, 
                  logging=False, phase='train', detect_faces=True, compute_spectrograms=True, temporal_features=True,
-                 enhanced_preprocessing=True):
+                 enhanced_preprocessing=True, label_assignment_fn=None, load_originals_always=True):
         if not os.path.exists(json_path):
             raise FileNotFoundError(f"JSON file not found at: {json_path}")
         
@@ -96,6 +101,10 @@ class MultiModalDeepfakeDataset(Dataset):
         self.compute_spectrograms = compute_spectrograms
         self.temporal_features = temporal_features
         self.enhanced_preprocessing = enhanced_preprocessing
+        self.label_assignment_fn = label_assignment_fn
+        # When True, for fake samples the loader will attempt to load original video/audio
+        # whenever an `original` path is present in metadata, regardless of `modify_video`/`modify_audio` flags.
+        self.load_originals_always = load_originals_always
         
         # Initialize error counters early
         self.face_detection_error_count = 0
@@ -103,60 +112,65 @@ class MultiModalDeepfakeDataset(Dataset):
         self._sample_count = 0  # Track sample count for periodic detailed logging
         
         # Optional face detector for more focused analysis
-        if self.detect_faces:
-            try:
-                self.face_detector = MTCNN(
-                    image_size=224, margin=40, min_face_size=20,
-                    thresholds=[0.6, 0.7, 0.7], factor=0.709, post_process=True,
-                    device='cuda' if torch.cuda.is_available() else 'cpu'
-                )
-            except Exception as e:
-                print(f"Warning: Could not initialize face detector: {e}")
-                self.detect_faces = False
+        # NOTE: initialize MTCNN lazily to avoid pickling issues when using DataLoader workers on Windows.
+        self.face_detector = None
+        self._mtcnn_inited = False
+        self.detect_faces = detect_faces
                 
-        # Pre-validate the dataset to filter out problematic entries
+        # Pre-validate the dataset to filter out problematic entries (can be expensive)
         self.valid_indices = self._validate_dataset()
-        self.class_counts = self._count_classes()
+
+        # ENFORCE PAIR-ONLY MODE: keep only fake samples that reference an `original` file.
+        # This makes the dataset expose only paired fake+original samples so training
+        # focuses on learning differences between manipulated and ground-truth videos.
+        paired = [idx for idx in self.valid_indices if self.data[idx].get('n_fakes', 0) > 0 and self.data[idx].get('original')]
+        if len(paired) == 0:
+            logger.warning("Pair-only filtering enabled but no paired samples found; dataset will be empty unless metadata contains 'original' entries.")
+        else:
+            logger.info(f"Pair-only filtering: reduced valid samples {len(self.valid_indices)} -> {len(paired)}")
+            self.valid_indices = paired
+
+        # Store class_weights_mode for later use (will be set by training script)
+        self.class_weights_mode = 'balanced'  # Default mode
         
+        # Recompute class counts and weights after filtering to paired samples
+        self.class_counts = self._count_classes()
         # Calculate class weights for imbalanced datasets
         self.class_weights = self._calculate_class_weights()
         
         # Initialize facial landmark detector if available (for enhanced facial analysis)
         if self.enhanced_preprocessing:
             try:
-                import dlib
                 # Try to load dlib's face detector and landmark predictor
                 self.dlib_detector = dlib.get_frontal_face_detector()
-                
-                # Use relative path to the model file in the Models directory
-                model_path = "shape_predictor_68_face_landmarks.dat"
-                # Check if file exists in current directory
+
+                # Model path can be configured via environment variable for portability
+                model_path = os.environ.get('SHAPE_PREDICTOR_PATH', 'shape_predictor_68_face_landmarks.dat')
                 if not os.path.exists(model_path):
-                    # Try finding it in the script's directory
                     script_dir = os.path.dirname(os.path.abspath(__file__))
                     model_path = os.path.join(script_dir, "shape_predictor_68_face_landmarks.dat")
-                    
+
                 if os.path.exists(model_path):
                     self.landmark_predictor = dlib.shape_predictor(model_path)
-                    print("✅ Facial landmark predictor initialized successfully")
+                    logger.info("Facial landmark predictor initialized successfully")
                 else:
-                    print(f"Warning: Facial landmark model not found at {model_path}")
+                    logger.warning(f"Facial landmark model not found at {model_path}")
                     self.landmark_predictor = None
             except Exception as e:
-                print(f"Warning: Could not initialize facial landmark detector: {e}")
+                logger.warning(f"Could not initialize facial landmark detector: {e}")
                 self.dlib_detector = None
                 self.landmark_predictor = None
         
-        print(f"Dataset initialized with {len(self.valid_indices)} valid samples out of {len(self.data)} total.")
-        print(f"Class distribution: {self.class_counts}")
+        logger.info(f"Dataset initialized with {len(self.valid_indices)} valid samples out of {len(self.data)} total.")
+        logger.info(f"Class distribution: {self.class_counts}")
 
     def _validate_dataset(self):
         """Pre-validate all samples in the dataset to identify valid ones."""
-        print("Starting dataset validation...")
+        logger.info("Starting dataset validation...")
         
         # Use the entire dataset for production
         max_to_validate = len(self.data)
-        print(f"✅ VALIDATING ALL {max_to_validate} SAMPLES IN THE DATASET")
+        logger.info(f"VALIDATING {max_to_validate} SAMPLES IN THE DATASET")
         
         valid_indices = []
         
@@ -171,12 +185,33 @@ class MultiModalDeepfakeDataset(Dataset):
             video_path = os.path.join(self.data_dir, sample['file'])
             audio_path = video_path.replace('.mp4', '.wav')
             
-            # Simple validation - just check if files exist
-            if os.path.exists(video_path) and os.path.exists(audio_path):
+            # Only check video existence here; avoid doing expensive audio checks until needed
+            if os.path.exists(video_path):
                 valid_indices.append(idx)
         
         print(f"Found {len(valid_indices)} valid samples out of {max_to_validate} checked.")
         return valid_indices
+
+    def _get_mtcnn(self):
+        """Lazily initialize and return an MTCNN face detector (CPU)."""
+        if not self.detect_faces:
+            return None
+        if getattr(self, 'face_detector', None) is None and not getattr(self, '_mtcnn_inited', False):
+            try:
+                from facenet_pytorch import MTCNN
+                # Initialize on CPU to avoid CUDA pickling issues in DataLoader workers
+                self.face_detector = MTCNN(
+                    image_size=224, margin=40, min_face_size=20,
+                    thresholds=[0.6, 0.7, 0.7], factor=0.709, post_process=True,
+                    device='cpu'
+                )
+                self._mtcnn_inited = True
+                logger.info("Initialized MTCNN face detector (lazy)")
+            except Exception as e:
+                logger.warning(f"Could not initialize MTCNN: {e}")
+                self.face_detector = None
+                self._mtcnn_inited = True
+        return self.face_detector
 
     def _count_classes(self):
         """Count the number of real/fake samples for balancing."""
@@ -289,19 +324,50 @@ class MultiModalDeepfakeDataset(Dataset):
             audio_visual_sync_features = None
             
             if sample.get('n_fakes', 0) > 0:
-                if sample.get('modify_video', False) and original_video_path:
-                    original_video_frames, _, _, _ = self._load_video(original_video_path)
-                    if original_video_frames is None and self.logging:
-                        print(f"⚠️ Warning: Original video loading failed for sample {actual_idx}. Path: {original_video_path}")
-                        
-                if sample.get('modify_audio', False) and original_audio_path:
+                # Decide whether to load originals for video/audio. If `load_originals_always` is True,
+                # we load the original modality whenever an `original` path exists. Otherwise fall back
+                # to the `modify_video` / `modify_audio` flags in the metadata.
+                load_video_orig = bool(self.load_originals_always) or sample.get('modify_video', False)
+                load_audio_orig = bool(self.load_originals_always) or sample.get('modify_audio', False)
+
+                if load_video_orig and original_video_path:
+                        if self.logging:
+                            print(f"🎥 [PAIR] Loading FAKE video: {sample['file']}")
+                            print(f"🎥 [PAIR] Loading REAL (original) video: {sample['original']}")
+                        original_video_frames, _, _, _ = self._load_video(original_video_path)
+                        if original_video_frames is None:
+                            # Try a minimal, more tolerant loader as a fallback
+                            try:
+                                original_video_frames, _, _, _ = self._load_video_minimal(original_video_path)
+                                if original_video_frames is not None and self.logging:
+                                    print(f"ℹ️ Fallback minimal original video loader succeeded for sample {actual_idx}")
+                            except Exception as fb_err:
+                                if self.logging:
+                                    print(f"⚠️ Warning: Original video loading failed for sample {actual_idx}. Path: {original_video_path}. Error: {fb_err}")
+
+                if load_audio_orig and original_audio_path:
                     original_audio_tensor, _, _ = self._load_audio(original_audio_path)
-                    if original_audio_tensor is None and self.logging:
-                        print(f"⚠️ Warning: Original audio loading failed for sample {actual_idx}. Path: {original_audio_path}")
-                
-                # Extract audio-visual synchronization features
+                    if original_audio_tensor is None:
+                        # Try a minimal librosa-based fallback
+                        try:
+                            original_audio_tensor, _, _ = self._load_audio_minimal(original_audio_path)
+                            if original_audio_tensor is not None and self.logging:
+                                print(f"ℹ️ Fallback minimal original audio loader succeeded for sample {actual_idx}")
+                        except Exception as fb_err:
+                            if self.logging:
+                                print(f"⚠️ Warning: Original audio loading failed for sample {actual_idx}. Path: {original_audio_path}. Error: {fb_err}")
+
+                # Extract audio-visual synchronization features (for fake pair)
                 if video_frames is not None and audio_tensor is not None:
                     audio_visual_sync_features = self._extract_av_sync_features(video_frames, audio_tensor)
+
+                # If originals were loaded, compute sync features for the original pair as well
+                original_audio_visual_sync = None
+                if original_video_frames is not None and original_audio_tensor is not None:
+                    try:
+                        original_audio_visual_sync = self._extract_av_sync_features(original_video_frames, original_audio_tensor)
+                    except Exception:
+                        original_audio_visual_sync = None
 
             # Create fake mask
             timestamps = sample.get('timestamps', [])
@@ -375,6 +441,7 @@ class MultiModalDeepfakeDataset(Dataset):
                 'deepfake_type': deepfake_type_id,
                 'original_video_frames': original_video_frames,
                 'original_audio': original_audio_tensor,
+                'original_audio_visual_sync': original_audio_visual_sync if 'original_audio_visual_sync' in locals() else None,
                 'fake_periods': sample.get('fake_periods', []),
                 'timestamps': timestamps,
                 'transcript': sample.get('transcript', ''),
@@ -423,7 +490,8 @@ class MultiModalDeepfakeDataset(Dataset):
         video_frames = torch.zeros((self.max_frames, 3, 224, 224))
         audio_tensor = torch.zeros(self.audio_length)
         audio_spectrogram = torch.zeros((1, 64, 64))  # Reduced from 128x128
-        label = torch.tensor(0, dtype=torch.long)  # Assume real by default
+        # Mark placeholder samples with a sentinel label -1 so training can filter them
+        label = torch.tensor(-1, dtype=torch.long)
         facial_landmarks = torch.zeros((self.max_frames, 136))  # 68 landmarks with x,y coordinates
         
         # Additional placeholder features (reduced sizes)
@@ -440,8 +508,8 @@ class MultiModalDeepfakeDataset(Dataset):
             'audio_spectrogram': audio_spectrogram,
             'label': label,
             'deepfake_type': 0,
-            'original_video_frames': None,
-            'original_audio': None,
+            'original_video_frames': torch.zeros((self.max_frames, 3, 224, 224)),
+            'original_audio': torch.zeros(self.audio_length),
             'fake_periods': [],
             'timestamps': [],
             'transcript': '',
@@ -498,11 +566,11 @@ class MultiModalDeepfakeDataset(Dataset):
                     frame_indices = list(range(total_frames))
                     # Repeat frames if not enough
                     if len(frame_indices) < self.max_frames:
-                        frame_indices = frame_indices * math.ceil(self.max_frames / len(frame_indices))
-                        frame_indices = frame_indices[:self.max_frames]
+                        repeat_times = math.ceil(self.max_frames / max(len(frame_indices), 1))
+                        frame_indices = (frame_indices * repeat_times)[:self.max_frames]
                 else:
                     # Random frame sampling during training
-                    frame_indices = sorted(random.sample(range(total_frames), self.max_frames))
+                    frame_indices = sorted(random.sample(range(total_frames), min(self.max_frames, total_frames)))
             else:
                 # Evenly distributed frames for validation/testing
                 frame_indices = np.linspace(0, total_frames - 1, self.max_frames, dtype=int)
@@ -598,8 +666,12 @@ class MultiModalDeepfakeDataset(Dataset):
                             raise ValueError(f"Frame conversion failed: {conversion_error}")
                             
                         
-                        # Detect faces
-                        boxes, probs = self.face_detector.detect(pil_img)
+                        # Detect faces using lazy-initialized detector
+                        detector = self._get_mtcnn()
+                        if detector is None:
+                            boxes, probs = None, None
+                        else:
+                            boxes, probs = detector.detect(pil_img)
                         
                         if boxes is not None and len(boxes) > 0:
                             # Take the face with highest probability
@@ -670,6 +742,9 @@ class MultiModalDeepfakeDataset(Dataset):
                                         self.face_detection_error_count += 1
                                     elif self.face_detection_error_count == self.max_face_detection_errors_to_print:
                                         print("Face detection error limit reached. Suppressing further error messages.")
+                                        self.face_detection_error_count += 1
+                                    else:
+                                        # Silent increment after limit reached
                                         self.face_detection_error_count += 1
                                     landmarks = []  # Reset landmarks on error
                                     
@@ -768,7 +843,15 @@ class MultiModalDeepfakeDataset(Dataset):
                     warnings.warn(f"⚠️ No valid frames extracted from video: {path}")
                 return None, None, None, None
 
-            # Stack frames into a tensor
+            # Stack frames into a tensor - ensure we have the correct number of frames
+            if len(video_frames) < self.max_frames:
+                # Pad with last frame if not enough frames
+                while len(video_frames) < self.max_frames:
+                    video_frames.append(video_frames[-1].clone() if video_frames else torch.zeros(3, 224, 224))
+            elif len(video_frames) > self.max_frames:
+                # Truncate if too many frames
+                video_frames = video_frames[:self.max_frames]
+            
             video_tensor = torch.stack(video_frames)
             
             # Process face crops if available
@@ -868,91 +951,163 @@ class MultiModalDeepfakeDataset(Dataset):
                 warnings.warn(f"⚠️ Audio file not found: {path}")
             return None, None, None
         try:
-            # Load audio with torchaudio
-            audio, sample_rate = torchaudio.load(path)
-            audio = audio.squeeze(0).numpy()
-            
-            original_length = len(audio)
+            # Load audio with torchaudio and keep as tensor to avoid extra copies
+            audio, sample_rate = torchaudio.load(path)  # [channels, time]
+            audio = audio.squeeze(0)  # [time]
+
+            original_length = audio.size(0)
             original_duration = original_length / sample_rate
 
-            # Process audio length
-            if len(audio) > self.audio_length:
+            # Process audio length (tensor ops)
+            if audio.size(0) > self.audio_length:
                 if self.phase == 'train':
-                    # Random crop during training
-                    start = random.randint(0, len(audio) - self.audio_length)
+                    start = random.randint(0, audio.size(0) - self.audio_length)
                     audio = audio[start:start + self.audio_length]
                 else:
-                    # Center crop during validation/testing
-                    start = (len(audio) - self.audio_length) // 2
+                    start = (audio.size(0) - self.audio_length) // 2
                     audio = audio[start:start + self.audio_length]
             else:
-                # Pad if too short
-                padding_needed = self.audio_length - len(audio)
-                audio = np.pad(audio, (0, padding_needed), mode='constant')
+                padding_needed = self.audio_length - audio.size(0)
+                if padding_needed > 0:
+                    audio = torch.nn.functional.pad(audio, (0, padding_needed))
 
-            # Apply audio augmentation if provided
+            # Apply audio augmentation if provided (audiomentations expects numpy)
             if self.audio_transform and self.phase == 'train':
                 try:
-                    audio = self.audio_transform(samples=audio, sample_rate=sample_rate)
+                    audio_np = audio.cpu().numpy()
+                    audio_np = self.audio_transform(samples=audio_np, sample_rate=sample_rate)
+                    audio = torch.tensor(audio_np, dtype=torch.float32)
                 except Exception as audio_transform_error:
-                    if self.logging:
-                        warnings.warn(f"⚠️ Audio transform error for file {path}. Error: {audio_transform_error}")
+                    logger.warning(f"Audio transform error for file {path}: {audio_transform_error}")
 
-            # Compute mel spectrogram for additional audio features
+            # Compute mel spectrogram for additional audio features using torchaudio when possible
             audio_spec = None
             if self.compute_spectrograms:
                 try:
-                    # Compute mel spectrogram
-                    mel_spec = librosa.feature.melspectrogram(
-                        y=audio, 
-                        sr=sample_rate,
-                        n_mels=64,  # Reduced from 128
-                        hop_length=512,
-                        n_fft=2048
-                    )
-                    
-                    # Convert to dB scale
-                    mel_spec = librosa.power_to_db(mel_spec, ref=np.max)
-                    
-                    # Resize to 64x64 (reduced from 128x128)
-                    mel_spec = cv2.resize(mel_spec, (64, 64))
-                    
+                    mel_transform = torchaudio.transforms.MelSpectrogram(sample_rate=sample_rate, n_mels=64, n_fft=2048, hop_length=512)
+                    mel_spec = mel_transform(audio)  # [n_mels, time]
+                    # Convert to dB
+                    try:
+                        db_transform = torchaudio.transforms.AmplitudeToDB(stype='power')
+                        mel_db = db_transform(mel_spec)
+                    except Exception:
+                        mel_db = torchaudio.functional.amplitude_to_DB(mel_spec, multiplier=10.0, amin=1e-10, db_multiplier=0.0)
+
+                    # Resize to 64x64
+                    mel_db = mel_db.unsqueeze(0).unsqueeze(0)  # [1,1,n_mels,T]
+                    mel_db = F.interpolate(mel_db, size=(64, 64), mode='bilinear', align_corners=False).squeeze(0).squeeze(0)
                     # Normalize
-                    mel_spec = (mel_spec - mel_spec.min()) / (mel_spec.max() - mel_spec.min() + 1e-8)
-                    
-                    audio_spec = torch.tensor(mel_spec, dtype=torch.float32).unsqueeze(0)
+                    mel_norm = (mel_db - mel_db.min()) / (mel_db.max() - mel_db.min() + 1e-8)
+                    audio_spec = mel_norm
                 except Exception as e:
-                    if self.logging:
-                        warnings.warn(f"⚠️ Error computing spectrogram: {e}")
-                    audio_spec = torch.zeros((1, 64, 64), dtype=torch.float32)  # Updated to match new size
+                    logger.warning(f"Error computing spectrogram with torchaudio: {e}, falling back to librosa")
+                    try:
+                        audio_np = audio.cpu().numpy()
+                        mel_spec = librosa.feature.melspectrogram(y=audio_np, sr=sample_rate, n_mels=64, hop_length=512, n_fft=2048)
+                        mel_spec = librosa.power_to_db(mel_spec, ref=np.max)
+                        mel_spec = cv2.resize(mel_spec, (64, 64))
+                        mel_spec = (mel_spec - mel_spec.min()) / (mel_spec.max() - mel_spec.min() + 1e-8)
+                        audio_spec = torch.tensor(mel_spec, dtype=torch.float32)
+                    except Exception as e2:
+                        logger.warning(f"Fallback spectrogram error: {e2}")
+                        audio_spec = torch.zeros((1, 64, 64), dtype=torch.float32)
             else:
-                audio_spec = torch.zeros((1, 64, 64), dtype=torch.float32)  # Updated to match new size
-            
-            # NEW: Extract MFCC features
+                audio_spec = torch.zeros((1, 64, 64), dtype=torch.float32)
+
+            # Extract MFCC features (prefer torchaudio)
             mfcc_features = None
             try:
-                # Extract MFCCs
-                mfccs = librosa.feature.mfcc(
-                    y=audio, 
-                    sr=sample_rate, 
-                    n_mfcc=20,  # Reduced from 40
-                    hop_length=512,
-                    n_fft=2048
-                )
-                # Normalize
-                mfccs = (mfccs - np.mean(mfccs)) / (np.std(mfccs) + 1e-8)
-                mfcc_features = torch.tensor(mfccs, dtype=torch.float32)
+                mfcc_transform = torchaudio.transforms.MFCC(sample_rate=sample_rate, n_mfcc=20, melkwargs={'n_fft':2048, 'n_mels':64, 'hop_length':512})
+                mfccs = mfcc_transform(audio)  # [n_mfcc, time]
+                mfccs = (mfccs - mfccs.mean()) / (mfccs.std() + 1e-8)
+                mfcc_features = mfccs
             except Exception as e:
-                if self.logging:
-                    warnings.warn(f"⚠️ Error computing MFCC features: {e}")
-                mfcc_features = torch.zeros((20, 50), dtype=torch.float32)  # Reduced default shape
+                logger.warning(f"Error computing MFCC with torchaudio: {e}, falling back to librosa")
+                try:
+                    audio_np = audio.cpu().numpy()
+                    mfccs = librosa.feature.mfcc(y=audio_np, sr=sample_rate, n_mfcc=20, hop_length=512, n_fft=2048)
+                    mfccs = (mfccs - np.mean(mfccs)) / (np.std(mfccs) + 1e-8)
+                    mfcc_features = torch.tensor(mfccs, dtype=torch.float32)
+                except Exception as e2:
+                    logger.warning(f"Fallback MFCC error: {e2}")
+                    mfcc_features = torch.zeros((20, 50), dtype=torch.float32)
 
-            return torch.tensor(audio, dtype=torch.float32), audio_spec, mfcc_features
+            return audio.to(dtype=torch.float32), audio_spec, mfcc_features
             
         except Exception as e:
             if self.logging:
                 warnings.warn(f"⚠️ Error loading audio file: {path}. Error: {e}")
             return None, None, None
+
+    def _load_audio_minimal(self, path):
+        """Fallback audio loader using librosa for robustness."""
+        try:
+            import librosa as _librosa
+            y, sr = _librosa.load(path, sr=None, mono=True)
+            y = y.astype('float32')
+            tensor = torch.tensor(y, dtype=torch.float32)
+            # pad/trim to audio_length
+            if tensor.size(0) > self.audio_length:
+                start = 0 if self.phase != 'train' else random.randint(0, tensor.size(0) - self.audio_length)
+                tensor = tensor[start:start + self.audio_length]
+            else:
+                pad = self.audio_length - tensor.size(0)
+                if pad > 0:
+                    tensor = torch.nn.functional.pad(tensor, (0, pad))
+            # minimal spectrogram placeholder
+            spect = torch.zeros((64, 64), dtype=torch.float32)
+            mfcc = torch.zeros((20, 50), dtype=torch.float32)
+            return tensor, spect, mfcc
+        except Exception as e:
+            if self.logging:
+                warnings.warn(f"Fallback audio loader failed for {path}: {e}")
+            return None, None, None
+
+    def _load_video_minimal(self, path):
+        """Fallback video loader that reads frames without heavy processing or face detection."""
+        if not path or not os.path.exists(path):
+            if self.logging:
+                warnings.warn(f"Fallback: video file not found: {path}")
+            return None, None, None, None
+        try:
+            cap = cv2.VideoCapture(path)
+            if not cap.isOpened():
+                if self.logging:
+                    warnings.warn(f"Fallback: failed to open video: {path}")
+                return None, None, None, None
+
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            if total_frames <= 0:
+                cap.release()
+                return None, None, None, None
+
+            # Evenly sample frames
+            indices = np.linspace(0, total_frames - 1, self.max_frames, dtype=int)
+            frames = []
+            for fi in indices:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, int(fi))
+                ret, fr = cap.read()
+                if not ret or fr is None:
+                    # insert zeros frame
+                    fr = np.zeros((224, 224, 3), dtype=np.uint8)
+                try:
+                    fr_rgb = cv2.cvtColor(fr, cv2.COLOR_BGR2RGB)
+                except Exception:
+                    fr_rgb = np.zeros((224, 224, 3), dtype=np.uint8)
+                fr_rgb = cv2.resize(fr_rgb, (224, 224))
+                t = torch.tensor(fr_rgb, dtype=torch.float32).permute(2, 0, 1) / 255.0
+                frames.append(t)
+            cap.release()
+            video_tensor = torch.stack(frames)
+            # Minimal placeholders for face features
+            face_embeddings = torch.zeros((1, 256))
+            temporal_consistency = torch.tensor(1.0)
+            facial_landmarks = torch.zeros((self.max_frames, 136), dtype=torch.float32)
+            return video_tensor, face_embeddings, temporal_consistency, facial_landmarks
+        except Exception as e:
+            if self.logging:
+                warnings.warn(f"Fallback video loader error for {path}: {e}")
+            return None, None, None, None
             
     def _extract_metadata_features(self, video_path):
         """Extract metadata features like compression artifacts."""
@@ -1057,12 +1212,11 @@ class MultiModalDeepfakeDataset(Dataset):
             quality = 90
             import uuid
             import time
-            # Create unique filename with process ID and time
-            temp_filename = f"temp_ela_{os.getpid()}_{uuid.uuid4()}.jpg"
-            img.save(temp_filename, 'JPEG', quality=quality)
-            
-            # Read back the saved image
-            saved_img = np.array(Image.open(temp_filename))
+            # Save ELA image in-memory to avoid disk I/O
+            buf = io.BytesIO()
+            img.save(buf, format='JPEG', quality=quality)
+            buf.seek(0)
+            saved_img = np.array(Image.open(buf))
             
             # Calculate absolute difference
             ela = np.abs(first_frame.astype(np.float32) - saved_img.astype(np.float32))
@@ -1076,13 +1230,7 @@ class MultiModalDeepfakeDataset(Dataset):
             # Normalize
             ela_normalized = ela_resized / ela_resized.max() if ela_resized.max() > 0 else ela_resized
             
-            # Clean up
-            if os.path.exists(temp_filename):
-                try:
-                    os.remove(temp_filename)
-                except Exception:
-                    # If file is still being used, don't crash
-                    pass
+            # In-memory approach uses no temp files to clean up
 
             return torch.tensor(ela_normalized, dtype=torch.float32)
             
@@ -1174,22 +1322,18 @@ class MultiModalDeepfakeDataset(Dataset):
                 if len(frame.shape) == 3 and frame.shape[0] == 3:
                     frame = frame.permute(1, 2, 0).cpu().numpy()
                 elif len(frame.shape) == 3 and frame.shape[2] == 3:
-                    # Already in HWC format
                     frame = frame.cpu().numpy()
                 else:
-                    # Handle unexpected frame shapes
-                    green_values.append(0.5)  # Default value
+                    green_values.append(0.5)
                     continue
                 
-                # Simple skin detection (very basic)
-                r, g, b = frame[:, :, 0], frame[:, :, 1], frame[:, :, 2]
-                skin_mask = (r > 0.4) & (g > 0.2) & (b > 0.2) & (r > g) & (r > b)
-                
-                # If skin detected, get mean green value of skin region
+                frame_ycrcb = cv2.cvtColor((frame * 255).astype(np.uint8), cv2.COLOR_RGB2YCrCb)
+                y, cr, cb = cv2.split(frame_ycrcb)
+                skin_mask = (cr > 135) & (cr < 180) & (cb > 85) & (cb < 135)
                 if np.any(skin_mask):
-                    green_mean = np.mean(g[skin_mask])
+                    green_mean = np.mean(frame[:, :, 1][skin_mask])
                 else:
-                    green_mean = np.mean(g)  # Fallback to full frame
+                    green_mean = np.mean(frame[:, :, 1])
                 
                 green_values.append(green_mean)
             
@@ -1256,23 +1400,20 @@ class MultiModalDeepfakeDataset(Dataset):
                     # Already in HWC format
                     frame = frame.cpu().numpy()
                 else:
-                    # Handle unexpected frame shapes
-                    skin_colors.append([0.5, 0.5, 0.5])  # Default values
+                    skin_colors.append([0.5, 0.5, 0.5])
                     continue
                 
-                # Simple skin detection
-                r, g, b = frame[:, :, 0], frame[:, :, 1], frame[:, :, 2]
-                skin_mask = (r > 0.4) & (g > 0.2) & (b > 0.2) & (r > g) & (r > b)
-                
-                # If skin detected, get mean RGB values of skin region
+                frame_ycrcb = cv2.cvtColor((frame * 255).astype(np.uint8), cv2.COLOR_RGB2YCrCb)
+                y, cr, cb = cv2.split(frame_ycrcb)
+                skin_mask = (cr > 135) & (cr < 180) & (cb > 85) & (cb < 135)
                 if np.any(skin_mask):
-                    r_mean = np.mean(r[skin_mask])
-                    g_mean = np.mean(g[skin_mask])
-                    b_mean = np.mean(b[skin_mask])
+                    r_mean = np.mean(frame[:, :, 0][skin_mask])
+                    g_mean = np.mean(frame[:, :, 1][skin_mask])
+                    b_mean = np.mean(frame[:, :, 2][skin_mask])
                 else:
-                    r_mean = np.mean(r)  # Fallback to full frame
-                    g_mean = np.mean(g)
-                    b_mean = np.mean(b)
+                    r_mean = np.mean(frame[:, :, 0])
+                    g_mean = np.mean(frame[:, :, 1])
+                    b_mean = np.mean(frame[:, :, 2])
                 
                 skin_colors.append([r_mean, g_mean, b_mean])
             
@@ -1615,7 +1756,9 @@ def get_data_loaders(
     shuffle=True, num_workers=2, max_samples=None, detect_faces=True,
     compute_spectrograms=True, temporal_features=True, enhanced_preprocessing=True,
     enhanced_augmentation=False, multiprocessing_context=None, 
-    use_mixup=True, mixup_alpha=0.2, cutmix_prob=0.3
+    use_mixup=True, mixup_alpha=0.2, cutmix_prob=0.3, class_weights_mode='balanced',
+    oversample_minority=False,
+    label_assignment_fn=None
 ):
     """
     Load data loaders with an option to restrict the maximum number of samples.
@@ -1644,6 +1787,7 @@ def get_data_loaders(
     """
     # Store if we're using MixUp
     using_mixup = enhanced_augmentation and use_mixup
+   
     mixup_fn = None
     
     # Get transforms for training and validation
@@ -1675,8 +1819,12 @@ def get_data_loaders(
         detect_faces=detect_faces,
         compute_spectrograms=compute_spectrograms,
         temporal_features=temporal_features,
-        enhanced_preprocessing=enhanced_preprocessing
+        enhanced_preprocessing=enhanced_preprocessing,
+        label_assignment_fn=label_assignment_fn
     )
+    # Set class_weights_mode after initialization and recalculate weights
+    train_dataset.class_weights_mode = class_weights_mode
+    train_dataset.class_weights = train_dataset._calculate_class_weights()
     
     # Create validation dataset
     val_dataset = MultiModalDeepfakeDataset(
@@ -1691,6 +1839,9 @@ def get_data_loaders(
         temporal_features=temporal_features,
         enhanced_preprocessing=enhanced_preprocessing
     )
+    # Set class_weights_mode after initialization and recalculate weights
+    val_dataset.class_weights_mode = class_weights_mode
+    val_dataset.class_weights = val_dataset._calculate_class_weights()
     
     # Create test dataset
     test_dataset = MultiModalDeepfakeDataset(
@@ -1705,6 +1856,9 @@ def get_data_loaders(
         temporal_features=temporal_features,
         enhanced_preprocessing=enhanced_preprocessing
     )
+    # Set class_weights_mode after initialization and recalculate weights
+    test_dataset.class_weights_mode = class_weights_mode
+    test_dataset.class_weights = test_dataset._calculate_class_weights()
     
     # Get total number of valid samples
     num_samples = len(train_dataset)
@@ -1743,6 +1897,22 @@ def get_data_loaders(
     # Get class weights for weighted sampling
     class_weights = train_dataset.class_weights
 
+    # Safety: prevent extremely large class weight ratios which destabilize training
+    try:
+        if isinstance(class_weights, torch.Tensor) and class_weights.numel() == 2:
+            w0 = float(class_weights[0].item())
+            w1 = float(class_weights[1].item())
+            if w1 == 0:
+                ratio = float('inf')
+            else:
+                ratio = max(w0 / w1, w1 / w0)
+            if ratio > 3.0:
+                print(f"[DATA LOADER] Warning: computed class weight ratio {ratio:.2f} is large. Overriding to safer weights [2.0, 1.0].")
+                class_weights = torch.tensor([2.0, 1.0], dtype=torch.float32)
+    except Exception:
+        # If anything goes wrong, keep the computed weights
+        pass
+
     # Handle multiprocessing context for safety
     mp_context = None
     if num_workers > 0 and multiprocessing_context:
@@ -1754,16 +1924,62 @@ def get_data_loaders(
             mp_context = None
 
     # Create data loaders
-    train_loader_kwargs = {
-        'dataset': train_dataset,
-        'batch_size': batch_size,
-        'sampler': train_sampler,
-        'num_workers': num_workers,
-        'pin_memory': False,  # Disabled for Windows compatibility (causes "invalid device pointer" crash)
-        'drop_last': False,
-        'collate_fn': collate_fn,
-        'persistent_workers': False,  # Disabled for Windows compatibility (num_workers > 0 can cause hangs)
-    }
+    # If oversample_minority is requested, create a Subset dataset for the train indices
+    # and use a WeightedRandomSampler to oversample the minority class (Real=0 by default)
+    if oversample_minority:
+        # Build subset dataset
+        subset_train_dataset = Subset(train_dataset, train_indices)
+
+        # Compute labels for the subset and class counts
+        labels_subset = []
+        for i in range(len(train_indices)):
+            actual_idx = train_dataset.valid_indices[train_indices[i]]
+            sample = train_dataset.data[actual_idx]
+            if label_assignment_fn is not None:
+                lbl = label_assignment_fn(sample)
+            else:
+                lbl = 1 if sample.get('n_fakes', 0) > 0 else 0
+            labels_subset.append(lbl)
+
+        # Count classes on the subset
+        from collections import Counter
+        c = Counter(labels_subset)
+        class_count_0 = c.get(0, 0)
+        class_count_1 = c.get(1, 0)
+        total_subset = len(labels_subset)
+
+        # Avoid division by zero
+        class_count_0 = max(1, class_count_0)
+        class_count_1 = max(1, class_count_1)
+
+        # Inverse frequency weighting (so minority has higher weight)
+        weight_per_class = {0: total_subset / class_count_0, 1: total_subset / class_count_1}
+        sample_weights = [weight_per_class[lbl] for lbl in labels_subset]
+
+        sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(sample_weights), replacement=True)
+
+        train_loader_kwargs = {
+            'dataset': subset_train_dataset,
+            'batch_size': batch_size,
+            'sampler': sampler,
+            'num_workers': num_workers,
+            'pin_memory': False,
+            'drop_last': False,
+            'collate_fn': collate_fn,
+            'persistent_workers': False,
+        }
+        print(f"[DATA LOADER] Oversampling enabled: subset size={len(subset_train_dataset)}, class_counts={dict(c)}")
+    else:
+        train_loader_kwargs = {
+            'dataset': train_dataset,
+            'batch_size': batch_size,
+            'sampler': train_sampler,
+            'num_workers': num_workers,
+            'pin_memory': False,  # Disabled for Windows compatibility (causes "invalid device pointer" crash)
+            'drop_last': False,
+            'collate_fn': collate_fn,
+            'persistent_workers': False,  # Disabled for Windows compatibility (num_workers > 0 can cause hangs)
+        }
     if mp_context is not None:
         train_loader_kwargs['multiprocessing_context'] = mp_context
     
@@ -1824,65 +2040,45 @@ def collate_fn(batch):
     
     for key in all_keys:
         values = [item.get(key) for item in batch]
-        
-        # Filter out None values but keep track of positions
         valid_values = []
         valid_indices = []
         for i, v in enumerate(values):
             if v is not None:
                 valid_values.append(v)
                 valid_indices.append(i)
-        
         if key in ['video_frames', 'audio', 'audio_spectrogram', 'facial_landmarks', 'mfcc_features', 'pulse_signal', 'skin_color_variations', 'head_pose', 'eye_blink_features', 'frequency_features']:
-            # These are critical tensors that must have consistent batch dimensions
-            if valid_values and all(isinstance(v, torch.Tensor) for v in valid_values):
-                try:
-                    # If we have the full batch, just stack
+            try:
+                if valid_values and all(isinstance(v, torch.Tensor) for v in valid_values):
                     if len(valid_values) == actual_batch_size:
-                        # Check if all tensors have the same shape
                         ref_shape = valid_values[0].shape
                         if all(v.shape == ref_shape for v in valid_values):
-                            # Clone tensors to avoid memory sharing issues
                             cloned_tensors = [v.clone() for v in valid_values]
                             result[key] = torch.stack(cloned_tensors)
                         else:
-                            # Handle different shapes by padding to max dimensions
                             max_shape = list(ref_shape)
                             for v in valid_values[1:]:
                                 for j in range(len(v.shape)):
                                     max_shape[j] = max(max_shape[j], v.shape[j])
-                            
-                            # Pad all tensors to max shape
                             padded_tensors = []
                             for v in valid_values:
                                 if list(v.shape) == max_shape:
                                     padded_tensors.append(v.clone())
                                 else:
-                                    # Create padding specification
                                     pad_spec = []
                                     for j in range(len(v.shape)):
                                         pad_amount = max_shape[j] - v.shape[j]
-                                        pad_spec = [0, pad_amount] + pad_spec  # PyTorch padding is reversed
-                                    
+                                        pad_spec = [0, pad_amount] + pad_spec
                                     padded = torch.nn.functional.pad(v, pad_spec)
                                     padded_tensors.append(padded.clone())
-                            
                             result[key] = torch.stack(padded_tensors)
                     else:
-                        # Missing some values, create full batch tensor with zeros
                         ref_shape = valid_values[0].shape
                         full_batch_tensor = torch.zeros(actual_batch_size, *ref_shape, dtype=valid_values[0].dtype)
-                        
-                        # Fill in the valid values at their correct positions
                         for i, valid_idx in enumerate(valid_indices):
                             if valid_idx < actual_batch_size:
                                 full_batch_tensor[valid_idx] = valid_values[i].clone()
-                        
                         result[key] = full_batch_tensor
-                        
-                except Exception as e:
-                    print(f"[ERROR] Failed to collate {key}: {e}")
-                    # Fallback: create empty tensor with correct batch size
+                else:
                     if key == 'video_frames':
                         result[key] = torch.zeros(actual_batch_size, 16, 3, 224, 224)
                     elif key == 'audio':
@@ -1905,8 +2101,12 @@ def collate_fn(batch):
                         result[key] = torch.zeros(actual_batch_size, 1, 16, 16)
                     else:
                         result[key] = None
-            else:
-                # Create appropriate zero tensor for missing data
+                if isinstance(result[key], torch.Tensor):
+                    zero_count = (result[key] == 0).all(dim=tuple(range(1, result[key].ndim))).sum().item()
+                    if actual_batch_size > 0 and zero_count / actual_batch_size > 0.5:
+                        print(f"[WARNING] More than 50% zero tensors in batch for key '{key}' ({zero_count}/{actual_batch_size})")
+            except Exception as e:
+                print(f"[ERROR] Failed to collate {key}: {e}")
                 if key == 'video_frames':
                     result[key] = torch.zeros(actual_batch_size, 16, 3, 224, 224)
                 elif key == 'audio':
@@ -1929,7 +2129,6 @@ def collate_fn(batch):
                     result[key] = torch.zeros(actual_batch_size, 1, 16, 16)
                 else:
                     result[key] = None
-                    
         elif key in ['ela_features', 'metadata_features', 'face_embeddings', 'temporal_consistency']:
             # Optional tensor features
             if valid_values and all(isinstance(v, torch.Tensor) for v in valid_values):

@@ -110,52 +110,43 @@ class EnhancedCrossModalFusion(nn.Module):
     def forward(self, visual_features, audio_features):
         """
         Args:
-            visual_features: Visual features tensor of shape [batch_size, visual_dim]
-            audio_features: Audio features tensor of shape [batch_size, audio_dim]
-            
+            visual_features: Visual features tensor of shape [batch_size, seq_len, visual_dim] or [batch_size, visual_dim]
+            audio_features: Audio features tensor of shape [batch_size, seq_len, audio_dim] or [batch_size, audio_dim]
         Returns:
             Fused features tensor of shape [batch_size, fusion_dim]
         """
+        # Shape assertions
+        assert visual_features.dim() in [2, 3], "visual_features must be [batch, seq_len, dim] or [batch, dim]"
+        assert audio_features.dim() in [2, 3], "audio_features must be [batch, seq_len, dim] or [batch, dim]"
         batch_size = visual_features.size(0)
-        
+        # If input is [batch, dim], unsqueeze to [batch, 1, dim]
+        if visual_features.dim() == 2:
+            visual_features = visual_features.unsqueeze(1)
+        if audio_features.dim() == 2:
+            audio_features = audio_features.unsqueeze(1)
         # Project to common space
         v_proj = self.visual_proj(visual_features)
         a_proj = self.audio_proj(audio_features)
-        
-        # Reshape for attention: [batch_size, 1, dim]
-        v_proj_reshaped = v_proj.unsqueeze(1)
-        a_proj_reshaped = a_proj.unsqueeze(1)
-        
+        # True cross-sequence attention: use all sequence steps
+        v_proj_t = v_proj.transpose(0, 1)  # [seq_len, batch, fusion_dim]
+        a_proj_t = a_proj.transpose(0, 1)
         # Cross attention: visual attending to audio
-        v_attend_a, _ = self.visual_attn(
-            v_proj_reshaped, a_proj_reshaped, a_proj_reshaped
-        )
-        v_attend_a = v_attend_a.squeeze(1)
-        
+        v_attend_a, _ = self.visual_attn(v_proj_t, a_proj_t, a_proj_t)
+        v_attend_a = v_attend_a.transpose(0, 1).mean(dim=1)  # [batch, fusion_dim]
         # Cross attention: audio attending to visual
-        a_attend_v, _ = self.audio_attn(
-            a_proj_reshaped, v_proj_reshaped, v_proj_reshaped
-        )
-        a_attend_v = a_attend_v.squeeze(1)
-        
+        a_attend_v, _ = self.audio_attn(a_proj_t, v_proj_t, v_proj_t)
+        a_attend_v = a_attend_v.transpose(0, 1).mean(dim=1)
         # Apply gating mechanism
-        v_combined = torch.cat([v_proj, v_attend_a], dim=1)
-        a_combined = torch.cat([a_proj, a_attend_v], dim=1)
-        
+        v_combined = torch.cat([v_proj.mean(dim=1), v_attend_a], dim=1)
+        a_combined = torch.cat([a_proj.mean(dim=1), a_attend_v], dim=1)
         v_gate = self.visual_gate(v_combined)
         a_gate = self.audio_gate(a_combined)
-        
-        v_gated = v_proj * v_gate + v_attend_a * (1 - v_gate)
-        a_gated = a_proj * a_gate + a_attend_v * (1 - a_gate)
-        
-        # Apply normalization (residual connection)
-        v_out = self.norm1(v_gated + v_proj)
-        a_out = self.norm2(a_gated + a_proj)
-        
-        # Concatenate and project to output dim
+        v_gated = v_proj.mean(dim=1) * v_gate + v_attend_a * (1 - v_gate)
+        a_gated = a_proj.mean(dim=1) * a_gate + a_attend_v * (1 - a_gate)
+        v_out = self.norm1(v_gated + v_proj.mean(dim=1))
+        a_out = self.norm2(a_gated + a_proj.mean(dim=1))
         combined = torch.cat([v_out, a_out], dim=1)
         output = self.output_proj(combined)
-        
         return output
 
 
@@ -181,35 +172,27 @@ class FocalLossWithLogits(nn.Module):
         BCE_loss = F.binary_cross_entropy_with_logits(
             logits, target, reduction='none'
         )
-        
         # Get the probabilities
         if logits.size(-1) > 1:
-            # Multi-class
             prob = F.softmax(logits, dim=-1)
             prob_for_target = torch.gather(prob, 1, target.unsqueeze(1))
             prob_for_target = prob_for_target.squeeze(1)
         else:
-            # Binary
             prob_for_target = torch.sigmoid(logits)
             prob_for_target = torch.where(target > 0.5, prob_for_target, 1 - prob_for_target)
-        
-        # Calculate focal term
         focal_weight = (1 - prob_for_target) ** self.gamma
-        
-        # Apply alpha (class weighting)
+        # Per-class alpha support
         if logits.size(-1) > 1:
-            # Multi-class - apply alpha to all classes
-            alpha_weight = torch.ones_like(target) * self.alpha
+            if isinstance(self.alpha, torch.Tensor):
+                alpha_weight = self.alpha[target]
+            else:
+                alpha_weight = torch.ones_like(target) * self.alpha
         else:
-            # Binary - apply alpha to positive class
-            alpha_weight = torch.where(target > 0.5, 
-                                      torch.ones_like(target) * self.alpha,
-                                      torch.ones_like(target) * (1 - self.alpha))
-        
-        # Combine weights with BCE loss
+            if isinstance(self.alpha, torch.Tensor):
+                alpha_weight = torch.where(target > 0.5, self.alpha[1], self.alpha[0])
+            else:
+                alpha_weight = torch.where(target > 0.5, torch.ones_like(target) * self.alpha, torch.ones_like(target) * (1 - self.alpha))
         loss = alpha_weight * focal_weight * BCE_loss
-        
-        # Apply reduction
         if self.reduction == 'mean':
             return loss.mean()
         elif self.reduction == 'sum':
@@ -309,35 +292,20 @@ class PeriodicalFeatureExtractor(nn.Module):
             Tensor of shape [batch_size, hidden_dim] containing periodical features
         """
         batch_size, seq_len, _ = x.shape
-        
-        # Encode features
-        encoded = self.encoder(x)  # [batch, seq_len, hidden_dim]
-        
-        # Apply FFT to detect periodic patterns
-        # Move to CPU for FFT, then back to original device
-        device = x.device
-        encoded_cpu = encoded.cpu()
-        
-        # Apply FFT along sequence dimension
-        fft_features = torch.fft.rfft(encoded_cpu, dim=1)
-        
-        # Get magnitude spectrum
+        assert x.device.type in ['cpu', 'cuda'], "Input tensor must be on CPU or CUDA device"
+        encoded = self.encoder(x)
+        # Use GPU FFT if available
+        if encoded.device.type == 'cuda':
+            fft_features = torch.fft.rfft(encoded, dim=1)
+        else:
+            fft_features = torch.fft.rfft(encoded.cpu(), dim=1)
         magnitude = torch.abs(fft_features)
-        
-        # Move back to original device
-        magnitude = magnitude.to(device)
-        
-        # Pool across frequency domain
-        # Take mean and max pooling
-        freq_mean = torch.mean(magnitude, dim=1)  # [batch, hidden_dim]
-        freq_max, _ = torch.max(magnitude, dim=1)  # [batch, hidden_dim]
-        
-        # Combine statistics
+        if encoded.device.type == 'cuda':
+            magnitude = magnitude.to(encoded.device)
+        freq_mean = torch.mean(magnitude, dim=1)
+        freq_max, _ = torch.max(magnitude, dim=1)
         combined = freq_mean + freq_max
-        
-        # Further processing
         output = self.freq_analyzer(combined)
-        
         return output
 
 
@@ -350,26 +318,30 @@ class MultiScaleFeatureFusion(nn.Module):
         super().__init__()
         self.input_dim = input_dim
         self.scales = scales
-        
-        # Create a processing layer for each scale
+        # Distribute input channels across scales. If input_dim is not divisible by
+        # the number of scales, distribute the remainder to the first few scales.
+        n_scales = len(scales)
+        base = input_dim // n_scales
+        rem = input_dim - base * n_scales
+        out_channels = [base + (1 if i < rem else 0) for i in range(n_scales)]
+
+        # Ensure sum(out_channels) == input_dim
+        assert sum(out_channels) == input_dim, "Internal channel distribution error"
+
         self.scale_processors = nn.ModuleList([
             nn.Sequential(
-                nn.Conv1d(input_dim, input_dim // len(scales), kernel_size=scale, 
-                         stride=scale, padding=0),
+                nn.Conv1d(input_dim, out_ch, kernel_size=scale, stride=scale, padding=0),
                 nn.ReLU(),
-                nn.BatchNorm1d(input_dim // len(scales))
+                nn.BatchNorm1d(out_ch)
             )
-            for scale in scales
+            for out_ch, scale in zip(out_channels, scales)
         ])
-        
-        # Fusion layer to combine multi-scale features
         self.fusion = nn.Sequential(
             nn.Linear(input_dim, input_dim),
             nn.ReLU(),
             nn.Dropout(0.2),
             nn.Linear(input_dim, input_dim)
         )
-        
     def forward(self, x):
         """
         Args:
@@ -379,24 +351,13 @@ class MultiScaleFeatureFusion(nn.Module):
             Tensor of shape [batch_size, input_dim] containing multi-scale features
         """
         batch_size, seq_len, feat_dim = x.shape
-        
-        # Transpose for Conv1d: [batch, features, sequence]
+        assert feat_dim == self.input_dim, f"Feature dim {feat_dim} does not match input_dim {self.input_dim}"
         x_transposed = x.transpose(1, 2)
-        
-        # Process at each scale
         scale_features = []
         for scale_idx, processor in enumerate(self.scale_processors):
-            # Apply convolution at this scale
-            scaled_feat = processor(x_transposed)  # [batch, feat_dim//num_scales, seq_len//scale]
-            
-            # Global average pooling
-            pooled = F.adaptive_avg_pool1d(scaled_feat, 1).squeeze(-1)  # [batch, feat_dim//num_scales]
+            scaled_feat = processor(x_transposed)
+            pooled = F.adaptive_avg_pool1d(scaled_feat, 1).squeeze(-1)
             scale_features.append(pooled)
-        
-        # Concatenate all scales
-        multi_scale = torch.cat(scale_features, dim=1)  # [batch, feat_dim]
-        
-        # Fuse multi-scale features
+        multi_scale = torch.cat(scale_features, dim=1)
         output = self.fusion(multi_scale)
-        
         return output
