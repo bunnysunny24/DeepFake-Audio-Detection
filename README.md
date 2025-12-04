@@ -8,6 +8,59 @@
 
 A comprehensive multimodal deepfake detection framework leveraging both audio and video streams. This project fuses computer vision, audio analysis, digital forensics, and physiological signal processing to robustly detect and explain deepfake manipulations.
 
+---
+
+## 🎯 Latest Results (November 11, 2025)
+
+### ⚠️ CRITICAL BUG DISCOVERED & FIXED ⚠️
+
+**2-Month Debugging Journey Complete!**
+
+**Root Cause Identified:** Class weights were **NEVER passed** to datasets during training, causing [1.0, 1.0] equal weights instead of [1.4528, 0.8095] balanced weights for 3.22:1 imbalanced dataset (76% fake, 24% real).
+
+**Bug Impact:**
+- Model learned "76% of data is fake → predict FAKE when uncertain = 76% accuracy"
+- **LAV-DF Performance:** 90% (same distribution as training)
+- **Samsung Performance:** 48% (different distribution)
+- **External Videos:** 0% (real-world test)
+- **Pattern:** Predicted FAKE for ALL videos with 70-80% confidence
+
+**✅ FIX APPLIED (November 10, 2025):**
+- Fixed `dataset_loader.py` (lines 1613-1680) - Added `class_weights_mode` parameter
+- Fixed `train_multimodal.py` (lines 1208-1224) - Pass class_weights_mode to datasets
+- Started new training with **correct** class weights [1.4528, 0.8095]
+
+### 🚀 Current Training Progress (Epoch 8/30)
+
+**NEW MODEL** (run_20251110_161212) - Training started Nov 10, 16:12:12
+
+| Epoch | Train Acc | Train F1 | Val Acc | Val F1 (Macro) | AUC | Status |
+|-------|-----------|----------|---------|----------------|-----|--------|
+| 1 | 48.95% | - | **42.00%** | - | 0.52 | Starting point |
+| 2 | 48.20% | - | **35.20%** | - | 0.62 | Learning patterns |
+| 3 | 55.60% | - | **47.60%** | - | 0.70 | Breaking 50% |
+| 4 | 65.70% | - | **66.00%** | - | 0.78 | Major jump |
+| 5 | 72.65% | - | **73.60%** | - | 0.79 | Steady climb |
+| 6 | 76.45% | 0.8404 | **76.40%** | **0.7135** | 0.81 | ⭐ **BEST MODEL** |
+| 7 | 80.30% | 0.8795 | **75.20%** | 0.7091 | 0.83 | Slight val drop |
+| 8 | 82.60% | 0.8795 | **74.40%** | 0.7018 | 0.82 | Validation plateau |
+
+**📊 Performance Improvement:** 42.00% → 76.40% = **+34.4% in 6 epochs** ✅
+
+**🎯 Expected Final Performance (Epochs 15-20):**
+- Samsung Dataset: 48% → **75-80%** accuracy
+- External Videos: 0% → **60-70%** accuracy  
+- REAL Detection: Currently biased → **70-80%** correct REAL predictions
+- Overall Validation: **80-85%** accuracy
+
+**⏱️ Training Status:**
+- Current: Epoch 8/30 completed (Nov 11, 13:31:44)
+- Best model saved: Epoch 6 (Nov 11, 07:35:47)
+- Remaining: 22 epochs (~26-33 hours)
+- Early stopping patience: 12 epochs
+
+---
+
 ## 🔧 Key Features
 
 ### Model Architecture
@@ -21,6 +74,15 @@ A comprehensive multimodal deepfake detection framework leveraging both audio an
   - Blink detection
   - Frequency analysis
   - Facial landmarks (68-point detection)
+
+### Training Innovations (November 2025)
+✅ **Bias Elimination:** Removed hardcoded bias manipulation (±0.30 → ±0.001)
+✅ **Balanced Class Weights:** Changed from sqrt_balanced to balanced (no class preference)
+✅ **Larger Dataset:** Increased from 1000 to 5000 samples
+✅ **Optimized Regularization:** Dropout 0.4 (reduced from 0.5)
+✅ **Extended Training:** Early stopping patience 12 (increased from 8)
+
+---
 
 ## 🚀 Quick Start
 
@@ -123,581 +185,245 @@ The training includes a **three-layer protection** against model collapse:
 
 ---
 
-## 🛡️ Bias Elimination Journey (November 2025)
+## 🛡️ Class Weights Bug Discovery & Fix (November 2025)
 
-### Problem Discovery
-Initial model showed 89% validation accuracy but had **fundamental bias issues**:
-- Predicted 82.7% REAL for ALL videos (both real and fake)
-- Root cause: **TWO sources of bias manipulation in training code**
+### 🔍 The 2-Month Mystery
 
-### Bias Sources Identified & Removed
-
-**1. Initial Bias (±0.30 hardcoded at model creation)**
-- Location: `train_multimodal.py` lines 1308-1311
-- Effect: Forced +0.30 REAL bias, -0.30 FAKE bias
-- Impact: 4.4x stronger than actual features (bias dominated decisions)
-- **Status:** ✅ REMOVED
-
-**2. Adaptive Bias (±0.05 per epoch during validation)**
-- Location: `train_multimodal.py` lines 2079-2084
-- Effect: Adjusted bias based on validation performance
-- Impact: Created fake "learning" that was just bias adjustment
-- **Status:** ✅ REMOVED
-
-**3. Class Weight Bias (sqrt_balanced → balanced)**
-- Old: `sqrt_balanced` gave 1.68x preference to REAL class
-- New: `balanced` treats both classes equally (1.0x each)
-- Impact: Eliminated weight-induced REAL prediction tendency
-- **Status:** ✅ FIXED
-
-### Verification Results
-
-| Metric | OLD (Biased Model) | NEW (Fixed Model) |
-|--------|-------------------|-------------------|
-| **Code Bias** | ±0.300000 | ±0.000927 (99.97% reduction) |
-| **Weight Bias** | 1.68x REAL | 1.0x (balanced) |
-| **Prediction Pattern** | 82.7% REAL for ALL videos | Varies by content |
-| **Feature Strength** | Bias 4.4x > Features | Features dominate |
-| **Learning Type** | Fake (bias adjustment) | Real (feature learning) |
-
-### Mathematical Proof
-
-**OLD Model Decision:**
+**Initial Symptoms:**
 ```
-Score = (Features × Weights) + Bias
-Score_REAL = (0.07 typical features) + (+0.30 bias) = +0.37
-Score_FAKE = (0.07 typical features) + (-0.30 bias) = -0.23
-Result: Always predicts REAL (bias dominates)
+✅ Training: 90% accuracy on LAV-DF  
+❌ Samsung:  48% accuracy (different distribution)
+❌ External: 0% accuracy (real-world videos)
+🚨 Pattern:  ALL videos predicted as FAKE (70-80% confidence)
 ```
 
-**NEW Model Decision:**
-```
-Score = (Features × Weights) + Bias  
-Score_REAL = (Features × Weights) + 0.001
-Score_FAKE = (Features × Weights) - 0.001
-Result: Features control decision (honest learning)
+**Investigation Timeline:**
+1. **Week 1-4:** Suspected augmentation, preprocessing issues ❌
+2. **Week 5-6:** Checked model architecture, loss functions ❌
+3. **Week 7:** Analyzed dataset imbalance (3.22:1 fake:real) 🔍
+4. **Week 8:** **BREAKTHROUGH** - Found class weights always [1.0, 1.0] in logs! 💡
+
+### 🐛 Root Cause Analysis
+
+**The Bug:**
+```python
+# dataset_loader.py (BEFORE FIX)
+def get_data_loaders(json_path, data_dir, batch_size, ...):
+    # ❌ class_weights_mode parameter was MISSING!
+    # Function signature didn't accept it
+    # Datasets created with default [1.0, 1.0] weights
 ```
 
-### Current Status
-- ✅ **No hardcoded bias** (±0.001 residual from learning)
-- ✅ **Balanced class weights** (no preference)
-- ✅ **Pure feature learning** (no shortcuts)
-- ✅ **Honest predictions** (71% accuracy but real progress)
-- 🎯 **Target:** 85-90% accuracy with 5000 samples (in progress)
+**The Impact:**
+```
+Dataset Imbalance: 76% FAKE, 24% REAL (3.22:1 ratio)
+Class Weights Used: [1.0, 1.0] (equal treatment)
+Expected Weights: [1.4528, 0.8095] (REAL gets 1.79× more weight)
 
+Result: Model learned "predict FAKE = 76% accurate on training data"
+        Rather than learning actual visual/audio features
+```
+
+**Evidence from Logs:**
+```
+[CRITICAL DEBUG] Class weights from dataset_loader: tensor([1., 1.])
+[WARNING] Expected [1.4528, 0.8095] for balanced mode
+[ERROR] Model shows FAKE bias - predicts FAKE for all videos
+```
+
+### ✅ The Fix
+
+**Changes Made:**
+
+**1. dataset_loader.py (Lines 1613-1680)**
+```python
+# AFTER FIX
+def get_data_loaders(
+    json_path, data_dir, batch_size,
+    class_weights_mode='balanced',  # ✅ ADDED PARAMETER
+    ...
+):
+    # Create datasets
+    train_dataset = LAVDFDataset(...)
+    val_dataset = LAVDFDataset(...)
+    
+    # ✅ SET class_weights_mode AFTER initialization
+    train_dataset.class_weights_mode = class_weights_mode
+    val_dataset.class_weights_mode = class_weights_mode
+    
+    # ✅ RECALCULATE weights with correct mode
+    train_dataset._calculate_class_weights()
+    val_dataset._calculate_class_weights()
+```
+
+**2. train_multimodal.py (Lines 1208-1224)**
+```python
+# AFTER FIX
+train_loader, val_loader, test_loader = get_data_loaders(
+    class_weights_mode=self.config.class_weights_mode,  # ✅ PASS PARAMETER
+    ...
+)
+```
+
+**Verification Results:**
+```bash
+$ python test_balanced_mode.py
+✅ Class weights: [1.4528, 0.8095]
+✅ REAL weight: 1.79× higher than FAKE
+✅ Matches expected values for 3.22:1 imbalance
+```
+
+### 📊 Before vs After Comparison
+
+| Metric | OLD (Broken) | NEW (Fixed) | Improvement |
+|--------|--------------|-------------|-------------|
+| **Class Weights** | [1.0, 1.0] | [1.4528, 0.8095] | ✅ Correct |
+| **LAV-DF Accuracy** | 90% | 76% → 80%+ | Learning features |
+| **Samsung Accuracy** | 48% | Expected 75-80% | 🎯 Target |
+| **External Videos** | 0% | Expected 60-70% | 🎯 Target |
+| **REAL Detection** | 18% (biased) | Expected 70-80% | 🎯 Target |
+| **Prediction Pattern** | ALL FAKE | Varies by content | ✅ Fixed |
+| **Training Progress** | Stagnant | 42%→76% in 6 epochs | ✅ Working |
+
+### 🎓 Lessons Learned
+
+1. **Always verify parameter passing** - Parameter existed in config but never reached datasets
+2. **Log intermediate values** - [1., 1.] in logs revealed the bug
+3. **Test on multiple distributions** - Samsung/external showed the generalization failure
+4. **Class imbalance is critical** - 3.22:1 ratio requires proper weighting
+5. **Diagnostic tools are essential** - test_balanced_mode.py confirmed the fix
 ---
 
-## 📊 Training Features  
-
-| Parameter | Value | Rationale |--physiological_fps 30   
-
-|-----------|-------|-----------|--optimizer adamw   
-
-| **Focal Gamma** | 1.5 | Moderate focusing on hard examples |--scheduler cosine   
-
-| **Class Weights** | sqrt_balanced | ~1.7x penalty for minority class (Real) |--scheduler_patience 5   
-
-| **Learning Rate** | 5e-5 | Stable convergence without overshooting |--warmup_epochs 1  
-
-| **Batch Size** | 8 | Sufficient for BatchNorm statistics |--early_stopping_patience 10   
-
-| **Warmup Epochs** | 3 | Gradual learning rate warmup |--gradient_clip 1.0   
-
-| **Dropout** | 0.5 | Strong regularization |--amp_enabled   
-
-| **Gradient Clip** | 0.5 | Prevents exploding gradients |--save_intermediate   
-
---save_intermediate_interval 20   
-
------debug   
-
---reduce_frames 8   
-
-## 🏗️ Model Architecture--pin_memory   
-
---resume_checkpoint "/home/srmist54/backend/Models/server_checkpoints/run_20250807_193339/intermediate/checkpoint_epoch_4_batch_20.pth"   
-
-### Multimodal Fusion Pipeline--loss_type focal   
-
---focal_gamma 2.0   
-
-```--focal_alpha 1.0   
-
-┌─────────────────┐     ┌─────────────────┐--dropout_rate 0.3  
-
-│  Video Frames   │     │  Audio Waveform │--class_weights_mode balanced   
-
-│  (3x224x224)    │     │  (16kHz)        │--use_wandb   
-
-└────────┬────────┘     └────────┬────────┘--wandb_project "deepfake-detection-improved"    
-
-         │                       │ --wandb_run_name "focal_loss_balanced_v1"
-
-         ▼                       ▼
-
-  ┌─────────────┐         ┌─────────────┐
-
-  │ EfficientNet│         │  Wav2Vec2   │## PowerShell / Windows laptop variant
-
-  │    -B0      │         │   Base      │
-
-  └──────┬──────┘         └──────┬──────┘Open PowerShell and run these commands (adjust paths to your local Windows paths):
-
-         │                       │
-
-         │ 1280-dim              │ 768-dim```powershell
-
-         │                       │# Set environment variables for this PowerShell session
-
-         └───────────┬───────────┘$env:PYTORCH_CUDA_ALLOC_CONF = 'expandable_segments:True'
-
-                     ▼$env:CUDA_VISIBLE_DEVICES = '0,1,2,3,4,5,6,7'
-
-           ┌──────────────────┐
-
-           │  Attention Fusion│# Change to the Models directory
-
-           │   (2944-dim)     │Set-Location -Path "D:\Bunny\check_lib"
-
-           └─────────┬────────┘
-
-                     ▼# Run training with torchrun (8 processes)
-
-           ┌──────────────────┐torchrun --nproc_per_node=8 --standalone train_multimodal.py \
-
-           │ Transformer (4L) │  --distributed \
-
-           └─────────┬────────┘  --json_path "D:\Bunny\check_lib\combined_data\LAV-DF\metadata.json" \
-
-                     ▼  --data_dir "D:\Bunny\check_lib\combined_data\LAV-DF" \
-
-           ┌──────────────────┐  --output_dir "D:\Bunny\check_lib\server_outputs" \
-
-           │  Classifier      │  --checkpoint_dir "D:\Bunny\check_lib\server_checkpoints" \
-
-           │  [Real / Fake]   │  --batch_size 12 \
-
-           └──────────────────┘  --num_epochs 30 \
-
-```  --learning_rate 1e-4 \
-
-  --enable_face_mesh \
-
-### Advanced Features Extracted  --enable_explainability \
-
-  --use_spectrogram \
-
-- **Visual**: Face detection, facial landmarks (68 points), Error Level Analysis (ELA)  --detect_deepfake_type \
-
-- **Audio**: Spectrograms, frequency analysis, voice artifacts  ## Multimodal Deepfake Model — Training README
-
-- **Physiological**: 
-
-  - Heart rate estimation (rPPG)  This repository contains code to train a multimodal deepfake detection model. This README explains how to run training in a repository-friendly way (no user-specific absolute paths), how to override dataset and output paths, and provides both Linux and PowerShell examples.
-
-  - Skin color consistency analysis
-
-  - Eye blink detection  Important: do not commit datasets, checkpoints, or other large artifacts to version control. Add `./data/`, `./outputs/`, and `./checkpoints/` to `.gitignore`.
-
-  - Head pose estimation
-
-  - Temporal consistency checks  ---
-
-
-
----  ## Recommended repository layout (relative to repo root)
-
-
-
-## 📁 Project Structure  - data/           # place datasets here (ignored by git)
-
-    - LAV-DF/
-
-```      - metadata.json
-
-Models/      - video/
-
-├── train_multimodal.py          # Main training script (3117 lines)      - audio/
-
-├── train_enhanced_model.ps1     # PowerShell launcher with optimal settings  - outputs/        # logs, exported results
-
-├── dataset_loader.py            # LAV-DF dataset loader with balanced sampling  - checkpoints/    # saved model checkpoints
-
-├── multi_modal_model.py         # Model architecture definitions  - train_multimodal.py
-
-├── advanced_model_components.py # Custom layers (attention, fusion, etc.)  - requirements.txt
-
-├── advanced_physiological_analysis.py  # rPPG, blink, pose detection
-
-├── improved_augmentation.py     # Enhanced data augmentation  ---
-
-├── skin_analyzer.py             # Skin color consistency analysis
-
-├── optimize_model.py            # Model optimization utilities  ## Example: Linux (sanitized)
-
-├── predict_deepfake_fixed.py    # Inference script
-
-├── requirements.txt             # Python dependencies  This is a sanitized example — paths are repository-relative so this README is safe to publish.
-
-├── server_checkpoints/          # Saved model checkpoints
-
-│   └── run_YYYYMMDD_HHMMSS/  ```bash
-
-│       ├── best_model.pth       # Best performing model  cd /path/to/repo
-
-│       └── regular/             # Epoch checkpoints  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 --standalone train_multimodal.py \
-
-└── server_outputs/              # Training logs and visualizations    --distributed \
-
-    └── improved_training_log.txt    --json_path ./data/LAV-DF/metadata.json \
-
-```    --data_dir ./data/LAV-DF \
-
-    --output_dir ./outputs \
-
----    --checkpoint_dir ./checkpoints \
-
-    --batch_size 12 --num_epochs 30 --learning_rate 1e-4 \
-
-## 🔧 Installation    --enable_face_mesh --enable_explainability --use_spectrogram --detect_deepfake_type \
-
-    --detect_faces --compute_spectrograms --temporal_features --enhanced_preprocessing \
-
-### Prerequisites    --enhanced_augmentation --enable_advanced_physiological --physiological_fps 30 \
-
-    --optimizer adamw --scheduler cosine --scheduler_patience 5 --warmup_epochs 1 \
-
-- Python 3.12    --early_stopping_patience 10 --gradient_clip 1.0 --amp_enabled --save_intermediate \
-
-- CUDA-capable GPU (tested on NVIDIA GPUs)    --save_intermediate_interval 20 --debug --reduce_frames 8 --pin_memory \
-
-- Windows 10/11 with PowerShell    --resume_checkpoint ./checkpoints/run_xxx/intermediate/checkpoint_epoch_4_batch_20.pth \
-
-    --loss_type focal --focal_gamma 2.0 --focal_alpha 1.0 --dropout_rate 0.3 \
-
-### Setup    --class_weights_mode balanced --use_wandb --wandb_project "deepfake-detection-improved" \
-
-    --wandb_run_name "focal_loss_balanced_v1"
-
-```powershell  ```
-
-# 1. Create virtual environment
-
-python -m venv deepfake-env-312  Notes:
-
-  - Adjust `--nproc_per_node` and `CUDA_VISIBLE_DEVICES` to match your available GPUs. For a single GPU use `--nproc_per_node=1` and `CUDA_VISIBLE_DEVICES=0`.
-
-# 2. Activate environment  - The example above uses 4 GPUs; reduce as needed for a laptop.
-
-.\deepfake-env-312\Scripts\activate.ps1
-
-  ---
-
-# 3. Install dependencies
-
-pip install -r requirements.txt  ## Example: PowerShell (Windows)
-
-
-
-# 4. Download dlib face landmarks model  Open PowerShell in the repository root and run:
-
-# Place shape_predictor_68_face_landmarks.dat in Models/ directory
-
-```  ```powershell
-
-  # set env vars for this session
-
-### Dependencies  $env:PYTORCH_CUDA_ALLOC_CONF = 'expandable_segments:True'
-
-  $env:CUDA_VISIBLE_DEVICES = '0'
-
-```
-
-torch>=2.0.0  # run training (single-GPU example)
-
-torchvision>=0.15.0  Set-Location -Path "C:\path\to\repo"
-
-torchaudio>=2.0.0
-
-opencv-python>=4.8.0  torchrun --nproc_per_node=1 --standalone train_multimodal.py `
-
-librosa>=0.10.0    --distributed `
-
-scikit-learn>=1.3.0    --json_path "./data/LAV-DF/metadata.json" `
-
-numpy>=1.24.0    --data_dir "./data/LAV-DF" `
-
-pillow>=10.0.0    --output_dir "./outputs" `
-
-matplotlib>=3.7.0    --checkpoint_dir "./checkpoints" `
-
-seaborn>=0.12.0    --batch_size 12 `
-
-dlib>=19.24.0    --num_epochs 30 `
-
-mediapipe>=0.10.0    --learning_rate 1e-4 `
-
-```    --enable_face_mesh `
-
-    --enable_explainability `
-
----    --use_spectrogram `
-
-    --detect_deepfake_type `
-
-✅ **Both classes successfully detected!**
-
-    ```bash
-
----    cd /path/to/repo
-
-    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 --standalone train_multimodal.py \
-
-## 🎮 Usage      --distributed \
-
-      --json_path ./data/LAV-DF/metadata.json \
-
-### Training      --data_dir ./data/LAV-DF \
-
-      --output_dir ./outputs \
-
-```powershell      --checkpoint_dir ./checkpoints \
-
-# Full training with current settings (100 samples)      --batch_size 12 --num_epochs 30 --learning_rate 1e-4 \
-
-.\train_enhanced_model.ps1      --enable_face_mesh --enable_explainability --use_spectrogram --detect_deepfake_type \
-
-      --detect_faces --compute_spectrograms --temporal_features --enhanced_preprocessing \
-
-# Custom training      --enhanced_augmentation --enable_advanced_physiological --physiological_fps 30 \
-
-python train_multimodal.py `      --optimizer adamw --scheduler cosine --scheduler_patience 5 --warmup_epochs 1 \
-
-  --json_path "F:\deepfake\backup\LAV-DF\metadata.json" `      --early_stopping_patience 10 --gradient_clip 1.0 --amp_enabled --save_intermediate \
-
-  --data_dir "F:\deepfake\backup\LAV-DF" `      --save_intermediate_interval 20 --debug --reduce_frames 8 --pin_memory \
-
-  --batch_size 8 `      --resume_checkpoint ./checkpoints/run_xxx/intermediate/checkpoint_epoch_4_batch_20.pth \
-
-  --num_epochs 50 `      --loss_type focal --focal_gamma 2.0 --focal_alpha 1.0 --dropout_rate 0.3 \
-
-  --max_samples 100 `      --class_weights_mode balanced --use_wandb --wandb_project "deepfake-detection-improved" \
-
-  --learning_rate 5e-5 `      --wandb_run_name "focal_loss_balanced_v1"
-
-  --focal_gamma 1.5 `    ```
-
-  --class_weights_mode sqrt_balanced `
-
-  --enhanced_preprocessing `    Notes:
-
-  --enhanced_augmentation `    - Adjust `--nproc_per_node` and `CUDA_VISIBLE_DEVICES` to match your available GPUs. For a single GPU use `--nproc_per_node=1` and `CUDA_VISIBLE_DEVICES=0`.
-
-  --enable_skin_color_analysis `    - The example above uses 4 GPUs; reduce as needed for a laptop.
-
-  --enable_advanced_physiological
-
-```    ---
-
-
-
-### Full Training Command (Current)    ## Example: PowerShell (Windows)
-
-
-
-```powershell    Open PowerShell in the repository root and run:
-
-python train_multimodal.py `
-
-  --json_path "F:\deepfake\backup\LAV-DF\metadata.json" `    ```powershell
-
-  --data_dir "F:\deepfake\backup\LAV-DF" `    # set env vars for this session
-
-  --output_dir "F:\deepfake\backup\Models\server_outputs" `    $env:PYTORCH_CUDA_ALLOC_CONF = 'expandable_segments:True'
-
-  --checkpoint_dir "F:\deepfake\backup\Models\server_checkpoints" `    $env:CUDA_VISIBLE_DEVICES = '0'
-
-  --batch_size 8 `
-
-  --num_epochs 50 `    # run training (single-GPU example)
-
-  --max_samples 100 `    Set-Location -Path "C:\path\to\repo"
-
-  --learning_rate 5e-5 `
-
-  --weight_decay 0.001 `    torchrun --nproc_per_node=1 --standalone train_multimodal.py `
-
-  --detect_faces `      --distributed `
-
-  --compute_spectrograms `      --json_path "./data/LAV-DF/metadata.json" `
-
-  --validation_split 0.1 `      --data_dir "./data/LAV-DF" `
-
-  --test_split 0.1 `      --output_dir "./outputs" `
-
-  --optimizer adamw `      --checkpoint_dir "./checkpoints" `
-
-  --scheduler cosine_with_restarts `      --batch_size 12 `
-
-  --warmup_epochs 3 `      --num_epochs 30 `
-
-  --loss_type focal `      --learning_rate 1e-4 `
-
-  --focal_alpha 0.25 `      --enable_face_mesh `
-
-  --focal_gamma 1.5 `      --enable_explainability `
-
-  --class_weights_mode sqrt_balanced `      --use_spectrogram `
-
-  --use_weighted_loss `      --detect_deepfake_type `
-
-  --dropout_rate 0.5 `      --detect_faces `
-
-  --gradient_clip 0.5 `      --compute_spectrograms `
-
-  --early_stopping_patience 8 `      --temporal_features `
-
-  --reduce_frames 10 `      --enhanced_preprocessing `
-
-  --enhanced_preprocessing `      --enhanced_augmentation `
-
-  --enhanced_augmentation `      --enable_advanced_physiological `
-
-  --enable_skin_color_analysis `      --physiological_fps 30 `
-
-  --enable_advanced_physiological `      --optimizer adamw `
-
-  --num_workers 4 `      --scheduler cosine `
-
-  --amp_enabled `      --scheduler_patience 5 `
-
-  --wandb_run_name "anti_degenerate_training" `      --warmup_epochs 1 `
-
-  --log_file "F:\deepfake\backup\Models\server_outputs\improved_training_log.txt"      --early_stopping_patience 10 `
-
-```      --gradient_clip 1.0 `
-
-      --amp_enabled `
-
-### Inference      --save_intermediate `
-
-      --save_intermediate_interval 20 `
-
-```powershell      --debug `
-
-python predict_deepfake_fixed.py `      --reduce_frames 8 `
-
-  --video_path "path/to/video.mp4" `      --pin_memory `
-
-  --checkpoint "server_checkpoints/run_XXXXXX/best_model.pth"      --resume_checkpoint "./checkpoints/run_xxx/intermediate/checkpoint_epoch_4_batch_20.pth" `
-
-```      --loss_type focal `
-
-      --focal_gamma 2.0 `
-
----      --focal_alpha 1.0 `
-
-      --dropout_rate 0.3 `
-
-## 📊 Dataset      --class_weights_mode balanced `
-
-      --use_wandb `
-
-### LAV-DF (Large-scale Audio-Visual Deepfake Dataset)      --wandb_project "deepfake-detection-improved" `
-
-      --wandb_run_name "focal_loss_balanced_v1"
-
-- **Total Samples**: 136,304 videos    ```
-
-- **Class Distribution**: 
-
-  - Real: 36,431 (26.7%)    ---
-
-  - Fake: 99,873 (73.3%)
-
-- **Current Training**: 100 samples (for development)    ## How to customize paths safely (recommended for public repos)
-
-- **Splits**: 80% train, 10% validation, 10% test
-
-    1. Use repository-relative folders (./data, ./outputs, ./checkpoints).
-
-**Metadata Structure:**    2. Keep a small `.env.example` file with variables and add `.env` to `.gitignore` for user-specific overrides.
-
+## 📊 Dataset Information
+
+### COMBINED_DATASET (155,899 videos)
+
+**Composition:**
+- **LAV-DF:** 136,304 videos (87.4%)
+- **Samsung FakeAVCeleb:** 19,595 videos (12.6%)
+- **Location:** `F:\deepfake\backup\COMBINED_DATASET\`
+
+**Class Distribution:**
+- **FAKE:** 118,627 videos (76.1%)
+- **REAL:** 37,272 videos (23.9%)
+- **Imbalance Ratio:** 3.22:1 (FAKE:REAL)
+
+**Training Configuration:**
+- **Train:** 2,000 samples (80%)
+- **Validation:** 250 samples (10%)
+- **Test:** 250 samples (10%)
+- **Class Weights:** [1.4528, 0.8095] (REAL gets 1.79× weight)
+
+**Metadata Structure:**
 ```json
-
-{    Example `.env.example`:
-
+{
   "video_id": "004053",
-
-  "label": "fake",    ```
-
-  "split": "dev",    DATA_DIR=./data
-
-  "video_path": "dev/004053.mp4",    OUTPUT_DIR=./outputs
-
-  "audio_path": "dev/004053.wav"    CHECKPOINT_DIR=./checkpoints
-
-}    ```
-
+  "label": "fake",
+  "split": "dev",
+  "video_path": "LAV-DF/dev/004053.mp4",
+  "audio_path": "LAV-DF/dev/004053.wav"
+}
 ```
 
-    Then users can create their own `.env` or export variables in their shell prior to running.
+---
+
+## 🚀 Quick Start
+
+### Prerequisites
+- **Python:** 3.12
+- **GPU:** NVIDIA RTX 4060 or better (8GB+ VRAM)
+- **CUDA:** 12.4
+- **OS:** Windows 10/11 with PowerShell
+
+### Installation
+
+1. **Clone repository:**
+```powershell
+git clone <repository-url>
+cd Models
+```
+
+2. **Create virtual environment:**
+```powershell
+python -m venv deepfake-env-312
+.\deepfake-env-312\Scripts\Activate.ps1
+```
+
+3. **Install PyTorch with CUDA:**
+```powershell
+pip install torch==2.6.0+cu124 torchvision==0.21.0+cu124 torchaudio==2.6.0+cu124 --index-url https://download.pytorch.org/whl/cu124
+```
+
+4. **Install other dependencies:**
+```powershell
+pip install -r requirements.txt
+```
+
+5. **Download facial landmarks model:**
+- Download `shape_predictor_68_face_landmarks.dat` from [dlib models](http://dlib.net/files/shape_predictor_68_face_landmarks.dat.bz2)
+- Extract to `Models/` directory
 
 ---
 
-    ---
+## 🎮 Training
 
-## 🔬 Key Improvements
+### Current Training (Resume from Epoch 8)
 
-    ## Prerequisites
+```powershell
+# Resume training from checkpoint
+.\train_combined_dataset.ps1
+```
 
-### ✅ Fixed Issues
+**Training Configuration:**
+```powershell
+python train_multimodal.py `
+  --json_path "F:\deepfake\backup\COMBINED_DATASET\metadata.json" `
+  --data_dir "F:\deepfake\backup\COMBINED_DATASET" `
+  --output_dir "F:\deepfake\backup\Models\server_outputs" `
+  --checkpoint_dir "F:\deepfake\backup\Models\server_checkpoints" `
+  --resume_checkpoint "F:\deepfake\backup\Models\server_checkpoints\run_20251110_161212\regular\checkpoint_epoch_7_acc_0.7520_f1_0.7091.pth" `
+  --batch_size 10 `
+  --num_epochs 30 `
+  --max_samples 2500 `
+  --learning_rate 5e-5 `
+  --weight_decay 0.001 `
+  --class_weights_mode balanced `
+  --loss_type focal `
+  --focal_alpha 0.25 `
+  --focal_gamma 3.0 `
+  --optimizer adamw `
+  --scheduler cosine_with_restarts `
+  --warmup_epochs 3 `
+  --early_stopping_patience 12 `
+  --dropout_rate 0.4 `
+  --gradient_clip 0.5 `
+  --detect_faces `
+  --compute_spectrograms `
+  --enhanced_preprocessing `
+  --enhanced_augmentation `
+  --enable_skin_color_analysis `
+  --enable_advanced_physiological `
+  --amp_enabled
+```
 
-    - Python 3.11
+### Training Timeline
+- **Per Epoch:** ~2.5 hours (RTX 4060)
+- **Total Epochs:** 30 (early stopping at 12 patience)
+- **Expected Completion:** ~26-33 hours remaining
+- **Best Model:** Saved at epoch 6 (76.4% val accuracy)
 
-1. **Class Weight Float16 Bug** → Explicit `dtype=torch.float32` in weight calculation    - Create a virtualenv or conda env (conda recommended on Windows for native libs)
+### Monitoring Training
 
-2. **BatchNorm Validation Collapse** → Use `model.train()` for first 3 epochs    - Install PyTorch matching your CUDA/CPU via https://pytorch.org
+```powershell
+# Check recent training progress
+Get-Content "F:\deepfake\backup\Models\server_outputs\combined_lavdf_samsung_log.txt" -Tail 20
 
-3. **Argmax Bias** → Replaced with threshold-based predictions (0.50)    - Install the rest of the deps:
+# Check best model timestamp
+Get-ChildItem "F:\deepfake\backup\Models\server_checkpoints\run_20251110_161212\best_model.pth" | Select LastWriteTime
 
-4. **Probability Imbalance** → Adaptive logit bias correction (±0.05)
-
-5. **Degenerate Solutions** → Three-layer emergency protection system    ```bash
-
-    pip install -r requirements.txt
-
-### 📝 Documentation    ```
-
-
-
-- `VALIDATION_SUCCESS.md` - Complete fix documentation    For Windows, if `dlib` or `mediapipe` fail to build use conda-forge: `conda install -c conda-forge dlib mediapipe`.
-
-- `BATCHNORM_FIX.md` - BatchNorm collapse analysis
-
-- `THRESHOLD_VS_ARGMAX.md` - Prediction method comparison    ---
-
-- `improved_training_log.txt` - Detailed training logs
-
-    ## Quick troubleshooting
-
----
-
-    - OOM (out-of-memory): lower `--batch_size` or use `--amp_enabled`.
-
-## 🎯 Performance Metrics    - Missing torch distributed features: ensure PyTorch was installed from the official wheels matching your CUDA/CPU.
-
-    - dlib build failures: install Visual Studio Build Tools + CMake or use conda-forge prebuilt packages.
-
-### Target Metrics
-
-    ---
-
-- **Accuracy**: >90% on test set
-- **Macro F1**: >0.85 (balanced performance)
-- **Real Class Recall**: >85% (critical for security)
-- **Fake Class Recall**: >90%
-- **AUC-ROC**: >0.95
+# Monitor GPU usage
+nvidia-smi
+```
 
 
 
@@ -784,4 +510,5 @@ For questions or issues:
 1. Check the troubleshooting section
 2. Review training logs in `server_outputs/`
 3. Create an issue with error details and configuration
+
 
