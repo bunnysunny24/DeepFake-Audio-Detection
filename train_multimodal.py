@@ -1,5 +1,5 @@
 """
-🔥 IMPROVED DEEPFAKE DETECTION TRAINING SCRIPT 🔥
+🔥 ADVANCED DEEPFAKE DETECTION TRAINING SCRIPT 🔥
 
 # Global debug flag for verbose logging
 DEBUG_MODE = False
@@ -29,29 +29,53 @@ if '--print_model_symbols' in sys.argv:
         print(f"[ERROR] Model file not found: {model_path}")
     sys.exit(0)
 
+✅ MULTIMODAL ARCHITECTURE (42 COMPONENTS):
+   - Facial Analysis: Landmarks, micro-expressions, head pose, eye dynamics, lip-audio sync
+   - Physiological Signals: Heartbeat, blood flow, thermal patterns, breathing, pulse signal, skin color, HRV
+   - Audio Analysis: Voice biometrics, MFCC, pitch consistency, voice stress (jitter/shimmer/HNR)
+   - Emotional Analysis: Stress, anxiety, fear, anger detection from voice patterns
+   - Visual Forensics: ELA, compression artifacts, metadata analysis, digital signatures
+   - Advanced Components: Temporal consistency, self-attention, multi-scale fusion
+
+✅ PRODUCTION ROBUSTNESS:
+   - Social Media Compression: Instagram, TikTok, WhatsApp, YouTube (multi-round)
+   - Resolution Degradation: 4 quality levels (high/mid/low/very_low)
+   - Adaptive Lighting: Low-light, overexposed, shadows, color temperature shifts
+   - Demographic Fairness: Balanced sampling across skin tones, age, gender
+   - Domain Adaptation: Adversarial training for distribution shift handling
+
+✅ COMPONENT DIVERSITY (AUXILIARY LOSSES):
+   - Per-component auxiliary classifiers (physiological, facial, audio, visual, forensic)
+   - Diversity penalty to prevent feature correlation
+   - Silent module detection (flags components with <1% contribution)
+   - Component contribution tracking with exponential moving average
+   - Prevents overfitting in 40+ component model
+
+✅ QUANTIZATION-AWARE TRAINING (QAT):
+   - Prepares model for INT8 deployment (4x smaller, 2-4x faster)
+   - FakeQuantize modules simulate quantization during training
+   - Post-training conversion to INT8 with <2% accuracy drop
+   - Export to PyTorch (.pth) and ONNX for production deployment
+
 ✅ CLASS IMBALANCE FIXES:
-   - Focal Loss: Focuses on hard examples, reduces easy example weight
-   - Class-balanced loss functions with proper weighting
-   - Macro F1 scoring: Better metric for imbalanced datasets
+   - Focal Loss: Focuses on hard examples (α, γ tunable)
+   - Class-balanced weights with multiple modes
+   - Macro F1 as primary metric for balanced evaluation
    - Per-class metrics tracking (Real vs Fake performance)
-   - Option for minority class oversampling
 
 ✅ OVERFITTING PREVENTION:
-   - Dropout regularization in model layers
-   - L2 weight decay regularization
-   - Early stopping based on Macro F1 (not just accuracy)
-   - Gradient clipping for training stability
-   - Enhanced metrics tracking and visualization
-
-✅ IMPROVED EVALUATION:
-   - Macro F1 as primary metric (average of both classes)
-   - Per-class precision, recall, F1 breakdown
-   - Confusion matrix analysis
-   - Real vs Fake performance tracking
+   - Dropout regularization (default 0.2-0.3)
+   - L2 weight decay (default 1e-4)
+   - Early stopping with Macro F1 monitoring
+   - Gradient clipping for stability
+   - Component diversity enforcement
 
 Usage Examples:
-  python train_multimodal.py --loss_type focal --focal_gamma 2.0 --dropout_rate 0.3 --use_weighted_loss
-  python train_multimodal.py --class_weights_mode balanced --oversample_minority --dropout_rate 0.5
+  # Full training with all features
+  python train_multimodal.py --loss_type focal --dropout_rate 0.2 --enable_qat --enhanced_augmentation
+  
+  # Production deployment training (30 epochs with QAT from epoch 15)
+  python train_multimodal.py --num_epochs 30 --enable_qat --qat_start_epoch 15 --qat_backend fbgemm
 """
 
 """
@@ -463,7 +487,7 @@ def plot_metrics(train_values, val_values, metric_name, epoch, save_dir="plots")
         return None
 
 
-def plot_confusion_matrix(y_true, y_pred, epoch, save_dir="plots"):
+def plot_confusion_matrix(y_true, y_pred, epoch, save_dir="plots", split='val'):
     """Plot confusion matrix and save to file."""
     try:
         import matplotlib
@@ -494,17 +518,18 @@ def plot_confusion_matrix(y_true, y_pred, epoch, save_dir="plots"):
             for (i, j), val in np.ndenumerate(cm):
                 plt.text(j, i, int(val), ha='center', va='center')
 
-        plt.title(f"Confusion Matrix - Epoch {epoch}")
+        split_label = split.capitalize()
+        plt.title(f"Confusion Matrix ({split_label}) - Epoch {epoch}")
         plt.xlabel("Predicted Label")
         plt.ylabel("True Label")
         plt.xticks([0, 1], ["Real", "Fake"])
         plt.yticks([0, 1], ["Real", "Fake"])
 
-        cm_path = os.path.join(save_dir, f"confusion_matrix_epoch_{epoch}.png")
+        cm_path = os.path.join(save_dir, f"confusion_matrix_{split}_epoch_{epoch}.png")
         plt.savefig(cm_path, dpi=150, bbox_inches='tight')
         plt.close()
 
-        print(f"[DEBUG] Confusion matrix saved successfully: {cm_path}")
+        print(f"[DEBUG] {split_label} confusion matrix saved successfully: {cm_path}")
         return cm_path
         
     except Exception as e:
@@ -1053,6 +1078,11 @@ class DeepfakeTrainer:
         # Set up directories
         self.setup_directories()
         
+        # Initialize QAT attributes BEFORE print_training_improvements()
+        self.qat_enabled = config.enable_qat
+        self.qat_start_epoch = config.qat_start_epoch if config.enable_qat else 999
+        self.qat_active = False
+        
         # Print configuration improvements
         self.print_training_improvements()
         # (Removed misplaced epoch-level diagnostics that referenced epoch local variables.)
@@ -1148,8 +1178,24 @@ class DeepfakeTrainer:
         self.best_epoch = 0
         self.early_stop_counter = 0
         
+        # ====== QUANTIZATION-AWARE TRAINING (QAT) SETUP ======
+        # QAT attributes already initialized earlier (before print_training_improvements)
+        self.model_fp32 = None  # Store original FP32 model before QAT
+        
+        if self.qat_enabled and self.is_main_process:
+            print("\n" + "="*80)
+            print("🔧 QUANTIZATION-AWARE TRAINING (QAT) ENABLED")
+            print("="*80)
+            print(f"   QAT will start at epoch: {self.qat_start_epoch}")
+            print(f"   QAT backend: {config.qat_backend}")
+            print(f"   QAT learning rate scale: {config.qat_lr_scale}x")
+            print(f"   Benefits: 4x smaller model, 2-4x faster inference")
+            print("="*80 + "\n")
+        
         # Initialize scaler for mixed precision
         self.scaler = GradScaler() if self.amp_enabled else None
+        # Gradient accumulation steps (default 1)
+        self.grad_accum_steps = max(1, int(getattr(config, 'grad_accum_steps', 1)))
         
         # Create a specific run folder in the checkpoint directory
         # In distributed training, only main process creates the directory
@@ -1963,6 +2009,9 @@ class DeepfakeTrainer:
                     print(f"[MEMORY] High memory usage detected: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
                     clear_gpu_cache()
                 
+                # Start batch timer for throughput calculation
+                batch_timer_start = time.time()
+
                 # Move batch to device with timeout protection
                 print(f"[RANK {self.local_rank}] Moving batch {batch_idx} to device...")
                 batch = move_batch_to_device(batch, self.device, trainer=self)
@@ -2083,7 +2132,9 @@ class DeepfakeTrainer:
                             continue
 
                 # Forward pass with mixed precision
-                self.optimizer.zero_grad()
+                # Zero gradients at accumulation boundaries to support gradient accumulation
+                if (batch_idx % self.grad_accum_steps) == 0:
+                    self.optimizer.zero_grad()
 
                 # Count successful vs failed samples for debugging
                 success_count = 0
@@ -2177,6 +2228,31 @@ class DeepfakeTrainer:
                         
                         loss = self.criterion(outputs, labels)
                         
+                        # ====== AUXILIARY LOSSES FOR COMPONENT DIVERSITY ======
+                        auxiliary_loss = torch.tensor(0.0, device=outputs.device)
+                        diversity_penalty = torch.tensor(0.0, device=outputs.device)
+                        
+                        if results.get('auxiliary_outputs') is not None:
+                            aux_loss, aux_details = self.model.compute_auxiliary_loss(
+                                results['auxiliary_outputs'], 
+                                labels
+                            )
+                            auxiliary_loss = aux_loss
+                            
+                            # Compute diversity penalty
+                            diversity_penalty = self.model.compute_diversity_penalty(
+                                results.get('component_contributions', {})
+                            )
+                            
+                            # Add to total loss
+                            loss = loss + auxiliary_loss + diversity_penalty
+                            
+                            if self.is_main_process and batch_idx % 10 == 0:
+                                print(f"[AUX LOSS] Aux: {auxiliary_loss.item():.6f}, Diversity: {diversity_penalty.item():.6f}")
+                                for key, value in aux_details.items():
+                                    if 'aux_' in key:
+                                        print(f"  {key}: {value:.6f}")
+                        
                         # Log loss value for all batches
                         if self.is_main_process:
                             print(f"[LOSS] Batch {batch_idx}: {loss.item():.6f}")
@@ -2219,7 +2295,13 @@ class DeepfakeTrainer:
                     
                     # Backward pass with scaler (AMP enabled)
                     try:
-                        self.scaler.scale(loss).backward()
+                        # For gradient accumulation, scale the loss down before backward
+                        if self.grad_accum_steps > 1:
+                            loss_for_backward = loss / float(self.grad_accum_steps)
+                        else:
+                            loss_for_backward = loss
+
+                        self.scaler.scale(loss_for_backward).backward()
                         
                         # Check for NaN in gradients using model method
                         if hasattr(self.model, 'check_for_nan_gradients') and self.model.check_for_nan_gradients():
@@ -2250,9 +2332,33 @@ class DeepfakeTrainer:
                         # Ensure unscale is called at least once before step
                         if not unscale_called:
                             self.scaler.unscale_(self.optimizer)
-                        
-                        self.scaler.step(self.optimizer)
-                        self.scaler.update()
+
+                        # Step only at accumulation boundary
+                        step_now = ((batch_idx + 1) % self.grad_accum_steps == 0) or (batch_idx == len(self.train_loader) - 1)
+                        if step_now:
+                            # Apply any remaining gradient clipping (if model did not handle it)
+                            if self.config.gradient_clip > 0 and not hasattr(self.model, 'clip_gradients'):
+                                nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clip)
+
+                            self.scaler.step(self.optimizer)
+                            self.scaler.update()
+
+                            # Update metrics using unscaled/original loss value
+                            try:
+                                raw_loss_value = float((loss * float(self.grad_accum_steps)).detach().cpu().item()) if self.grad_accum_steps > 1 else float(loss.detach().cpu().item())
+                            except Exception:
+                                raw_loss_value = float(loss.detach().cpu().item())
+                            epoch_loss += raw_loss_value
+                            valid_batch_count += 1
+                            batch_losses.append(raw_loss_value)
+                            probs = torch.softmax(outputs, dim=1)
+                            _, preds = torch.max(outputs, 1)
+                            y_true.extend(labels.cpu().numpy())
+                            y_pred.extend(preds.cpu().numpy())
+                            try:
+                                y_probs.extend(probs[:, 1].detach().cpu().numpy())
+                            except Exception:
+                                y_probs.extend(probs.max(dim=1)[0].detach().cpu().numpy())
                         # GPU memory usage after optimizer step
                         try:
                             if torch.cuda.is_available() and self.is_main_process:
@@ -2260,6 +2366,70 @@ class DeepfakeTrainer:
                                 print(f"[GPU] After optimizer step batch {batch_idx}: allocated={allocated_gb:.2f}GB reserved={reserved_gb:.2f}GB")
                         except Exception:
                             pass
+
+                        # --- Per-batch metrics: throughput, memory, loss, grad-norm, prediction distribution ---
+                        try:
+                            batch_time = time.time() - batch_timer_start if 'batch_timer_start' in locals() else None
+                            samples = int(original_labels.shape[0]) if 'original_labels' in locals() else (int(labels.shape[0]) if 'labels' in locals() else 0)
+                            throughput = (samples / batch_time) if batch_time and batch_time > 0 else None
+
+                            # Ensure we have memory numbers
+                            try:
+                                alloc_gb, reserved_gb = (allocated_gb, reserved_gb) if 'allocated_gb' in locals() else get_gpu_memory_usage()
+                            except Exception:
+                                alloc_gb, reserved_gb = get_gpu_memory_usage()
+
+                            # Gradient norm (L2) across parameters (best-effort)
+                            grad_norm = None
+                            try:
+                                total_norm_sq = 0.0
+                                for p in self.model.parameters():
+                                    if p.grad is not None:
+                                        param_norm = p.grad.data.norm(2)
+                                        total_norm_sq += float(param_norm.item()) ** 2
+                                grad_norm = float(total_norm_sq ** 0.5)
+                            except Exception:
+                                grad_norm = None
+
+                            # Prediction distribution (probs for 'fake' class if available)
+                            pred_mean = pred_std = pred_pct_fake = None
+                            try:
+                                pred_probs = probs[:, 1].detach().cpu()
+                                pred_mean = float(pred_probs.mean().item())
+                                pred_std = float(pred_probs.std().item())
+                                pred_pct_fake = float((pred_probs >= 0.5).float().mean().item())
+                            except Exception:
+                                pass
+
+                            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            time_str = f"{batch_time:.3f}s" if batch_time is not None else "N/A"
+                            thr_str = f"{throughput:.1f} samp/s" if throughput is not None else "N/A"
+                            grad_str = f"{grad_norm:.4f}" if grad_norm is not None else "N/A"
+                            pred_mean_str = f"{pred_mean:.4f}" if pred_mean is not None else "N/A"
+                            pred_std_str = f"{pred_std:.4f}" if pred_std is not None else "N/A"
+                            pred_pct_str = f"{pred_pct_fake:.3f}" if pred_pct_fake is not None else "N/A"
+
+                            log_line = (
+                                f"[METRICS] {timestamp} E{epoch+1} B{batch_idx} "
+                                f"time={time_str} thr={thr_str} "
+                                f"alloc={alloc_gb:.2f}GB res={reserved_gb:.2f}GB "
+                                f"loss={raw_loss_value:.6f} grad_norm={grad_str} "
+                                f"pred_mean={pred_mean_str} pred_std={pred_std_str} pct_fake={pred_pct_str}\n"
+                            )
+                            # Print and persist to log file if available
+                            if self.is_main_process:
+                                try:
+                                    print(log_line.strip())
+                                except Exception:
+                                    pass
+                            if self.log_file:
+                                try:
+                                    self.log_file.write(log_line)
+                                    self.log_file.flush()
+                                except Exception:
+                                    pass
+                        except Exception as metrics_err:
+                            print(f"[METRICS] Error computing metrics for batch {batch_idx}: {metrics_err}")
                         
                     except Exception as scaler_error:
                         print(f"[ERROR] AMP scaler error at batch {batch_idx}: {scaler_error}")
@@ -2305,6 +2475,28 @@ class DeepfakeTrainer:
                     
                     loss = self.criterion(outputs, labels)
                     
+                    # ====== AUXILIARY LOSSES FOR COMPONENT DIVERSITY (Non-AMP path) ======
+                    auxiliary_loss = torch.tensor(0.0, device=outputs.device)
+                    diversity_penalty = torch.tensor(0.0, device=outputs.device)
+                    
+                    if results.get('auxiliary_outputs') is not None:
+                        aux_loss, aux_details = self.model.compute_auxiliary_loss(
+                            results['auxiliary_outputs'], 
+                            labels
+                        )
+                        auxiliary_loss = aux_loss
+                        
+                        # Compute diversity penalty
+                        diversity_penalty = self.model.compute_diversity_penalty(
+                            results.get('component_contributions', {})
+                        )
+                        
+                        # Add to total loss
+                        loss = loss + auxiliary_loss + diversity_penalty
+                        
+                        if self.is_main_process and batch_idx % 10 == 0:
+                            print(f"[AUX LOSS] Aux: {auxiliary_loss.item():.6f}, Diversity: {diversity_penalty.item():.6f}")
+                    
                     # Log loss value for all batches
                     if self.is_main_process:
                         print(f"[LOSS] Batch {batch_idx}: {loss.item():.6f}")
@@ -2319,31 +2511,106 @@ class DeepfakeTrainer:
                         self.nan_count += 1
                         continue
                     
+                    # Support gradient accumulation: average loss across accumulation steps
+                    if self.grad_accum_steps > 1:
+                        loss_for_backward = loss / float(self.grad_accum_steps)
+                    else:
+                        loss_for_backward = loss
+
                     # Backward pass (no AMP)
-                    loss.backward()
-                    
-                    # Gradient clipping
-                    if self.config.gradient_clip > 0:
-                        if hasattr(self.model, 'clip_gradients'):
-                            self.model.clip_gradients(max_norm=self.config.gradient_clip)
-                        else:
-                            nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clip)
-                    
-                    # Optimizer step
-                    self.optimizer.zero_grad()
-                    self.optimizer.step()
-                    
-                    # Track metrics
-                    epoch_loss += loss.item()
-                    valid_batch_count += 1
-                    batch_losses.append(loss.item())
-                    
-                    # Store predictions
-                    probs = torch.softmax(outputs, dim=1)
-                    _, preds = torch.max(outputs, 1)
-                    y_true.extend(labels.cpu().numpy())
-                    y_pred.extend(preds.cpu().numpy())
-                    y_probs.extend(probs[:, 1].detach().cpu().numpy())
+                    loss_for_backward.backward()
+
+                    # Step only at accumulation boundary
+                    step_now = ((batch_idx + 1) % self.grad_accum_steps == 0) or (batch_idx == len(self.train_loader) - 1)
+                    if step_now:
+                        # Gradient clipping
+                        if self.config.gradient_clip > 0:
+                            if hasattr(self.model, 'clip_gradients'):
+                                self.model.clip_gradients(max_norm=self.config.gradient_clip)
+                            else:
+                                nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clip)
+
+                        # Optimizer step and zero grads
+                        self.optimizer.step()
+                        self.optimizer.zero_grad()
+
+                        # Update metrics using original (unscaled) loss value
+                        try:
+                            raw_loss_value = float((loss * float(self.grad_accum_steps)).detach().cpu().item()) if self.grad_accum_steps > 1 else float(loss.detach().cpu().item())
+                        except Exception:
+                            raw_loss_value = float(loss.detach().cpu().item())
+                        epoch_loss += raw_loss_value
+                        valid_batch_count += 1
+                        batch_losses.append(raw_loss_value)
+
+                        # Store predictions
+                        probs = torch.softmax(outputs, dim=1)
+                        _, preds = torch.max(outputs, 1)
+                        y_true.extend(labels.cpu().numpy())
+                        y_pred.extend(preds.cpu().numpy())
+                        try:
+                            y_probs.extend(probs[:, 1].detach().cpu().numpy())
+                        except Exception:
+                            y_probs.extend(probs.max(dim=1)[0].detach().cpu().numpy())
+                        # --- Per-batch metrics (non-AMP path) ---
+                        try:
+                            batch_time = time.time() - batch_timer_start if 'batch_timer_start' in locals() else None
+                            samples = int(original_labels.shape[0]) if 'original_labels' in locals() else (int(labels.shape[0]) if 'labels' in locals() else 0)
+                            throughput = (samples / batch_time) if batch_time and batch_time > 0 else None
+                            try:
+                                alloc_gb, reserved_gb = get_gpu_memory_usage()
+                            except Exception:
+                                alloc_gb, reserved_gb = 0.0, 0.0
+
+                            # Gradient norm (L2) across parameters
+                            grad_norm = None
+                            try:
+                                total_norm_sq = 0.0
+                                for p in self.model.parameters():
+                                    if p.grad is not None:
+                                        param_norm = p.grad.data.norm(2)
+                                        total_norm_sq += float(param_norm.item()) ** 2
+                                grad_norm = float(total_norm_sq ** 0.5)
+                            except Exception:
+                                grad_norm = None
+
+                            pred_mean = pred_std = pred_pct_fake = None
+                            try:
+                                pred_probs = probs[:, 1].detach().cpu()
+                                pred_mean = float(pred_probs.mean().item())
+                                pred_std = float(pred_probs.std().item())
+                                pred_pct_fake = float((pred_probs >= 0.5).float().mean().item())
+                            except Exception:
+                                pass
+
+                            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            time_str = f"{batch_time:.3f}s" if batch_time is not None else "N/A"
+                            thr_str = f"{throughput:.1f} samp/s" if throughput is not None else "N/A"
+                            grad_str = f"{grad_norm:.4f}" if grad_norm is not None else "N/A"
+                            pred_mean_str = f"{pred_mean:.4f}" if pred_mean is not None else "N/A"
+                            pred_std_str = f"{pred_std:.4f}" if pred_std is not None else "N/A"
+                            pred_pct_str = f"{pred_pct_fake:.3f}" if pred_pct_fake is not None else "N/A"
+
+                            log_line = (
+                                f"[METRICS] {timestamp} E{epoch+1} B{batch_idx} "
+                                f"time={time_str} thr={thr_str} "
+                                f"alloc={alloc_gb:.2f}GB res={reserved_gb:.2f}GB "
+                                f"loss={raw_loss_value:.6f} grad_norm={grad_str} "
+                                f"pred_mean={pred_mean_str} pred_std={pred_std_str} pct_fake={pred_pct_str}\n"
+                            )
+                            if self.is_main_process:
+                                try:
+                                    print(log_line.strip())
+                                except Exception:
+                                    pass
+                            if self.log_file:
+                                try:
+                                    self.log_file.write(log_line)
+                                    self.log_file.flush()
+                                except Exception:
+                                    pass
+                        except Exception as metrics_err:
+                            print(f"[METRICS] Error computing metrics for batch {batch_idx}: {metrics_err}")
                     
                     # Add regularization for deepfake type if enabled
                     if self.config.detect_deepfake_type and 'deepfake_type' in results and results['deepfake_type'] is not None:
@@ -2396,6 +2663,14 @@ class DeepfakeTrainer:
         self.metrics['train_f1_scores'].append(f1)
         self.metrics['train_macro_f1_scores'].append(macro_f1)  # Key metric for imbalanced data
         self.metrics['train_auc_scores'].append(auc_score)
+        
+        # Plot confusion matrix for training
+        if self.is_main_process:
+            cm_path = plot_confusion_matrix(y_true, y_pred, epoch+1, self.plot_dir, split='train')
+            
+            # Log confusion matrix to WandB
+            if self.config.use_wandb:
+                wandb.log({f"train_confusion_matrix_epoch_{epoch+1}": wandb.Image(cm_path)})
         
         # Return metrics (include macro F1)
         return avg_loss, accuracy, precision, recall, f1, auc_score, macro_f1
@@ -2710,7 +2985,7 @@ class DeepfakeTrainer:
         
         # Plot confusion matrix
         if self.is_main_process:
-            cm_path = plot_confusion_matrix(y_true, y_pred, epoch+1, self.plot_dir)
+            cm_path = plot_confusion_matrix(y_true, y_pred, epoch+1, self.plot_dir, split='val')
             
             # Log confusion matrix to WandB
             if self.config.use_wandb:
@@ -2933,7 +3208,7 @@ class DeepfakeTrainer:
         
         # Plot confusion matrix for test set
         if self.is_main_process:
-            cm_path = plot_confusion_matrix(y_true, y_pred, 0, self.plot_dir)
+            cm_path = plot_confusion_matrix(y_true, y_pred, 0, self.plot_dir, split='test')
             
             # Log confusion matrix to WandB
             if self.config.use_wandb:
@@ -3042,6 +3317,48 @@ class DeepfakeTrainer:
                 if is_shutdown_requested():
                     print(f"[SHUTDOWN] Shutdown requested before starting epoch {epoch}. Exiting training loop.")
                     break
+
+                # ====== ACTIVATE QUANTIZATION-AWARE TRAINING (QAT) ======
+                if self.qat_enabled and epoch == self.qat_start_epoch and not self.qat_active:
+                    if self.is_main_process:
+                        print("\n" + "="*80)
+                        print(f"🔧 ACTIVATING QUANTIZATION-AWARE TRAINING at Epoch {epoch+1}")
+                        print("="*80)
+                    
+                    # Import QAT utilities
+                    from quantization_utils import prepare_model_for_qat
+                    
+                    # Store original FP32 model
+                    self.model_fp32 = self.model
+                    
+                    # Prepare model for QAT
+                    self.model = prepare_model_for_qat(
+                        self.model,
+                        backend=self.config.qat_backend
+                    )
+                    
+                    # Move to device
+                    self.model = self.model.to(self.device)
+                    
+                    # Wrap with DDP if distributed
+                    if self.distributed:
+                        self.model = DDP(
+                            self.model,
+                            device_ids=[self.local_rank],
+                            output_device=self.local_rank,
+                            find_unused_parameters=True
+                        )
+                    
+                    # Reduce learning rate for QAT phase
+                    for param_group in self.optimizer.param_groups:
+                        param_group['lr'] *= self.config.qat_lr_scale
+                    
+                    self.qat_active = True
+                    
+                    if self.is_main_process:
+                        print(f"✅ QAT activated!")
+                        print(f"✅ Learning rate reduced by {self.config.qat_lr_scale}x")
+                        print("="*80 + "\n")
 
                 epoch_start_time = time.time()
 
@@ -3192,6 +3509,59 @@ class DeepfakeTrainer:
             
             # Load best model for testing
             self.load_best_model()
+            
+            # ====== POST-TRAINING QAT CONVERSION ======
+            if self.qat_enabled and self.qat_active:
+                print("\n" + "="*80)
+                print("🔄 POST-TRAINING: Converting QAT Model to INT8 Quantized Model")
+                print("="*80)
+                
+                from quantization_utils import (
+                    convert_qat_to_quantized,
+                    validate_quantized_model,
+                    export_quantized_model,
+                    get_model_size
+                )
+                
+                # Convert to INT8 quantized model
+                model_quantized = convert_qat_to_quantized(self.model)
+                
+                # Validate quantization accuracy
+                print("\n📊 Validating quantization accuracy...")
+                acc_fp32, acc_int8, degradation = validate_quantized_model(
+                    self.model_fp32 if self.model_fp32 is not None else self.model,
+                    model_quantized,
+                    self.val_loader,
+                    device='cpu'  # Quantized models run on CPU
+                )
+                
+                # Export quantized model
+                quantized_path = os.path.join(self.log_dir, "model_int8_quantized.pth")
+                export_quantized_model(
+                    model_quantized,
+                    quantized_path,
+                    sample_input=None  # Can add sample input for ONNX export
+                )
+                
+                # Save quantization report
+                qat_report = {
+                    'fp32_accuracy': float(acc_fp32),
+                    'int8_accuracy': float(acc_int8),
+                    'accuracy_degradation': float(degradation),
+                    'model_size_fp32_mb': get_model_size(self.model),
+                    'model_size_int8_mb': get_model_size(model_quantized),
+                    'quantization_backend': self.config.qat_backend,
+                    'qat_start_epoch': self.qat_start_epoch,
+                    'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                }
+                
+                qat_report_path = os.path.join(self.log_dir, "qat_report.json")
+                with open(qat_report_path, 'w') as f:
+                    json.dump(qat_report, f, indent=4)
+                
+                print(f"✅ Quantization report saved: {qat_report_path}")
+                print(f"✅ INT8 model exported: {quantized_path}")
+                print("="*80 + "\n")
             
             # Test the model
             test_loss, test_metrics = self.test_model()
@@ -3464,23 +3834,34 @@ class DeepfakeTrainer:
                 'audio': combined_audio
             }
 
-            for key in ['face_embeddings', 'facial_landmarks', 'metadata_features', 'ela_features', 'pulse_signal', 'head_pose', 'eye_blink_features', 'frequency_features']:
+            for key in ['face_embeddings', 'facial_landmarks', 'metadata_features', 'ela_features', 'pulse_signal', 'head_pose', 'eye_blink_features', 'frequency_features', 'mfcc_features', 'skin_color_variations']:
                 if key in batch and batch[key] is not None:
-                    val = batch[key]
-                    if isinstance(val, torch.Tensor):
+                    fake_val = batch[key]
+                    original_key = 'original_' + key
+                    
+                    if isinstance(fake_val, torch.Tensor):
                         try:
-                            combined[key] = torch.cat([val, val], dim=0) if False else torch.cat([val, val], dim=0)
-                        except Exception:
-                            # Try simpler concatenation when originals are provided separately
-                            orig_key = 'original_' + key if ('original_' + key) in batch else None
-                            if orig_key and batch.get(orig_key) is not None:
-                                try:
-                                    combined[key] = torch.cat([val, batch[orig_key]], dim=0)
-                                except Exception:
-                                    # fallback: expand val to match
-                                    combined[key] = torch.cat([val, val], dim=0)
+                            # Use REAL original features if available, otherwise duplicate fake features
+                            if original_key in batch and batch[original_key] is not None:
+                                original_val = batch[original_key]
+                                combined[key] = torch.cat([fake_val, original_val], dim=0)
+                                
+                                # Log verification that features are different
+                                if batch_idx == 0 and key in ['pulse_signal', 'facial_landmarks', 'mfcc_features']:
+                                    fake_mean = fake_val.mean().item()
+                                    orig_mean = original_val.mean().item()
+                                    diff = abs(fake_mean - orig_mean)
+                                    print(f"[CONTRASTIVE] {key}: fake_mean={fake_mean:.4f}, orig_mean={orig_mean:.4f}, diff={diff:.4f}")
                             else:
-                                combined[key] = torch.cat([val, val], dim=0)
+                                # Fallback: duplicate fake features (for features without original versions)
+                                combined[key] = torch.cat([fake_val, fake_val], dim=0)
+                                if batch_idx == 0:
+                                    print(f"[WARNING] No original features for '{key}', using duplicated fake features")
+                        except Exception as e:
+                            # Final fallback: duplicate fake features
+                            combined[key] = torch.cat([fake_val, fake_val], dim=0)
+                            if batch_idx == 0:
+                                print(f"[ERROR] Failed to concatenate {key}: {e}, using duplicated features")
 
             # Build labels: first B = fake (1), next B = original (0)
             B = fake_v.shape[0]
@@ -3583,48 +3964,70 @@ class DeepfakeTrainer:
         print(f"[PAIRWISE] Finished pairwise training: processed_pairs={processed_pairs}, steps={step}")
     
     def print_training_improvements(self):
-        """Print the training improvements for class imbalance and overfitting."""
+        """Print the advanced training configuration details."""
         print("\n" + "="*70)
-        print("🔥 IMPROVED DEEPFAKE DETECTION TRAINING")
+        print("🔥 ADVANCED DEEPFAKE DETECTION TRAINING")
         print("="*70)
         
+        # Multimodal Architecture
+        print("✅ MULTIMODAL ARCHITECTURE (40+ COMPONENTS):")
+        print(f"   🎭 Facial Analysis: Landmarks, micro-expressions, head pose, eye dynamics")
+        print(f"   💓 Physiological: Heartbeat, blood flow, breathing, skin color")
+        print(f"   🎤 Audio: Voice biometrics, MFCC, pitch, spectrogram")
+        print(f"   🔍 Forensics: ELA, compression artifacts, metadata")
+        print(f"   🧠 Advanced: Temporal consistency, attention, multi-scale fusion")
+        
+        # Production Robustness
+        print("\n✅ PRODUCTION ROBUSTNESS:")
+        print(f"   📱 Social Media: Instagram, TikTok, WhatsApp compression (multi-round)")
+        print(f"   📐 Resolution: 4 quality levels (high/mid/low/very_low)")
+        print(f"   💡 Lighting: Low-light, overexposed, shadows, color temperature")
+        print(f"   👥 Fairness: Balanced sampling across demographics")
+        print(f"   🌐 Domain Adaptation: Adversarial training for distribution shift")
+        
+        # Component Diversity
+        print("\n✅ COMPONENT DIVERSITY (AUXILIARY LOSSES):")
+        print(f"   🎯 Per-component auxiliary classifiers (5 key components)")
+        print(f"   🔀 Diversity penalty prevents feature correlation")
+        print(f"   🔇 Silent module detection (<1% contribution flagged)")
+        print(f"   📊 Component contribution tracking with EMA")
+        
+        # Quantization-Aware Training
+        if self.qat_enabled:
+            print("\n✅ QUANTIZATION-AWARE TRAINING (QAT):")
+            print(f"   🔧 Starts at epoch: {self.qat_start_epoch}")
+            print(f"   💾 INT8 deployment: 4x smaller, 2-4x faster inference")
+            print(f"   📉 Target accuracy drop: <2%")
+            print(f"   🚀 Backend: {self.config.qat_backend}")
+        
         # Class Imbalance Fixes
-        print("✅ CLASS IMBALANCE FIXES:")
+        print("\n✅ CLASS IMBALANCE & LOSS:")
         loss_type = getattr(self.config, 'loss_type', 'ce')
         if loss_type == 'focal':
             alpha = getattr(self.config, 'focal_alpha', 1.0)
             gamma = getattr(self.config, 'focal_gamma', 2.0)
-            print(f"   🎯 Focal Loss enabled (α={alpha}, γ={gamma}) - focuses on hard examples")
+            print(f"   🎯 Focal Loss (α={alpha}, γ={gamma}) - focuses on hard examples")
         else:
             print(f"   📊 Cross-Entropy Loss with class weighting")
         
         if getattr(self.config, 'use_weighted_loss', False):
             print(f"   ⚖️ Class-balanced weights enabled")
         
-        if getattr(self.config, 'oversample_minority', False):
-            print(f"   📈 Minority class oversampling enabled")
-        
-        print(f"   📏 Macro F1 as primary metric (balances Real vs Fake performance)")
+        print(f"   📏 Macro F1 as primary metric")
         
         # Overfitting Prevention
         print("\n✅ OVERFITTING PREVENTION:")
         dropout = getattr(self.config, 'dropout_rate', 0.0)
         if dropout > 0:
-            print(f"   🛡️ Dropout regularization: {dropout:.1%}")
+            print(f"   🛡️ Dropout: {dropout:.1%}")
         
         print(f"   📉 L2 Weight decay: {self.config.weight_decay}")
-        print(f"   ⏹️ Early stopping patience: {self.config.early_stopping_patience} epochs")
+        print(f"   ⏹️ Early stopping: {self.config.early_stopping_patience} epochs")
         print(f"   ✂️ Gradient clipping: {self.config.gradient_clip}")
-        
-        # Evaluation Improvements
-        print("\n✅ ENHANCED EVALUATION:")
-        print(f"   🎯 Per-class metrics tracking (Real vs Fake)")
-        print(f"   📊 Confusion matrix analysis")
-        print(f"   🏆 Macro F1 for balanced scoring")
-        print(f"   📈 Training stability monitoring")
+        print(f"   🔀 Component diversity enforcement")
         
         print("="*70)
-        print("Ready to train with bias-resistant configuration! 🚀")
+        print("Ready to train with production-grade configuration! 🚀")
         print("="*70 + "\n")
     
     def run(self):
@@ -3748,6 +4151,12 @@ def parse_args():
     parser.add_argument('--dropout_rate', type=float, default=0.3, help='Dropout rate for regularization (0.0-0.8)')
     parser.add_argument('--l2_reg_strength', type=float, default=1e-4, help='L2 regularization strength')
     
+    # 🔥 Quantization-Aware Training (QAT) for Deployment
+    parser.add_argument('--enable_qat', action='store_true', help='Enable Quantization-Aware Training for INT8 deployment')
+    parser.add_argument('--qat_backend', type=str, default='fbgemm', choices=['fbgemm', 'qnnpack'], help='Quantization backend: fbgemm (x86) or qnnpack (ARM)')
+    parser.add_argument('--qat_start_epoch', type=int, default=15, help='Epoch to start QAT (after initial convergence)')
+    parser.add_argument('--qat_lr_scale', type=float, default=0.1, help='Learning rate scale for QAT phase (0.1 = 10x lower)')
+    
     # Distributed training parameters
     parser.add_argument('--distributed', action='store_true', help='Enable distributed training')
     parser.add_argument('--local_rank', type=int, default=0, help='Local rank for distributed training')
@@ -3777,6 +4186,7 @@ def parse_args():
     parser.add_argument('--disable_skin_analysis', action='store_true', help='Disable memory-intensive skin color analysis for speed')
     parser.add_argument('--disable_advanced_physio', action='store_true', help='Disable advanced physiological analysis for speed')
     parser.add_argument('--fast_mode', action='store_true', help='Enable fast mode with reduced feature extraction')
+    parser.add_argument('--grad_accum_steps', type=int, default=1, help='Gradient accumulation steps to simulate larger batch sizes')
     
     return parser.parse_args()
 

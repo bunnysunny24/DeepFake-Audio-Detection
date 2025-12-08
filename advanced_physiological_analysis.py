@@ -331,6 +331,12 @@ class BloodFlowSkinAnalyzer(nn.Module):
     """
     Advanced skin color pattern analyzer for detecting blood flow changes.
     Analyzes subtle color variations that indicate natural blood circulation.
+    
+    🌡️ THERMAL ANALYSIS:
+    - Analyzes RGB color shifts to infer relative temperature changes
+    - Detects blood flow patterns that correlate with skin temperature
+    - Identifies thermal inconsistencies common in deepfakes
+    - Estimates relative heat distribution across facial regions
     """
     
     def __init__(self, feature_dim=64):
@@ -375,6 +381,26 @@ class BloodFlowSkinAnalyzer(nn.Module):
             nn.ReLU(),
             nn.Dropout(0.3),
             nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1),
+            nn.Sigmoid()
+        )
+        
+        # Thermal pattern analyzer (estimates relative temperature from color shifts)
+        self.thermal_analyzer = nn.Sequential(
+            nn.Conv2d(3, 16, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(16, 32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(32, 16, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(16, 1, kernel_size=1),  # Single channel thermal map
+            nn.Sigmoid()
+        )
+        
+        # Temperature consistency checker
+        self.temp_consistency = nn.Sequential(
+            nn.Linear(64, 32),  # Features from thermal analysis
             nn.ReLU(),
             nn.Linear(32, 1),
             nn.Sigmoid()
@@ -462,6 +488,78 @@ class BloodFlowSkinAnalyzer(nn.Module):
         
         return sync_score
     
+    def estimate_thermal_patterns(self, face_frames):
+        """
+        Estimate relative skin temperature patterns from RGB color shifts.
+        
+        🌡️ THERMAL ESTIMATION METHOD:
+        - Red channel correlates with blood flow (warmer = more red)
+        - Green/Blue ratio indicates oxygenation and temperature
+        - Temporal changes in color indicate thermal variations
+        - Facial regions have characteristic thermal distributions
+        
+        NOTE: This is NOT true thermal imaging, but RGB-based thermal inference
+        """
+        batch_size, num_frames, C, H, W = face_frames.shape
+        
+        thermal_maps = []
+        thermal_features_list = []
+        
+        for t in range(num_frames):
+            frame = face_frames[:, t]  # [batch, 3, H, W]
+            
+            # Generate thermal map from RGB (warmer areas appear redder)
+            thermal_map = self.thermal_analyzer(frame)  # [batch, 1, H, W]
+            thermal_maps.append(thermal_map)
+            
+            # Extract thermal statistics
+            batch_thermal_features = []
+            for b in range(batch_size):
+                tmap = thermal_map[b, 0]  # [H, W]
+                
+                # Thermal statistics
+                mean_temp = torch.mean(tmap)
+                std_temp = torch.std(tmap)
+                max_temp = torch.max(tmap)
+                min_temp = torch.min(tmap)
+                
+                # Regional analysis (divide face into quadrants)
+                h_mid, w_mid = H // 2, W // 2
+                forehead_temp = torch.mean(tmap[:h_mid, :])  # Upper region
+                cheeks_temp = torch.mean(tmap[h_mid:, :])    # Lower region
+                nose_temp = torch.mean(tmap[h_mid-10:h_mid+10, w_mid-10:w_mid+10])  # Central region
+                
+                # Thermal gradient (temperature difference across face)
+                temp_gradient = torch.abs(forehead_temp - cheeks_temp)
+                
+                features = torch.stack([
+                    mean_temp, std_temp, max_temp, min_temp,
+                    forehead_temp, cheeks_temp, nose_temp, temp_gradient
+                ])
+                batch_thermal_features.append(features)
+            
+            thermal_features_list.append(torch.stack(batch_thermal_features))
+        
+        thermal_maps = torch.stack(thermal_maps, dim=1)  # [batch, frames, 1, H, W]
+        thermal_features = torch.stack(thermal_features_list, dim=1)  # [batch, frames, 8]
+        
+        # Temporal thermal consistency
+        thermal_variation = torch.std(thermal_features, dim=1)  # [batch, 8]
+        
+        # Flatten for consistency check
+        thermal_flat = thermal_features.reshape(batch_size, -1)
+        if thermal_flat.shape[1] < 64:
+            # Pad to 64 dimensions
+            padding = torch.zeros(batch_size, 64 - thermal_flat.shape[1], device=thermal_flat.device)
+            thermal_flat = torch.cat([thermal_flat, padding], dim=1)
+        else:
+            thermal_flat = thermal_flat[:, :64]
+        
+        # Check thermal consistency (real faces have consistent thermal patterns)
+        consistency_score = self.temp_consistency(thermal_flat)
+        
+        return thermal_maps, thermal_features, consistency_score
+    
     def forward(self, face_frames):
         """
         Args:
@@ -484,12 +582,18 @@ class BloodFlowSkinAnalyzer(nn.Module):
             # Detect pulse synchronization
             sync_score = self.detect_pulse_synchronization(color_signals)
             
-            # Overall naturalness combining flow and synchronization
-            naturalness = (flow_score + sync_score) / 2
+            # Estimate thermal patterns (RGB-based temperature inference)
+            thermal_maps, thermal_features, thermal_consistency = self.estimate_thermal_patterns(face_frames)
+            
+            # Overall naturalness combining flow, synchronization, and thermal consistency
+            naturalness = (flow_score + sync_score + thermal_consistency) / 3
             
             return {
                 'blood_flow_score': flow_score,
                 'pulse_sync_score': sync_score,
+                'thermal_maps': thermal_maps,
+                'thermal_features': thermal_features,
+                'thermal_consistency': thermal_consistency,
                 'skin_color_signals': color_signals,
                 'skin_masks': skin_masks,
                 'naturalness': naturalness

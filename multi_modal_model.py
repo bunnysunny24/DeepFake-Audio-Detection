@@ -62,11 +62,15 @@ def get_gpu_memory_usage():
 
 
 class AttentionFusion(nn.Module):
-    """Cross-modal attention fusion module."""
+    """Cross-modal attention fusion module with normalization and gating for stability."""
     def __init__(self, visual_dim, audio_dim, output_dim):
         super(AttentionFusion, self).__init__()
         self.visual_projection = nn.Linear(visual_dim, output_dim)
         self.audio_projection = nn.Linear(audio_dim, output_dim)
+        
+        # Normalize each modality BEFORE fusion to stabilize cross-modal variance
+        self.visual_norm = nn.LayerNorm(output_dim)
+        self.audio_norm = nn.LayerNorm(output_dim)
         
         # Cross-attention components
         self.visual_query = nn.Linear(output_dim, output_dim)
@@ -77,6 +81,12 @@ class AttentionFusion(nn.Module):
         self.visual_key = nn.Linear(output_dim, output_dim)
         self.visual_value = nn.Linear(output_dim, output_dim)
         
+        # Gated fusion to prevent one modality from overpowering the other
+        self.gate = nn.Sequential(
+            nn.Linear(output_dim * 2, output_dim),
+            nn.Sigmoid()  # Learn adaptive weighting between modalities
+        )
+        
         # Output layer
         self.fusion_layer = nn.Linear(output_dim * 2, output_dim)
         
@@ -84,9 +94,9 @@ class AttentionFusion(nn.Module):
         self.layer_norm = nn.LayerNorm(output_dim)
         
     def forward(self, visual_features, audio_features):
-        # Project features to common space
-        visual_proj = self.visual_projection(visual_features)
-        audio_proj = self.audio_projection(audio_features)
+        # Project features to common space and normalize
+        visual_proj = self.visual_norm(self.visual_projection(visual_features))
+        audio_proj = self.audio_norm(self.audio_projection(audio_features))
         
         # Visual attending to audio
         v_query = self.visual_query(visual_proj)
@@ -110,10 +120,14 @@ class AttentionFusion(nn.Module):
         
         # Combine attended features
         combined = torch.cat([v_attended_a, a_attended_v], dim=-1)
-        fused = self.fusion_layer(combined)
         
-        # Residual connection and normalization
-        fused = self.layer_norm(fused + visual_proj + audio_proj)
+        # Apply gated fusion for adaptive modality weighting
+        gate_weights = self.gate(combined)
+        fused = self.fusion_layer(combined)
+        fused = fused * gate_weights
+        
+        # Stable residual connection with scaled contribution
+        fused = self.layer_norm(fused + 0.5 * (visual_proj + audio_proj))
         
         return fused
 
@@ -2375,6 +2389,10 @@ class MultiModalDeepfakeModel(nn.Module):
         else:  # Default to simple concat
             self.combined_projection = nn.Linear(self.actual_video_feature_dim + self.actual_audio_feature_dim, transformer_dim)
 
+        # Ensure a combined_projection always exists to avoid creating modules inside forward()
+        if not hasattr(self, 'combined_projection'):
+            self.combined_projection = nn.Linear(self.actual_video_feature_dim + self.actual_audio_feature_dim, transformer_dim)
+
         # Transformer for sequence modeling
         encoder_layer = TransformerEncoderLayer(
             d_model=transformer_dim, 
@@ -2757,6 +2775,14 @@ class MultiModalDeepfakeModel(nn.Module):
         self.feature_adapter = None
         self.expected_classifier_dim = combined_dim  # Expected input dimension for classifier
 
+        # Pre-create adapter for original (non-manipulated) path to avoid
+        # dynamic on-forward creation which can cause DDP/serialization issues.
+        try:
+            self._original_feature_adapter = nn.Linear(768, self.expected_classifier_dim)
+        except Exception:
+            # In case module creation fails for any reason, set placeholder to None
+            self._original_feature_adapter = None
+
         # Learnable inconsistency threshold
         self.deepfake_threshold = nn.Parameter(torch.tensor(20.0), requires_grad=True)
         
@@ -2771,6 +2797,56 @@ class MultiModalDeepfakeModel(nn.Module):
             # 7 (facial) + 9 (physiological) + 6 (visual) + 3 (audio) + 
             # 5 (multimodal) + 3 (forensic) + 6 (advanced) + 1 (contrastive) = 40+
             self.component_weights = nn.Parameter(torch.ones(50), requires_grad=True)  # 50 to allow future expansion
+        
+        # ====== AUXILIARY LOSS COMPONENTS FOR COMPONENT DIVERSITY ======
+        # Per-component auxiliary classifiers to enforce each module learns useful features
+        self.enable_auxiliary_losses = True  # Can be disabled if needed
+        
+        if self.enable_auxiliary_losses:
+            # Key component auxiliary heads (force critical modules to contribute)
+            self.aux_physiological_head = nn.Sequential(
+                nn.Linear(256, 64),
+                nn.ReLU(),
+                nn.Dropout(0.3),
+                nn.Linear(64, 2)
+            )
+            
+            self.aux_facial_head = nn.Sequential(
+                nn.Linear(256, 64),
+                nn.ReLU(),
+                nn.Dropout(0.3),
+                nn.Linear(64, 2)
+            )
+            
+            self.aux_audio_head = nn.Sequential(
+                nn.Linear(self.actual_audio_feature_dim, 128),
+                nn.ReLU(),
+                nn.Dropout(0.3),
+                nn.Linear(128, 2)
+            )
+            
+            self.aux_visual_head = nn.Sequential(
+                nn.Linear(self.actual_video_feature_dim, 128),
+                nn.ReLU(),
+                nn.Dropout(0.3),
+                nn.Linear(128, 2)
+            )
+            
+            self.aux_forensic_head = nn.Sequential(
+                nn.Linear(64, 32),
+                nn.ReLU(),
+                nn.Dropout(0.3),
+                nn.Linear(32, 2)
+            )
+            
+            # Diversity loss weight (learnable)
+            self.diversity_loss_weight = nn.Parameter(torch.tensor(0.1), requires_grad=True)
+            
+            # Component contribution tracking (for detecting "silent" modules)
+            self.register_buffer('component_contribution_ema', torch.zeros(50))
+            self.register_buffer('component_usage_count', torch.zeros(50))
+            
+            print("✅ Auxiliary loss components initialized for component diversity")
 
         # Initialize weights
         self._initialize_weights()
@@ -2979,6 +3055,9 @@ class MultiModalDeepfakeModel(nn.Module):
             eye_blink_features = inputs.get('eye_blink_features')  # From dataset
             frequency_features = inputs.get('frequency_features')  # From dataset
             mfcc_features = inputs.get('mfcc_features')         # From dataset
+            voice_stress_features = inputs.get('voice_stress_features')  # NEW: Jitter/shimmer/HNR from dataset
+            thermal_maps = inputs.get('thermal_maps')           # NEW: RGB-based thermal inference (if available)
+            thermal_features = inputs.get('thermal_features')   # NEW: Thermal statistics (if available)
             
             # Handle missing inputs
             if video_frames is None or audio is None:
@@ -3463,6 +3542,13 @@ class MultiModalDeepfakeModel(nn.Module):
                     component_contributions['blood_flow_patterns'] = blood_flow_results['naturalness']
                     component_contributions['pulse_synchronization'] = blood_flow_results['pulse_sync_score']
                     
+                    # 🆕 Thermal pattern analysis (if available from blood flow analyzer)
+                    if 'thermal_consistency' in blood_flow_results:
+                        component_contributions['thermal_consistency'] = blood_flow_results['thermal_consistency']
+                        if self.debug:
+                            thermal_mean = torch.mean(blood_flow_results['thermal_consistency']).detach().cpu().item()
+                            print(f"[PHYSIO] ✅ Thermal consistency: {thermal_mean:.3f}")
+                    
                     component_contributions['breathing_patterns'] = breathing_results['naturalness']
                     component_contributions['breathing_rate'] = breathing_results['breathing_rate'] / 20  # Normalize for contribution
                     component_contributions['breathing_regularity'] = breathing_results['regularity_score']
@@ -3649,6 +3735,36 @@ class MultiModalDeepfakeModel(nn.Module):
             )
             component_contributions['voice_biometrics'] = voice_bio_consistency
             
+            # 🆕 Voice stress analysis (jitter/shimmer/HNR) - USE DATASET-PROVIDED FEATURES
+            if voice_stress_features is not None:
+                if self.debug:
+                    print(f"[INFO] ✅ Using dataset-provided voice stress features: {voice_stress_features.shape}")
+                # Voice stress features: [jitter, shimmer, hnr, jitter_flag, shimmer_flag, hnr_flag]
+                # Convert to fakeness indicators (higher jitter/shimmer = more fake, lower HNR = more fake)
+                jitter = voice_stress_features[:, 0:1]  # [batch, 1]
+                shimmer = voice_stress_features[:, 1:2]
+                hnr = voice_stress_features[:, 2:3]
+                
+                # Normalize and invert to get "naturalness" scores
+                # Jitter: 0-1% = natural (score 1.0), >2% = synthetic (score 0.0)
+                jitter_naturalness = torch.clamp(1.0 - jitter / 2.0, 0.0, 1.0)
+                # Shimmer: 1-3% = natural (score 1.0), >5% = synthetic (score 0.0)
+                shimmer_naturalness = torch.clamp(1.0 - (shimmer - 1.0) / 4.0, 0.0, 1.0)
+                # HNR: >15 dB = natural (score 1.0), <10 dB = synthetic (score 0.0)
+                hnr_naturalness = torch.clamp((hnr - 10.0) / 10.0, 0.0, 1.0)
+                
+                # Combined voice stress naturalness
+                voice_stress_naturalness = (jitter_naturalness + shimmer_naturalness + hnr_naturalness) / 3.0
+                component_contributions['voice_stress'] = voice_stress_naturalness
+                
+                if self.debug:
+                    print(f"[MODEL] ✅ Voice stress processed: jitter={jitter.mean():.2f}%, shimmer={shimmer.mean():.2f}%, HNR={hnr.mean():.1f} dB")
+            else:
+                if self.debug:
+                    print("[INFO] ⚠️ Voice stress features not provided by dataset")
+                # Fallback: Use neutral score
+                component_contributions['voice_stress'] = torch.ones(batch_size, 1, device=audio_features.device) * 0.5
+            
             # 5. Multimodal Analysis
             # Siamese network comparison for audio-video coherence
             av_similarity = self.siamese_network(audio_features, video_features)
@@ -3747,6 +3863,68 @@ class MultiModalDeepfakeModel(nn.Module):
                         traceback.print_exc()
                     # Continue without advanced features
                     advanced_features_list = []
+            
+            # ====== AUXILIARY LOSS COMPUTATION FOR COMPONENT DIVERSITY ======
+            auxiliary_outputs = {}
+            if self.training and self.enable_auxiliary_losses:
+                try:
+                    # Compute auxiliary predictions from key components
+                    # This forces each module to learn discriminative features
+                    
+                    # 1. Physiological auxiliary head
+                    physiological_feat = component_contributions.get('physiological', 
+                        component_contributions.get('advanced_physiological', torch.zeros(batch_size, 256, device=video_frames.device)))
+                    if physiological_feat.shape[-1] != 256:
+                        physiological_feat = F.adaptive_avg_pool1d(physiological_feat.unsqueeze(1), 256).squeeze(1)
+                    auxiliary_outputs['physiological'] = self.aux_physiological_head(physiological_feat)
+                    
+                    # 2. Facial dynamics auxiliary head
+                    facial_feat = torch.cat([
+                        component_contributions.get('landmark_trajectory', torch.zeros(batch_size, 64, device=video_frames.device)),
+                        component_contributions.get('micro_expressions', torch.zeros(batch_size, 64, device=video_frames.device)),
+                        component_contributions.get('head_pose', torch.zeros(batch_size, 64, device=video_frames.device)),
+                        component_contributions.get('eye_naturalness', torch.zeros(batch_size, 64, device=video_frames.device))
+                    ], dim=-1)
+                    if facial_feat.shape[-1] != 256:
+                        facial_feat = F.adaptive_avg_pool1d(facial_feat.unsqueeze(1), 256).squeeze(1)
+                    auxiliary_outputs['facial'] = self.aux_facial_head(facial_feat)
+                    
+                    # 3. Audio auxiliary head
+                    auxiliary_outputs['audio'] = self.aux_audio_head(audio_features)
+                    
+                    # 4. Visual auxiliary head
+                    auxiliary_outputs['visual'] = self.aux_visual_head(video_features)
+                    
+                    # 5. Forensic auxiliary head
+                    forensic_feat = torch.cat([
+                        component_contributions.get('digital_artifacts', torch.zeros(batch_size, 16, device=video_frames.device)),
+                        component_contributions.get('compression', torch.zeros(batch_size, 16, device=video_frames.device)),
+                        component_contributions.get('ela_score', torch.zeros(batch_size, 16, device=video_frames.device)),
+                        component_contributions.get('metadata_score', torch.zeros(batch_size, 16, device=video_frames.device))
+                    ], dim=-1)
+                    if forensic_feat.shape[-1] != 64:
+                        forensic_feat = F.adaptive_avg_pool1d(forensic_feat.unsqueeze(1), 64).squeeze(1)
+                    auxiliary_outputs['forensic'] = self.aux_forensic_head(forensic_feat)
+                    
+                    # Update component contribution tracking (EMA)
+                    with torch.no_grad():
+                        component_weights_norm = F.softmax(self.component_weights, dim=0)
+                        self.component_contribution_ema = 0.9 * self.component_contribution_ema + 0.1 * component_weights_norm
+                        self.component_usage_count += 1
+                        
+                        # Detect silent modules (contribution < 0.01 after 100 updates)
+                        if self.component_usage_count[0] > 100:
+                            silent_modules = (self.component_contribution_ema < 0.01).nonzero(as_tuple=True)[0]
+                            if len(silent_modules) > 0 and self.debug:
+                                print(f"[WARNING] Silent modules detected (low contribution): {silent_modules.tolist()}")
+                    
+                    if self.debug:
+                        print(f"[AUX LOSS] Generated {len(auxiliary_outputs)} auxiliary predictions")
+                        
+                except Exception as e:
+                    if self.debug:
+                        print(f"[WARNING] Error computing auxiliary losses: {e}")
+                    auxiliary_outputs = {}
             
             # ============================================================================
             # CONTRASTIVE LEARNING FUSION: Combine fake, original, and difference features
@@ -4236,15 +4414,8 @@ class MultiModalDeepfakeModel(nn.Module):
                         else:
                             # Fallback: concatenate and project
                             original_combined = torch.cat([original_video_features, original_audio_features], dim=-1)
-                            if hasattr(self, 'combined_projection'):
-                                original_combined = self.combined_projection(original_combined)
-                            else:
-                                # Last resort: create a simple projection on-the-fly
-                                if not hasattr(self, '_temp_original_projection'):
-                                    self._temp_original_projection = nn.Linear(
-                                        original_combined.shape[-1], 768
-                                    ).to(original_combined.device)
-                                original_combined = self._temp_original_projection(original_combined)
+                            # Use the pre-created combined_projection to project concatenated features
+                            original_combined = self.combined_projection(original_combined)
                         # [4, 768]
                         
                         # Apply transformer fusion (same as fake videos)
@@ -4352,6 +4523,7 @@ class MultiModalDeepfakeModel(nn.Module):
                 'explanation': explanation_data,
                 'component_weights': F.softmax(self.component_weights, dim=0) if self.enable_explainability else None,
                 'component_contributions': component_contributions,
+                'auxiliary_outputs': auxiliary_outputs if self.training and self.enable_auxiliary_losses else None,
                 'detailed_results': results.get('detailed_results', {}),  # Ensure this key always exists
                 'error': None  # Ensure error key exists when no error
             })
@@ -5075,4 +5247,105 @@ class MultiModalDeepfakeModel(nn.Module):
             if self.debug:
                 print(f"Error generating attention maps: {e}")
             return None
+    
+    def compute_auxiliary_loss(self, auxiliary_outputs, labels):
+        """
+        Compute auxiliary losses for component diversity.
+        
+        Args:
+            auxiliary_outputs: Dict of auxiliary predictions from each component
+            labels: Ground truth labels [batch_size]
+            
+        Returns:
+            auxiliary_loss: Combined auxiliary loss
+            loss_details: Dict of individual component losses for logging
+        """
+        if not self.enable_auxiliary_losses or not auxiliary_outputs:
+            return torch.tensor(0.0), {}
+        
+        try:
+            criterion = nn.CrossEntropyLoss()
+            loss_details = {}
+            total_aux_loss = 0.0
+            
+            # Compute loss for each auxiliary head
+            for component_name, predictions in auxiliary_outputs.items():
+                if predictions is not None and labels is not None:
+                    # Handle contrastive doubled batch size
+                    if predictions.shape[0] != labels.shape[0]:
+                        # Take first half (fake samples only)
+                        predictions = predictions[:labels.shape[0]]
+                    
+                    aux_loss = criterion(predictions, labels)
+                    loss_details[f'aux_{component_name}'] = aux_loss.item()
+                    total_aux_loss += aux_loss
+            
+            # Average auxiliary losses
+            if len(auxiliary_outputs) > 0:
+                total_aux_loss = total_aux_loss / len(auxiliary_outputs)
+            
+            # Weight by learnable diversity loss weight
+            weighted_aux_loss = total_aux_loss * torch.abs(self.diversity_loss_weight)
+            loss_details['aux_total'] = total_aux_loss.item()
+            loss_details['diversity_weight'] = torch.abs(self.diversity_loss_weight).item()
+            
+            return weighted_aux_loss, loss_details
+            
+        except Exception as e:
+            if self.debug:
+                print(f"Error computing auxiliary loss: {e}")
+            return torch.tensor(0.0), {}
+    
+    def compute_diversity_penalty(self, component_contributions):
+        """
+        Compute diversity penalty to prevent feature correlation between components.
+        
+        Args:
+            component_contributions: Dict of component feature tensors
+            
+        Returns:
+            diversity_penalty: Penalty for highly correlated features
+        """
+        if not self.enable_auxiliary_losses or len(component_contributions) < 2:
+            return torch.tensor(0.0)
+        
+        try:
+            # Collect all component features
+            features_list = []
+            for key, value in component_contributions.items():
+                if isinstance(value, torch.Tensor) and value.numel() > 0:
+                    # Flatten to [batch, features]
+                    features_list.append(value.view(value.shape[0], -1))
+            
+            if len(features_list) < 2:
+                return torch.tensor(0.0)
+            
+            # Normalize features
+            normalized_features = [F.normalize(f, dim=-1) for f in features_list]
+            
+            # Compute pairwise correlations
+            total_correlation = 0.0
+            num_pairs = 0
+            
+            for i in range(len(normalized_features)):
+                for j in range(i + 1, len(normalized_features)):
+                    # Cosine similarity (already normalized)
+                    correlation = torch.abs(torch.mean(
+                        torch.sum(normalized_features[i] * normalized_features[j], dim=-1)
+                    ))
+                    total_correlation += correlation
+                    num_pairs += 1
+            
+            # Average correlation (we want to minimize this)
+            if num_pairs > 0:
+                diversity_penalty = total_correlation / num_pairs
+            else:
+                diversity_penalty = torch.tensor(0.0)
+            
+            return diversity_penalty * 0.01  # Small weight for diversity
+            
+        except Exception as e:
+            if self.debug:
+                print(f"Error computing diversity penalty: {e}")
+            return torch.tensor(0.0)
                     

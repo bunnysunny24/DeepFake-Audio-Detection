@@ -242,9 +242,11 @@ class MultiModalDeepfakeDataset(Dataset):
                 unpaired_real_count += 1
         
         # Calculate actual training samples
-        # Real count = number of UNIQUE original videos (many fakes may share 1 original)
+        # For paired training: each fake is shown WITH its original, so real_count = paired_count
+        # (even though some originals are reused, the model sees them once per pairing)
+        # Real count = paired originals + unpaired real samples
         # Fake count = all paired fakes + unpaired fakes
-        real_count = len(unique_originals) + unpaired_real_count
+        real_count = paired_count + unpaired_real_count  # Each paired fake brings its original
         fake_count = paired_count + unpaired_fake_count
         total = real_count + fake_count
         
@@ -344,10 +346,16 @@ class MultiModalDeepfakeDataset(Dataset):
             audio_tensor, audio_spectrogram, mfcc_features = self._load_audio(audio_path)
             if audio_tensor is None:
                 raise ValueError(f"Audio loading failed for sample {actual_idx}. Path: {audio_path}")
+            
+            # Extract voice stress features (jitter, shimmer, HNR)
+            voice_stress_features = self._extract_voice_stress(audio_tensor)
 
             # Load original video/audio if needed
             original_video_frames = None
             original_audio_tensor = None
+            original_mfcc_features = None  # Initialize here to ensure it's always defined
+            original_facial_landmarks_raw = None  # Initialize here
+            original_voice_stress_features = None  # Initialize here
             audio_visual_sync_features = None
             
             if sample.get('n_fakes', 0) > 0:
@@ -361,28 +369,39 @@ class MultiModalDeepfakeDataset(Dataset):
                         # if self.logging:
                         #     print(f"🎥 [PAIR] Loading FAKE video: {sample['file']}")
                         #     print(f"🎥 [PAIR] Loading REAL (original) video: {sample['original']}")
-                        original_video_frames, _, _, _ = self._load_video(original_video_path)
+                        # CRITICAL: Capture ALL outputs including landmarks from original video
+                        original_video_frames, original_face_embeddings, original_temporal_consistency, original_facial_landmarks_raw = self._load_video(original_video_path)
                         if original_video_frames is None:
                             # Try a minimal, more tolerant loader as a fallback
                             try:
-                                original_video_frames, _, _, _ = self._load_video_minimal(original_video_path)
+                                original_video_frames, original_face_embeddings, original_temporal_consistency, original_facial_landmarks_raw = self._load_video_minimal(original_video_path)
                                 if original_video_frames is not None and self.logging:
                                     print(f"ℹ️ Fallback minimal original video loader succeeded for sample {actual_idx}")
                             except Exception as fb_err:
                                 if self.logging:
                                     print(f"⚠️ Warning: Original video loading failed for sample {actual_idx}. Path: {original_video_path}. Error: {fb_err}")
+                                # Set to None on failure
+                                original_facial_landmarks_raw = None
 
                 if load_audio_orig and original_audio_path:
-                    original_audio_tensor, _, _ = self._load_audio(original_audio_path)
+                    original_audio_tensor, original_audio_spectrogram, original_mfcc_features = self._load_audio(original_audio_path)
                     if original_audio_tensor is None:
                         # Try a minimal librosa-based fallback
                         try:
-                            original_audio_tensor, _, _ = self._load_audio_minimal(original_audio_path)
+                            original_audio_tensor, original_audio_spectrogram, original_mfcc_features = self._load_audio_minimal(original_audio_path)
                             if original_audio_tensor is not None and self.logging:
                                 print(f"ℹ️ Fallback minimal original audio loader succeeded for sample {actual_idx}")
                         except Exception as fb_err:
                             if self.logging:
                                 print(f"⚠️ Warning: Original audio loading failed for sample {actual_idx}. Path: {original_audio_path}. Error: {fb_err}")
+                            original_mfcc_features = None
+                    
+                    # Extract voice stress from original audio
+                    if original_audio_tensor is not None:
+                        original_voice_stress_features = self._extract_voice_stress(original_audio_tensor)
+                else:
+                    original_mfcc_features = None
+                    original_voice_stress_features = None
 
                 # Extract audio-visual synchronization features (for fake pair)
                 if video_frames is not None and audio_tensor is not None:
@@ -428,6 +447,57 @@ class MultiModalDeepfakeDataset(Dataset):
             
             # NEW: Extract frequency domain features
             frequency_features = self._extract_frequency_features(video_frames)
+            
+            # CRITICAL: Extract features from ORIGINAL video for contrastive learning
+            original_pulse_signal = None
+            original_skin_color_variations = None
+            original_head_pose = None
+            original_eye_blink_features = None
+            original_frequency_features = None
+            original_facial_landmarks = None
+            # original_mfcc_features already extracted from _load_audio() above
+            
+            if original_video_frames is not None:
+                # Extract physiological features from ORIGINAL video
+                if self.enhanced_preprocessing:
+                    original_pulse_signal = self._extract_pulse_signal(original_video_frames)
+                    original_skin_color_variations = self._extract_skin_color_variations(original_video_frames)
+                    original_frequency_features = self._extract_frequency_features(original_video_frames)
+                
+                # Use landmarks already extracted during _load_video() call (line 366)
+                if 'original_facial_landmarks_raw' in locals() and original_facial_landmarks_raw is not None:
+                    # Already a tensor from _load_video(), just normalize shape
+                    original_facial_landmarks = original_facial_landmarks_raw.clone().detach()
+                    if len(original_facial_landmarks) < self.max_frames:
+                        padding = torch.zeros((self.max_frames - len(original_facial_landmarks), 136))
+                        original_facial_landmarks = torch.cat([original_facial_landmarks, padding], dim=0)
+                    elif len(original_facial_landmarks) > self.max_frames:
+                        original_facial_landmarks = original_facial_landmarks[:self.max_frames]
+                    
+                    # Extract derivative features from landmarks
+                    original_head_pose = self._estimate_head_pose(original_facial_landmarks)
+                    original_eye_blink_features = self._extract_eye_blink_patterns(original_video_frames, original_facial_landmarks)
+                else:
+                    # Fallback: create zero tensors if landmarks not available
+                    original_facial_landmarks = torch.zeros((self.max_frames, 136), dtype=torch.float32)
+                    original_head_pose = torch.zeros((self.max_frames, 3), dtype=torch.float32)
+                    original_eye_blink_features = torch.zeros(self.max_frames, dtype=torch.float32)
+            
+            # Ensure ALL original features have fallbacks (if original video not available)
+            if original_mfcc_features is None:
+                original_mfcc_features = torch.zeros((20, 50), dtype=torch.float32)
+            if original_pulse_signal is None:
+                original_pulse_signal = torch.zeros(self.max_frames, dtype=torch.float32)
+            if original_skin_color_variations is None:
+                original_skin_color_variations = torch.zeros((self.max_frames, 3), dtype=torch.float32)
+            if original_head_pose is None:
+                original_head_pose = torch.zeros((self.max_frames, 3), dtype=torch.float32)
+            if original_eye_blink_features is None:
+                original_eye_blink_features = torch.zeros(self.max_frames, dtype=torch.float32)
+            if original_frequency_features is None:
+                original_frequency_features = torch.zeros((1, 16, 16), dtype=torch.float32)
+            if original_facial_landmarks is None:
+                original_facial_landmarks = torch.zeros((self.max_frames, 136), dtype=torch.float32)
             
             # Label: 1 for fake, 0 for real
             label = torch.tensor(1 if sample.get('n_fakes', 0) > 0 else 0, dtype=torch.long)
@@ -479,13 +549,23 @@ class MultiModalDeepfakeDataset(Dataset):
                 'ela_features': ela_features,
                 'audio_visual_sync': audio_visual_sync_features,
                 'file_path': video_path,  # For explainability and error analysis
-                'facial_landmarks': facial_landmarks,  # NEW
-                'mfcc_features': mfcc_features,  # NEW
-                'pulse_signal': pulse_signal,  # NEW
-                'skin_color_variations': skin_color_variations,  # NEW
-                'head_pose': head_pose_features,  # NEW
-                'eye_blink_features': eye_blink_features,  # NEW
-                'frequency_features': frequency_features  # NEW
+                'facial_landmarks': facial_landmarks,  # From FAKE video
+                'mfcc_features': mfcc_features,  # From FAKE audio
+                'voice_stress_features': voice_stress_features,  # NEW: Jitter/shimmer from FAKE audio
+                'pulse_signal': pulse_signal,  # From FAKE video
+                'skin_color_variations': skin_color_variations,  # From FAKE video
+                'head_pose': head_pose_features,  # From FAKE video
+                'eye_blink_features': eye_blink_features,  # From FAKE video
+                'frequency_features': frequency_features,  # From FAKE video
+                # ORIGINAL VIDEO FEATURES (for contrastive learning)
+                'original_facial_landmarks': original_facial_landmarks,
+                'original_mfcc_features': original_mfcc_features,
+                'original_voice_stress_features': original_voice_stress_features,  # NEW: From REAL audio
+                'original_pulse_signal': original_pulse_signal,
+                'original_skin_color_variations': original_skin_color_variations,
+                'original_head_pose': original_head_pose,
+                'original_eye_blink_features': original_eye_blink_features,
+                'original_frequency_features': original_frequency_features
             }
 
             return result
@@ -523,6 +603,7 @@ class MultiModalDeepfakeDataset(Dataset):
         
         # Additional placeholder features (reduced sizes)
         mfcc_features = torch.zeros((20, 50))  # Reduced from (40, 100)
+        voice_stress_features = torch.zeros(6)  # NEW: jitter, shimmer, hnr + flags
         pulse_signal = torch.zeros(self.max_frames)
         skin_color_variations = torch.zeros((self.max_frames, 3))
         head_pose_features = torch.zeros((self.max_frames, 3))  # pitch, yaw, roll
@@ -549,11 +630,21 @@ class MultiModalDeepfakeDataset(Dataset):
             'file_path': 'placeholder',
             'facial_landmarks': facial_landmarks,
             'mfcc_features': mfcc_features,
+            'voice_stress_features': voice_stress_features,  # NEW
             'pulse_signal': pulse_signal,
             'skin_color_variations': skin_color_variations,
             'head_pose': head_pose_features,
             'eye_blink_features': eye_blink_features,
-            'frequency_features': frequency_features
+            # ORIGINAL VIDEO FEATURES (placeholder zeros)
+            'original_facial_landmarks': torch.zeros((self.max_frames, 136)),
+            'original_mfcc_features': torch.zeros((20, 50)),
+            'original_voice_stress_features': torch.zeros(6),  # NEW
+            'original_pulse_signal': torch.zeros(self.max_frames),
+            'original_pulse_signal': torch.zeros(self.max_frames),
+            'original_skin_color_variations': torch.zeros((self.max_frames, 3)),
+            'original_head_pose': torch.zeros((self.max_frames, 3)),
+            'original_eye_blink_features': torch.zeros(self.max_frames),
+            'original_frequency_features': torch.zeros((1, 16, 16))
         }
 
     def _load_video(self, path):
@@ -1648,6 +1739,140 @@ class MultiModalDeepfakeDataset(Dataset):
                 warnings.warn(f"⚠️ Error extracting eye blink patterns: {e}")
             return torch.zeros(self.max_frames, dtype=torch.float32)
     
+    def _extract_voice_stress(self, audio_waveform):
+        """
+        Extract voice stress features: jitter, shimmer, and HNR.
+        
+        Args:
+            audio_waveform: Audio tensor [samples]
+            
+        Returns:
+            Voice stress feature tensor [6]: [jitter, shimmer, hnr, jitter_flag, shimmer_flag, hnr_flag]
+        """
+        try:
+            import numpy as np
+            
+            if audio_waveform is None or audio_waveform.numel() == 0:
+                return torch.zeros(6, dtype=torch.float32)
+            
+            audio_np = audio_waveform.cpu().numpy()
+            sample_rate = 16000  # Default sample rate
+            
+            # Compute jitter (cycle-to-cycle pitch variations)
+            def compute_jitter(audio, sr):
+                try:
+                    frame_length = 2048
+                    hop_length = 512
+                    pitches = []
+                    
+                    for i in range(0, len(audio) - frame_length, hop_length):
+                        frame = audio[i:i+frame_length]
+                        autocorr = np.correlate(frame, frame, mode='full')
+                        autocorr = autocorr[len(autocorr)//2:]
+                        
+                        if len(autocorr) > 1 and autocorr[0] != 0:
+                            autocorr = autocorr / autocorr[0]
+                            min_lag = int(sr / 500)
+                            max_lag = int(sr / 50)
+                            
+                            if max_lag < len(autocorr):
+                                search_range = autocorr[min_lag:max_lag]
+                                if len(search_range) > 0:
+                                    peak_idx = np.argmax(search_range) + min_lag
+                                    pitch = sr / peak_idx if peak_idx > 0 else 0
+                                    pitches.append(pitch)
+                    
+                    if len(pitches) < 2:
+                        return 0.0
+                    
+                    periods = [1.0/p if p > 0 else 0 for p in pitches]
+                    periods = [p for p in periods if p > 0]
+                    
+                    if len(periods) < 2:
+                        return 0.0
+                    
+                    period_diffs = np.abs(np.diff(periods))
+                    avg_period = np.mean(periods)
+                    jitter = np.mean(period_diffs) / avg_period if avg_period > 0 else 0.0
+                    
+                    return float(jitter * 100.0)
+                except:
+                    return 0.0
+            
+            # Compute shimmer (amplitude variations)
+            def compute_shimmer(audio, sr):
+                try:
+                    frame_length = 2048
+                    hop_length = 512
+                    amplitudes = []
+                    
+                    for i in range(0, len(audio) - frame_length, hop_length):
+                        frame = audio[i:i+frame_length]
+                        rms = np.sqrt(np.mean(frame**2))
+                        amplitudes.append(rms)
+                    
+                    if len(amplitudes) < 2:
+                        return 0.0
+                    
+                    amplitudes = np.array(amplitudes)
+                    amplitude_diffs = np.abs(np.diff(amplitudes))
+                    avg_amplitude = np.mean(amplitudes)
+                    shimmer = np.mean(amplitude_diffs) / avg_amplitude if avg_amplitude > 0 else 0.0
+                    
+                    return float(shimmer * 100.0)
+                except:
+                    return 0.0
+            
+            # Compute HNR (Harmonic-to-Noise Ratio)
+            def compute_hnr(audio, sr):
+                try:
+                    frame_length = 2048
+                    hop_length = 512
+                    hnr_values = []
+                    
+                    for i in range(0, len(audio) - frame_length, hop_length):
+                        frame = audio[i:i+frame_length]
+                        autocorr = np.correlate(frame, frame, mode='full')
+                        autocorr = autocorr[len(autocorr)//2:]
+                        
+                        if len(autocorr) > 1 and autocorr[0] > 0:
+                            min_lag = int(sr / 500)
+                            max_lag = int(sr / 50)
+                            
+                            if max_lag < len(autocorr):
+                                search_range = autocorr[min_lag:max_lag]
+                                if len(search_range) > 0:
+                                    max_autocorr = np.max(search_range)
+                                    noise = autocorr[0] - max_autocorr
+                                    if noise > 0:
+                                        hnr = 10 * np.log10(max_autocorr / noise)
+                                        hnr_values.append(hnr)
+                    
+                    if len(hnr_values) == 0:
+                        return 0.0
+                    
+                    return float(np.mean(hnr_values))
+                except:
+                    return 0.0
+            
+            # Extract features
+            jitter = compute_jitter(audio_np, sample_rate)
+            shimmer = compute_shimmer(audio_np, sample_rate)
+            hnr = compute_hnr(audio_np, sample_rate)
+            
+            # Abnormality flags
+            jitter_flag = 1.0 if jitter > 1.0 else 0.0
+            shimmer_flag = 1.0 if shimmer > 3.0 else 0.0
+            hnr_flag = 1.0 if hnr < 10.0 else 0.0
+            
+            features = torch.tensor([jitter, shimmer, hnr, jitter_flag, shimmer_flag, hnr_flag], dtype=torch.float32)
+            return features
+            
+        except Exception as e:
+            if self.logging:
+                warnings.warn(f"⚠️ Error extracting voice stress features: {e}")
+            return torch.zeros(6, dtype=torch.float32)
+    
     def _extract_frequency_features(self, video_frames):
         """Extract frequency domain features to detect artifacts from generative models."""
         try:
@@ -2073,7 +2298,8 @@ def collate_fn(batch):
             if v is not None:
                 valid_values.append(v)
                 valid_indices.append(i)
-        if key in ['video_frames', 'audio', 'audio_spectrogram', 'facial_landmarks', 'mfcc_features', 'pulse_signal', 'skin_color_variations', 'head_pose', 'eye_blink_features', 'frequency_features']:
+        if key in ['video_frames', 'audio', 'audio_spectrogram', 'facial_landmarks', 'mfcc_features', 'pulse_signal', 'skin_color_variations', 'head_pose', 'eye_blink_features', 'frequency_features',
+                   'original_facial_landmarks', 'original_mfcc_features', 'original_pulse_signal', 'original_skin_color_variations', 'original_head_pose', 'original_eye_blink_features', 'original_frequency_features']:
             try:
                 if valid_values and all(isinstance(v, torch.Tensor) for v in valid_values):
                     if len(valid_values) == actual_batch_size:
@@ -2112,19 +2338,19 @@ def collate_fn(batch):
                         result[key] = torch.zeros(actual_batch_size, 8000)
                     elif key == 'audio_spectrogram':
                         result[key] = torch.zeros(actual_batch_size, 1, 64, 64)
-                    elif key == 'facial_landmarks':
+                    elif key == 'facial_landmarks' or key == 'original_facial_landmarks':
                         result[key] = torch.zeros(actual_batch_size, 16, 136)
-                    elif key == 'mfcc_features':
+                    elif key == 'mfcc_features' or key == 'original_mfcc_features':
                         result[key] = torch.zeros(actual_batch_size, 20, 50)
-                    elif key == 'pulse_signal':
+                    elif key == 'pulse_signal' or key == 'original_pulse_signal':
                         result[key] = torch.zeros(actual_batch_size, 16)
-                    elif key == 'skin_color_variations':
+                    elif key == 'skin_color_variations' or key == 'original_skin_color_variations':
                         result[key] = torch.zeros(actual_batch_size, 16, 3)
-                    elif key == 'head_pose':
+                    elif key == 'head_pose' or key == 'original_head_pose':
                         result[key] = torch.zeros(actual_batch_size, 16, 3)
-                    elif key == 'eye_blink_features':
+                    elif key == 'eye_blink_features' or key == 'original_eye_blink_features':
                         result[key] = torch.zeros(actual_batch_size, 16)
-                    elif key == 'frequency_features':
+                    elif key == 'frequency_features' or key == 'original_frequency_features':
                         result[key] = torch.zeros(actual_batch_size, 1, 16, 16)
                     else:
                         result[key] = None
@@ -2140,19 +2366,19 @@ def collate_fn(batch):
                     result[key] = torch.zeros(actual_batch_size, 8000)
                 elif key == 'audio_spectrogram':
                     result[key] = torch.zeros(actual_batch_size, 1, 64, 64)
-                elif key == 'facial_landmarks':
+                elif key == 'facial_landmarks' or key == 'original_facial_landmarks':
                     result[key] = torch.zeros(actual_batch_size, 16, 136)
-                elif key == 'mfcc_features':
+                elif key == 'mfcc_features' or key == 'original_mfcc_features':
                     result[key] = torch.zeros(actual_batch_size, 20, 50)
-                elif key == 'pulse_signal':
+                elif key == 'pulse_signal' or key == 'original_pulse_signal':
                     result[key] = torch.zeros(actual_batch_size, 16)
-                elif key == 'skin_color_variations':
+                elif key == 'skin_color_variations' or key == 'original_skin_color_variations':
                     result[key] = torch.zeros(actual_batch_size, 16, 3)
-                elif key == 'head_pose':
+                elif key == 'head_pose' or key == 'original_head_pose':
                     result[key] = torch.zeros(actual_batch_size, 16, 3)
-                elif key == 'eye_blink_features':
+                elif key == 'eye_blink_features' or key == 'original_eye_blink_features':
                     result[key] = torch.zeros(actual_batch_size, 16)
-                elif key == 'frequency_features':
+                elif key == 'frequency_features' or key == 'original_frequency_features':
                     result[key] = torch.zeros(actual_batch_size, 1, 16, 16)
                 else:
                     result[key] = None

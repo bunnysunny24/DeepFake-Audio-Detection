@@ -1,7 +1,10 @@
+import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 class SkinColorAnalyzer(nn.Module):
     def __init__(self, feature_dim=32):
@@ -69,24 +72,32 @@ class SkinColorAnalyzer(nn.Module):
         try:
             # Detect skin regions
             skin_mask = self.detect_skin(frames)  # [B, T, H, W]
-            skin_features = torch.full((batch_size, num_frames, 3), 0.0, device=device, dtype=frames.dtype)
-            mask_flat = skin_mask.view(batch_size, num_frames, -1)  # [B, T, H*W]
+
+            # Vectorize feature computation to avoid Python loops and repeated small allocations
+            mask_flat = skin_mask.view(batch_size, num_frames, -1).to(dtype=frames.dtype)  # [B, T, H*W]
             frames_flat = frames.view(batch_size, num_frames, 3, -1)  # [B, T, 3, H*W]
-            for c in range(3):
-                channel_vals = frames_flat[:, :, c, :]  # [B, T, H*W]
-                masked_vals = channel_vals * mask_flat.float()
-                skin_counts = mask_flat.sum(dim=-1)
-                skin_counts_safe = skin_counts.clone()
-                skin_counts_safe[skin_counts_safe == 0] = 1
-                skin_sum = masked_vals.sum(dim=-1)
-                skin_mean = skin_sum / skin_counts_safe
-                default_val = torch.tensor([0.5, 0.4, 0.35], device=device, dtype=frames.dtype)[c]
-                skin_mean = torch.where(skin_counts > 0, skin_mean, default_val)
-                skin_features[:, :, c] = skin_mean
-            # Add BatchNorm and learnable projection
-            skin_features_bn = self.bn(skin_features.view(-1, 3)).view(batch_size, num_frames, 3)
+
+            # Broadcast mask over channels and compute per-channel sums: [B, T, 3]
+            masked = frames_flat * mask_flat.unsqueeze(2)  # [B, T, 3, H*W]
+            skin_sum = masked.sum(dim=-1)  # [B, T, 3]
+
+            # Counts per frame: [B, T]
+            skin_counts = mask_flat.sum(dim=-1)
+            skin_counts_safe = skin_counts.clamp_min(1).unsqueeze(-1)  # [B, T, 1]
+
+            skin_mean = skin_sum / skin_counts_safe  # [B, T, 3]
+
+            # Pre-create default values once on correct device/dtype
+            default_val = torch.tensor([0.5, 0.4, 0.35], device=device, dtype=frames.dtype).view(1, 1, 3)
+
+            # Where there are zero skin pixels, substitute default color means
+            mask_has_skin = skin_counts.unsqueeze(-1) > 0
+            skin_mean = torch.where(mask_has_skin, skin_mean, default_val)
+
+            # Apply BatchNorm and projection
+            skin_features_bn = self.bn(skin_mean.contiguous().view(-1, 3)).view(batch_size, num_frames, 3)
             skin_features_proj = self.proj(skin_features_bn)
             return skin_features_proj
         except Exception as e:
-            print(f"Error in skin color analysis: {str(e)}")
-            return torch.zeros((batch_size, num_frames, self.feature_dim), device=device)
+            logger.exception("Error in skin color analysis")
+            return torch.zeros((batch_size, num_frames, self.feature_dim), device=device, dtype=frames.dtype)
