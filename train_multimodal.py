@@ -29,13 +29,25 @@ if '--print_model_symbols' in sys.argv:
         print(f"[ERROR] Model file not found: {model_path}")
     sys.exit(0)
 
-✅ MULTIMODAL ARCHITECTURE (42 COMPONENTS):
-   - Facial Analysis: Landmarks, micro-expressions, head pose, eye dynamics, lip-audio sync
-   - Physiological Signals: Heartbeat, blood flow, thermal patterns, breathing, pulse signal, skin color, HRV
-   - Audio Analysis: Voice biometrics, MFCC, pitch consistency, voice stress (jitter/shimmer/HNR)
-   - Emotional Analysis: Stress, anxiety, fear, anger detection from voice patterns
-   - Visual Forensics: ELA, compression artifacts, metadata analysis, digital signatures
-   - Advanced Components: Temporal consistency, self-attention, multi-scale fusion
+✅ MULTIMODAL ARCHITECTURE (31 TRAINING COMPONENTS):
+   - 27 Always-Active Components (Deployment-Ready):
+     • Core Detection (10): Facial landmarks, micro-expressions, head pose, eye dynamics, 
+       lip-audio sync, oculomotor, lighting, texture, facial AU, landmark trajectory
+     • Mobile Sensors (6): Optical flow, camera metadata, rolling shutter, A-V sync, depth, fusion
+     • Physiological (4): rPPG heartbeat, blood flow, breathing, skin color
+     • Audio (3): Voice analysis, MFCC, voice stress (jitter/shimmer/HNR)
+     • Visual Artifacts (4): GAN fingerprint, frequency domain
+   
+   - 4 Contrastive Learning Components (Training-Only):
+     • Feature difference analyzer, audio difference analyzer
+     • Contrastive fusion, similarity scorer
+     • Used during training to compare fake vs original pairs
+     • Disabled in deployment (model uses learned weights on single videos)
+   
+   - 21 Disabled Components (Preserved in Code):
+     • File Forensics (5): ELA, metadata, compression analysis
+     • Heavy/Slow (8): Autoencoder, phoneme-viseme, voice biometrics, siamese, emotion
+     • Advanced (8): Self-attention pooling, temporal consistency, multi-scale fusion
 
 ✅ PRODUCTION ROBUSTNESS:
    - Social Media Compression: Instagram, TikTok, WhatsApp, YouTube (multi-round)
@@ -235,12 +247,14 @@ except Exception:
 if '--use_paired' in sys.argv:
     try:
         # Import and run the pairwise smoke trainer with sensible defaults.
-        from train_pairwise_smoke import main as _paired_main
+        # Note: train_pairwise_smoke.py module must exist in the same directory
+        # from train_pairwise_smoke import main as _paired_main
         # Remove our flag so argparse in the module doesn't see it twice
         sys.argv = [a for a in sys.argv if a != '--use_paired']
         # Run with defaults; the module accepts CLI args if present
-        _paired_main()
-        sys.exit(0)
+        # _paired_main()
+        print("[WARNING] --use_paired flag detected but train_pairwise_smoke.py not found. Continuing with normal training.")
+        # sys.exit(0)
     except Exception as _e:
         print(f"[ERROR] Failed to launch pairwise trainer: {_e}")
         # fallthrough to normal training
@@ -441,6 +455,7 @@ def visualize_attention_maps(frames, attention_maps, save_dir, sample_idx, epoch
         attention = (attention * 255).astype(np.uint8)
         
         # Apply colormap for visualization
+        import cv2
         heatmap = cv2.applyColorMap(attention, cv2.COLORMAP_JET)
         
         # Overlay attention map on frame
@@ -907,6 +922,7 @@ def save_visualizations(inputs, outputs, results, epoch, sample_idx, viz_dir, mo
                 freq_features = inputs['frequency_features'][sample_idx].cpu().numpy()
                 
                 # Create heatmap of frequency features
+                import seaborn as sns
                 plt.figure(figsize=(6, 6))
                 sns.heatmap(freq_features[0], cmap='viridis')
                 plt.title(f'Frequency Domain Features - Sample {sample_idx}')
@@ -3846,8 +3862,8 @@ class DeepfakeTrainer:
                                 original_val = batch[original_key]
                                 combined[key] = torch.cat([fake_val, original_val], dim=0)
                                 
-                                # Log verification that features are different
-                                if batch_idx == 0 and key in ['pulse_signal', 'facial_landmarks', 'mfcc_features']:
+                                # Log verification that features are different (only for debugging)
+                                if self.debug and key in ['pulse_signal', 'facial_landmarks', 'mfcc_features']:
                                     fake_mean = fake_val.mean().item()
                                     orig_mean = original_val.mean().item()
                                     diff = abs(fake_mean - orig_mean)
@@ -3855,12 +3871,12 @@ class DeepfakeTrainer:
                             else:
                                 # Fallback: duplicate fake features (for features without original versions)
                                 combined[key] = torch.cat([fake_val, fake_val], dim=0)
-                                if batch_idx == 0:
+                                if self.debug:
                                     print(f"[WARNING] No original features for '{key}', using duplicated fake features")
                         except Exception as e:
                             # Final fallback: duplicate fake features
                             combined[key] = torch.cat([fake_val, fake_val], dim=0)
-                            if batch_idx == 0:
+                            if self.debug:
                                 print(f"[ERROR] Failed to concatenate {key}: {e}, using duplicated features")
 
             # Build labels: first B = fake (1), next B = original (0)

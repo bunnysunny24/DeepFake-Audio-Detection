@@ -155,6 +155,17 @@ umf==0.10.0
 urllib3==2.3.0
 
 # ============================================================================
+# INFERENCE-SPECIFIC DEPENDENCIES (Added from requirements_inference.txt)
+# ============================================================================
+# API Server
+flask>=3.0.0
+flask-cors>=4.0.0
+
+# Optional: Quantization Export (Uncomment if needed)
+# onnx>=1.15.0
+# onnxruntime>=1.16.0
+
+# ============================================================================
 # INSTALLATION INSTRUCTIONS
 # ============================================================================
 

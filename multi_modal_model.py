@@ -43,6 +43,38 @@ try:
 except ImportError:
     print("Warning: SkinColorAnalyzer not found, using fallback implementation (fallbacks moved to fallbacks.py)")
 
+# Import voice stress analyzer
+try:
+    from voice_stress_analyzer import (
+        VoiceStressAnalyzer,
+        JitterShimmerAnalyzer,
+        EmotionalStateDetector,
+        FormantAnalyzer
+    )
+    print("✅ Successfully imported voice stress analyzer components")
+    VOICE_STRESS_AVAILABLE = True
+except ImportError as e:
+    print(f"⚠️ Warning: voice_stress_analyzer.py not found or has errors: {e}")
+    print("⚠️ Voice stress analysis will use basic signal processing only")
+    VOICE_STRESS_AVAILABLE = False
+
+# Import mobile sensor analyzers
+try:
+    from mobile_sensor_analysis import (
+        OpticalFlowAnalyzer,
+        CameraMetadataAnalyzer,
+        RollingShutterDetector,
+        AudioVisualSyncAnalyzer,
+        MobileDepthAnalyzer,
+        MobileSensorFusion
+    )
+    print("✅ Successfully imported mobile sensor analyzers")
+    MOBILE_SENSORS_AVAILABLE = True
+except ImportError as e:
+    print(f"⚠️ Warning: mobile_sensor_analysis.py not found or has errors: {e}")
+    print("⚠️ Mobile sensor features will be disabled")
+    MOBILE_SENSORS_AVAILABLE = False
+
 
 def clear_gpu_memory():
     """Utility function to clear GPU memory and trigger garbage collection."""
@@ -2527,23 +2559,24 @@ class MultiModalDeepfakeModel(nn.Module):
                 if self.debug:
                     print(f"[TRACE] Failed to register trace hooks: {e}")
 
-        self.ela_encoder = nn.Sequential(
-            nn.Conv2d(1, 32, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Flatten(),
-        )
-        self.ela_projection = nn.Linear(64, 128)
-        
-        # Metadata feature processing
-        self.metadata_encoder = nn.Sequential(
-            nn.Linear(10, 64),
-            nn.ReLU(),
-            nn.Linear(64, 128)
-        )
+        # ❌ DISABLED: ELA only works on JPEG compression artifacts, not live streams
+        # self.ela_encoder = nn.Sequential(
+        #     nn.Conv2d(1, 32, kernel_size=3, stride=2, padding=1),
+        #     nn.ReLU(),
+        #     nn.MaxPool2d(2),
+        #     nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+        #     nn.ReLU(),
+        #     nn.AdaptiveAvgPool2d((1, 1)),
+        #     nn.Flatten(),
+        # )
+        # self.ela_projection = nn.Linear(64, 128)
+        # 
+        # # Metadata feature processing
+        # self.metadata_encoder = nn.Sequential(
+        #     nn.Linear(10, 64),
+        #     nn.ReLU(),
+        #     nn.Linear(64, 128)
+        # )
         
         # Audio-Visual sync detector
         self.sync_detector = AudioVisualSyncDetector(
@@ -2603,6 +2636,8 @@ class MultiModalDeepfakeModel(nn.Module):
         # ============================================================================
         # CONTRASTIVE LEARNING COMPONENTS FOR FAKE VS ORIGINAL COMPARISON
         # ============================================================================
+        # ✅ ENABLED: Used during TRAINING to help model learn differences
+        # During DEPLOYMENT: Not used (model uses learned weights on single video)
         
         # Feature difference analyzer - computes differences between fake and original features
         self.feature_difference_analyzer = nn.Sequential(
@@ -2645,7 +2680,9 @@ class MultiModalDeepfakeModel(nn.Module):
             nn.Sigmoid()
         )
         
-        print("[INFO] ✅ Contrastive learning components initialized for fake/original comparison")
+        print("[INFO] ✅ Contrastive learning components initialized for TRAINING")
+        print("       During training: Compares fake vs original to learn differences")
+        print("       During deployment: Uses learned weights on single video")
         
         # 3. Visual Artifact & Spatial Analysis
         self.lighting_consistency_analyzer = LightingConsistencyAnalyzer(feature_dim=64)
@@ -2656,100 +2693,152 @@ class MultiModalDeepfakeModel(nn.Module):
         # 4. Audio Analysis
         self.voice_analysis_module = VoiceAnalysisModule(audio_dim=self.actual_audio_feature_dim, feature_dim=128)
         self.mfcc_extractor = MFCCExtractor(num_mfcc=40, feature_dim=64)
-        self.phoneme_viseme_analyzer = PhonemeVisemeAnalyzer(
-            audio_dim=self.actual_audio_feature_dim,
-            visual_dim=self.actual_video_feature_dim,
-            hidden_dim=128
-        )
-        self.voice_biometrics_verifier = VoiceBiometricsVerifier(
-            audio_dim=self.actual_audio_feature_dim,
-            speaker_dim=256
-        )
+        # ❌ DISABLED: Too slow for real-time (80-150ms) and needs enrollment
+        # self.phoneme_viseme_analyzer = PhonemeVisemeAnalyzer(
+        #     audio_dim=self.actual_audio_feature_dim,
+        #     visual_dim=self.actual_video_feature_dim,
+        #     hidden_dim=128
+        # )
+        # self.voice_biometrics_verifier = VoiceBiometricsVerifier(
+        #     audio_dim=self.actual_audio_feature_dim,
+        #     speaker_dim=256
+        # )
+        
+        # ============================================================================
+        # 5. MOBILE SENSOR ANALYSIS COMPONENTS (NEW)
+        # Extractable from ANY video + Enhanced with real mobile sensor data
+        # ============================================================================
+        
+        # Initialize mobile sensor analyzers if available
+        if MOBILE_SENSORS_AVAILABLE:
+            self.enable_mobile_sensors = True
+            
+            # Features extractable from ANY video (works with existing datasets)
+            self.optical_flow_analyzer = OpticalFlowAnalyzer(feature_dim=64)
+            self.camera_metadata_analyzer = CameraMetadataAnalyzer(feature_dim=32)
+            self.rolling_shutter_detector = RollingShutterDetector(feature_dim=16)
+            self.av_sync_analyzer = AudioVisualSyncAnalyzer(feature_dim=32)
+            
+            # Optional: Enhanced with real mobile depth sensor data
+            self.mobile_depth_analyzer = MobileDepthAnalyzer(feature_dim=64)
+            
+            # Mobile sensor fusion module
+            self.mobile_sensor_fusion = MobileSensorFusion(feature_dim=256)
+            
+            print("[INFO] ✅ Mobile sensor analysis enabled (27 active components)")
+            print("       - Optimized for training AND deployment")
+            print("       - Optical flow: Camera shake, motion patterns")
+            print("       - Camera metadata: Exposure, focus, white balance")
+            print("       - Rolling shutter: CMOS sensor artifacts")
+            print("       - A-V sync: Lip-audio synchronization")
+            print("       - Depth analysis: Monocular + real sensor fusion")
+            print("       - 25 components disabled (contrastive, forensic, heavy)")
+        else:
+            self.enable_mobile_sensors = False
+            print("[INFO] ⚠️ Mobile sensor analysis disabled (import failed)")
+            print("       Install mobile_sensor_analysis.py to enable")
+        
+        # Voice Stress Analysis (Neural Networks)
+        if VOICE_STRESS_AVAILABLE:
+            self.voice_stress_analyzer = VoiceStressAnalyzer(sample_rate=16000, feature_dim=64)
+            self.enable_voice_stress = True
+            print("[INFO] Voice stress neural networks enabled: Jitter/Shimmer, Emotional Detection, Formants")
+        else:
+            self.enable_voice_stress = False
+            print("[INFO] Voice stress neural networks disabled (using dataset extraction only)")
         
         # 5. Multimodal Fusion & Temporal Consistency
-        self.dual_attention = DualSpatioTemporalAttention(feature_dim=128, num_heads=4)
-        self.emotion_recognition = EmotionRecognitionModule(
-            visual_dim=self.actual_video_feature_dim,
-            audio_dim=self.actual_audio_feature_dim,
-            feature_dim=128
-        )
+        # ❌ DISABLED: Dual attention is redundant, emotion recognition not critical
+        # self.dual_attention = DualSpatioTemporalAttention(feature_dim=128, num_heads=4)
+        # self.emotion_recognition = EmotionRecognitionModule(
+        #     visual_dim=self.actual_video_feature_dim,
+        #     audio_dim=self.actual_audio_feature_dim,
+        #     feature_dim=128
+        # )
         
         # ========== ADVANCED MODEL COMPONENTS INTEGRATION ==========
+        # ❌ DISABLED: Too memory-intensive for mobile deployment, needs long temporal windows
         # Check if advanced components are available
-        if ADVANCED_COMPONENTS_AVAILABLE:
-            print("✅ Integrating advanced model components...")
-            
-            # Self-Attention Pooling for improved temporal feature aggregation
-            self.visual_self_attention = SelfAttentionPooling(input_dim=self.actual_video_feature_dim)
-            self.audio_self_attention = SelfAttentionPooling(input_dim=self.actual_audio_feature_dim)
-            
-            # Temporal Consistency Detector for deepfake temporal artifacts
-            self.temporal_consistency_detector = TemporalConsistencyDetector(
-                feature_dim=self.actual_video_feature_dim,
-                hidden_dim=256
-            )
-            
-            # Enhanced Cross-Modal Fusion replacing basic fusion
-            self.enhanced_cross_modal_fusion = EnhancedCrossModalFusion(
-                visual_dim=self.actual_video_feature_dim,
-                audio_dim=self.actual_audio_feature_dim,
-                fusion_dim=512
-            )
-            # Projection to transformer's expected dimension (keeps architecture consistent)
-            try:
-                self.enhanced_projection = nn.Linear(512, transformer_dim)
-            except Exception:
-                # If transformer_dim not in scope for some reason, create a passthrough layer placeholder
-                self.enhanced_projection = None
-            
-            # Periodical Feature Extractor for detecting periodic patterns
-            self.periodical_extractor = PeriodicalFeatureExtractor(
-                input_dim=self.actual_video_feature_dim,
-                hidden_dim=128
-            )
-            
-            # Multi-Scale Feature Fusion for hierarchical representations
-            self.multiscale_fusion = MultiScaleFeatureFusion(
-                input_dim=self.actual_video_feature_dim,
-                scales=[1, 2, 4]
-            )
-            
-            print("✅ Advanced components initialized successfully!")
-            self.use_advanced_components = True
-        else:
-            print("⚠️ Advanced components not available, using standard components")
-            self.use_advanced_components = False
+        # if ADVANCED_COMPONENTS_AVAILABLE:
+        #     print("✅ Integrating advanced model components...")
+        #     
+        #     # Self-Attention Pooling for improved temporal feature aggregation
+        #     self.visual_self_attention = SelfAttentionPooling(input_dim=self.actual_video_feature_dim)
+        #     self.audio_self_attention = SelfAttentionPooling(input_dim=self.actual_audio_feature_dim)
+        #     
+        #     # Temporal Consistency Detector for deepfake temporal artifacts
+        #     self.temporal_consistency_detector = TemporalConsistencyDetector(
+        #         feature_dim=self.actual_video_feature_dim,
+        #         hidden_dim=256
+        #     )
+        #     
+        #     # Enhanced Cross-Modal Fusion replacing basic fusion
+        #     self.enhanced_cross_modal_fusion = EnhancedCrossModalFusion(
+        #         visual_dim=self.actual_video_feature_dim,
+        #         audio_dim=self.actual_audio_feature_dim,
+        #         fusion_dim=512
+        #     )
+        #     # Projection to transformer's expected dimension (keeps architecture consistent)
+        #     try:
+        #         self.enhanced_projection = nn.Linear(512, transformer_dim)
+        #     except Exception:
+        #         # If transformer_dim not in scope for some reason, create a passthrough layer placeholder
+        #         self.enhanced_projection = None
+        #     
+        #     # Periodical Feature Extractor for detecting periodic patterns
+        #     self.periodical_extractor = PeriodicalFeatureExtractor(
+        #         input_dim=self.actual_video_feature_dim,
+        #         hidden_dim=128
+        #     )
+        #     
+        #     # Multi-Scale Feature Fusion for hierarchical representations
+        #     self.multiscale_fusion = MultiScaleFeatureFusion(
+        #         input_dim=self.actual_video_feature_dim,
+        #         scales=[1, 2, 4]
+        #     )
+        #     
+        #     print("✅ Advanced components initialized successfully!")
+        #     self.use_advanced_components = True
+        # else:
+        #     print("⚠️ Advanced components not available, using standard components")
+        self.use_advanced_components = False  # Force disable advanced components
         
         # 6. Advanced Machine Learning Models
-        self.siamese_network = SiameseNetwork(
-            audio_dim=self.actual_audio_feature_dim,
-            video_dim=self.actual_video_feature_dim,
-            hidden_dim=256
-        )
-        self.autoencoder = Autoencoder(input_channels=3)
+        # ❌ DISABLED: Siamese needs reference video, autoencoder too slow (100-200ms)
+        # self.siamese_network = SiameseNetwork(
+        #     audio_dim=self.actual_audio_feature_dim,
+        #     video_dim=self.actual_video_feature_dim,
+        #     hidden_dim=256
+        # )
+        # self.autoencoder = Autoencoder(input_channels=3)
         
         # 7. Forensic & Metadata Analysis
-        self.enhanced_metadata_analyzer = EnhancedMetadataAnalyzer(input_dim=10, hidden_dim=64)
-        self.digital_artifact_detector = DigitalArtifactDetector(input_channels=3, feature_dim=64)
-        self.compression_analyzer = CompressionAnalyzer(input_channels=3, feature_dim=64)
+        # ❌ DISABLED: Only works for JPEG/H.264 files, not live streams
+        # self.enhanced_metadata_analyzer = EnhancedMetadataAnalyzer(input_dim=10, hidden_dim=64)
+        # self.digital_artifact_detector = DigitalArtifactDetector(input_channels=3, feature_dim=64)
+        # self.compression_analyzer = CompressionAnalyzer(input_channels=3, feature_dim=64)
         
         # 8. Liveness Detection
+        # ✅ KEEP: Liveness detector is useful, but lightweight processor is redundant
         self.liveness_detector = LivenessDetectionModule(visual_dim=self.actual_video_feature_dim, feature_dim=128)
-        self.lightweight_processor = LightweightModelProcessor(input_channels=3, feature_dim=32)
+        # self.lightweight_processor = LightweightModelProcessor(input_channels=3, feature_dim=32)
         
         # Combined features dimension
+        # Recalculated for 27 active components only
         combined_dim = transformer_dim
         if self.enable_explainability:
-            # Original features + new enhanced features
-            combined_dim += 128 * 4  # Original: ELA + metadata + sync + face embeddings
-            combined_dim += 512      # Additional features from new modules
+            # Reduced dimension: Only keeping active components
+            # Sync detector + face embeddings (128 * 2)
+            combined_dim += 256
+            # Enhanced features from 27 active modules
+            combined_dim += 512      # Facial + physiological + mobile features
             
-        # Add dimensions for advanced components if available
-        if ADVANCED_COMPONENTS_AVAILABLE and hasattr(self, 'use_advanced_components') and self.use_advanced_components:
-            combined_dim += 512  # Enhanced fusion output
-            combined_dim += 256  # Temporal consistency detector output (bidirectional GRU)
-            combined_dim += 128  # Periodical features
-            combined_dim += self.actual_video_feature_dim  # Multi-scale fusion output
+        # Advanced components disabled for deployment
+        # if ADVANCED_COMPONENTS_AVAILABLE and hasattr(self, 'use_advanced_components') and self.use_advanced_components:
+        #     combined_dim += 512  # Enhanced fusion output
+        #     combined_dim += 256  # Temporal consistency detector output (bidirectional GRU)
+        #     combined_dim += 128  # Periodical features
+        #     combined_dim += self.actual_video_feature_dim  # Multi-scale fusion output
         
         # Main classifier
         self.classifier = nn.Sequential(
@@ -3178,6 +3267,30 @@ class MultiModalDeepfakeModel(nn.Module):
                     # Final audio feature stability check
                     audio_features = torch.clamp(audio_features, -50.0, 50.0)
                     
+                    # Voice Stress Analysis (Neural Networks)
+                    if self.enable_voice_stress:
+                        try:
+                            voice_stress_results = self.voice_stress_analyzer(audio)
+                            component_contributions['voice_stress_jitter'] = voice_stress_results['jitter'].mean(dim=1, keepdim=True)
+                            component_contributions['voice_stress_shimmer'] = voice_stress_results['shimmer'].mean(dim=1, keepdim=True)
+                            component_contributions['voice_stress_hnr'] = voice_stress_results['hnr'].mean(dim=1, keepdim=True)
+                            component_contributions['voice_stress_score'] = voice_stress_results['stress_score']
+                            component_contributions['voice_emotion_stress'] = voice_stress_results['emotions']['stress']
+                            component_contributions['voice_emotion_anxiety'] = voice_stress_results['emotions']['anxiety']
+                            component_contributions['voice_emotion_fear'] = voice_stress_results['emotions']['fear']
+                            component_contributions['voice_emotion_anger'] = voice_stress_results['emotions']['anger']
+                            component_contributions['voice_fakeness'] = voice_stress_results['fakeness_score'].unsqueeze(1)
+                            
+                            if self.debug:
+                                print(f"[VOICE STRESS] ✅ Neural network analysis completed")
+                                print(f"   Jitter: {voice_stress_results['jitter'].mean():.3f}%")
+                                print(f"   Shimmer: {voice_stress_results['shimmer'].mean():.3f}%")
+                                print(f"   HNR: {voice_stress_results['hnr'].mean():.3f} dB")
+                                print(f"   Fakeness Score: {voice_stress_results['fakeness_score'].mean():.3f}")
+                        except Exception as e:
+                            if self.debug:
+                                print(f"[WARNING] Voice stress neural network failed: {e}")
+                    
             except Exception as e:
                 if self.debug:
                     print(f"[WARNING] Error in audio model, using fallback: {e}")
@@ -3220,7 +3333,7 @@ class MultiModalDeepfakeModel(nn.Module):
                     original_video_features = torch.mean(original_temporal_visual, dim=1)  # [B, feature_dim]
                     original_video_features = self.video_projection(original_video_features)  # [B, video_feature_dim]
                     
-                    # Compute DIFFERENCE between fake and original video features
+                    # ✅ TRAINING: Compute DIFFERENCE between fake and original video features
                     video_feature_difference = self.feature_difference_analyzer(
                         torch.abs(video_features - original_video_features)
                     )
@@ -3257,7 +3370,27 @@ class MultiModalDeepfakeModel(nn.Module):
                         original_audio_features = self.audio_projection(original_audio_features)  # [B, audio_feature_dim]
                         original_audio_features = torch.clamp(original_audio_features, -50.0, 50.0)
                     
-                    # Compute DIFFERENCE between fake and original audio features
+                        # Voice Stress Analysis on ORIGINAL audio (for comparison)
+                        if self.enable_voice_stress:
+                            try:
+                                original_voice_stress = self.voice_stress_analyzer(original_audio_normalized)
+                                component_contributions['original_voice_stress_score'] = original_voice_stress['stress_score']
+                                component_contributions['original_voice_fakeness'] = original_voice_stress['fakeness_score'].unsqueeze(1)
+                                
+                                # Compute voice stress DIFFERENCE (fake - original)
+                                voice_stress_diff = torch.abs(
+                                    voice_stress_results['fakeness_score'] - original_voice_stress['fakeness_score']
+                                )
+                                component_contributions['voice_stress_difference'] = voice_stress_diff.unsqueeze(1)
+                                
+                                if self.debug:
+                                    print(f"[VOICE STRESS] ✅ Original audio analyzed")
+                                    print(f"   Voice Stress Difference: {voice_stress_diff.mean():.3f}")
+                            except Exception as e:
+                                if self.debug:
+                                    print(f"[WARNING] Original voice stress analysis failed: {e}")
+                    
+                    # ✅ TRAINING: Compute DIFFERENCE between fake and original audio features
                     audio_feature_difference = self.audio_difference_analyzer(
                         torch.abs(audio_features - original_audio_features)
                     )
@@ -3350,41 +3483,48 @@ class MultiModalDeepfakeModel(nn.Module):
             explainability_features = []
             component_contributions = {}
             
-            # Process ELA features if available
-            ela_output = None
-            if ela_features is not None:
-                # Add channel dimension if missing
-                if len(ela_features.shape) == 3:
-                    ela_features = ela_features.unsqueeze(1)
-                ela_output = self.ela_encoder(ela_features)
-                ela_output = self.ela_projection(ela_output)
-                # Ensure correct batch size
-                ela_output = self._ensure_batch_consistency(ela_output, batch_size, "ela_output")
-                explainability_features.append(ela_output)
-                component_contributions['ela'] = ela_output
-            else:
-                explainability_features.append(torch.zeros(batch_size, 128, device=video_frames.device))
+            # Initialize advanced features list for mobile sensors and advanced components
+            advanced_features_list = []
             
-            # Process metadata features if available
-            metadata_output = None
-            if metadata_features is not None:
-                metadata_output = self.metadata_encoder(metadata_features)
-                metadata_output = self._ensure_batch_consistency(metadata_output, batch_size, "metadata_output")
-                explainability_features.append(metadata_output)
-                component_contributions['metadata'] = metadata_output
-                
-                # Enhanced metadata analysis
-                enhanced_metadata_score = self.enhanced_metadata_analyzer(metadata_features)
-                enhanced_metadata_score = self._ensure_batch_consistency(enhanced_metadata_score, batch_size, "enhanced_metadata_score")
-                component_contributions['enhanced_metadata'] = enhanced_metadata_score
-            else:
-                # Use learnable zeros so gradients can still flow
-                zero_placeholder = torch.zeros(batch_size, 128, device=video_frames.device, requires_grad=True)
-                explainability_features.append(zero_placeholder)
-                zero_score = torch.zeros(batch_size, 1, device=video_frames.device, requires_grad=True)
-                component_contributions['enhanced_metadata'] = zero_score
-                if self.debug:
-                    print("[WARNING] No metadata features - using trainable zeros (won't learn metadata patterns)")
+            # ❌ DISABLED: ELA encoder - only works on JPEG compression
+            # # Process ELA features if available
+            # ela_output = None
+            # if ela_features is not None:
+            #     # Add channel dimension if missing
+            #     if len(ela_features.shape) == 3:
+            #         ela_features = ela_features.unsqueeze(1)
+            #     ela_output = self.ela_encoder(ela_features)
+            #     ela_output = self.ela_projection(ela_output)
+            #     # Ensure correct batch size
+            #     ela_output = self._ensure_batch_consistency(ela_output, batch_size, "ela_output")
+            #     explainability_features.append(ela_output)
+            #     component_contributions['ela'] = ela_output
+            # else:
+            #     explainability_features.append(torch.zeros(batch_size, 128, device=video_frames.device))
+            # Skip ELA features - disabled
+            
+            # ❌ DISABLED: Metadata encoders - only work on file-based forensics
+            # # Process metadata features if available
+            # metadata_output = None
+            # if metadata_features is not None:
+            #     metadata_output = self.metadata_encoder(metadata_features)
+            #     metadata_output = self._ensure_batch_consistency(metadata_output, batch_size, "metadata_output")
+            #     explainability_features.append(metadata_output)
+            #     component_contributions['metadata'] = metadata_output
+            #     
+            #     # Enhanced metadata analysis
+            #     enhanced_metadata_score = self.enhanced_metadata_analyzer(metadata_features)
+            #     enhanced_metadata_score = self._ensure_batch_consistency(enhanced_metadata_score, batch_size, "enhanced_metadata_score")
+            #     component_contributions['enhanced_metadata'] = enhanced_metadata_score
+            # else:
+            #     # Use learnable zeros so gradients can still flow
+            #     zero_placeholder = torch.zeros(batch_size, 128, device=video_frames.device, requires_grad=True)
+            #     explainability_features.append(zero_placeholder)
+            #     zero_score = torch.zeros(batch_size, 1, device=video_frames.device, requires_grad=True)
+            #     component_contributions['enhanced_metadata'] = zero_score
+            #     if self.debug:
+            #         print("[WARNING] No metadata features - using trainable zeros (won't learn metadata patterns)")
+            # Skip metadata features - disabled
             
             # Process audio-visual sync features if available
             av_sync_score = None
@@ -3729,11 +3869,13 @@ class MultiModalDeepfakeModel(nn.Module):
                 mfcc_consistency, _ = self.mfcc_extractor(audio)
                 component_contributions['mfcc'] = mfcc_consistency
             
-            # Voice biometrics verification
-            voice_bio_consistency = self.voice_biometrics_verifier(
-                audio_features.unsqueeze(1).expand(-1, 5, -1)  # Expand to sequence
-            )
-            component_contributions['voice_biometrics'] = voice_bio_consistency
+            # ❌ DISABLED: Voice biometrics - needs enrollment phase
+            # # Voice biometrics verification
+            # voice_bio_consistency = self.voice_biometrics_verifier(
+            #     audio_features.unsqueeze(1).expand(-1, 5, -1)  # Expand to sequence
+            # )
+            # component_contributions['voice_biometrics'] = voice_bio_consistency
+            # Skip voice biometrics - disabled
             
             # 🆕 Voice stress analysis (jitter/shimmer/HNR) - USE DATASET-PROVIDED FEATURES
             if voice_stress_features is not None:
@@ -3766,103 +3908,178 @@ class MultiModalDeepfakeModel(nn.Module):
                 component_contributions['voice_stress'] = torch.ones(batch_size, 1, device=audio_features.device) * 0.5
             
             # 5. Multimodal Analysis
-            # Siamese network comparison for audio-video coherence
-            av_similarity = self.siamese_network(audio_features, video_features)
-            component_contributions['av_similarity'] = av_similarity
-            
-            # Emotion recognition for cross-modal consistency
-            emotion_consistency, _ = self.emotion_recognition(video_features, audio_features)
-            component_contributions['emotion'] = emotion_consistency
-            
-            # Autoencoder reconstruction for anomaly detection
-            if video_frames.size(1) > 0:
-                _, ae_error = self.autoencoder(video_frames[:, 0])
-                component_contributions['autoencoder'] = torch.sigmoid(1.0 - ae_error.unsqueeze(1))
-            else:
-                # CRITICAL: Use trainable placeholder for empty videos to maintain gradient flow
-                component_contributions['autoencoder'] = torch.ones(
-                    batch_size, 1, 
-                    device=video_frames.device,
-                    requires_grad=True
-                )
+            # ❌ DISABLED: Siamese (needs reference), emotion (not critical), autoencoder (too slow)
+            # # Siamese network comparison for audio-video coherence
+            # av_similarity = self.siamese_network(audio_features, video_features)
+            # component_contributions['av_similarity'] = av_similarity
+            # 
+            # # Emotion recognition for cross-modal consistency
+            # emotion_consistency, _ = self.emotion_recognition(video_features, audio_features)
+            # component_contributions['emotion'] = emotion_consistency
+            # 
+            # # Autoencoder reconstruction for anomaly detection
+            # if video_frames.size(1) > 0:
+            #     _, ae_error = self.autoencoder(video_frames[:, 0])
+            #     component_contributions['autoencoder'] = torch.sigmoid(1.0 - ae_error.unsqueeze(1))
+            # else:
+            #     # CRITICAL: Use trainable placeholder for empty videos to maintain gradient flow
+            #     component_contributions['autoencoder'] = torch.ones(
+            #         batch_size, 1, 
+            #         device=video_frames.device,
+            #         requires_grad=True
+            #     )
+            # Skip siamese, emotion, autoencoder - all disabled
             
             # 6. Forensic Analysis
-            # Digital artifact detection
-            artifact_score = self.digital_artifact_detector(video_frames[:, 0])
-            component_contributions['digital_artifacts'] = 1.0 - artifact_score  # Invert for consistency
-            
-            # Compression analysis
-            compression_score = self.compression_analyzer(video_frames[:, 0])
-            component_contributions['compression'] = 1.0 - compression_score  # Invert for consistency
+            # ❌ DISABLED: Digital artifact detector and compression analyzer - only work on file-based compression
+            # # Digital artifact detection
+            # artifact_score = self.digital_artifact_detector(video_frames[:, 0])
+            # component_contributions['digital_artifacts'] = 1.0 - artifact_score  # Invert for consistency
+            # 
+            # # Compression analysis
+            # compression_score = self.compression_analyzer(video_frames[:, 0])
+            # component_contributions['compression'] = 1.0 - compression_score  # Invert for consistency
+            # Skip forensic analyzers - disabled
             
             # 7. Liveness Detection
             liveness_score, _ = self.liveness_detector(video_features)
             component_contributions['liveness'] = liveness_score
             
-            # ========== ADVANCED MODEL COMPONENTS INTEGRATION ==========
-            # Apply advanced components if available
-            advanced_features_list = []
-            
-            if hasattr(self, 'use_advanced_components') and self.use_advanced_components:
+            # ========== MOBILE SENSOR ANALYSIS INTEGRATION (NEW) ==========
+            # Extract mobile sensor features - works with ANY video + enhanced with real sensor data
+            if hasattr(self, 'enable_mobile_sensors') and self.enable_mobile_sensors:
                 if self.debug:
-                    print("[INFO] Applying advanced model components...")
+                    print("[INFO] Extracting mobile sensor features...")
                 
                 try:
-                    # 1. Self-Attention Pooling for temporal features
-                    # Apply on temporal visual features (before mean pooling)
-                    visual_attended = self.visual_self_attention(temporal_visual_features)
-                    component_contributions['visual_self_attention'] = torch.sigmoid(torch.mean(visual_attended, dim=-1, keepdim=True))
+                    # 1. Optical Flow Analysis (camera shake, motion patterns)
+                    optical_flow_results = self.optical_flow_analyzer(video_frames)
+                    component_contributions['optical_flow'] = optical_flow_results['shake_score']
+                    mobile_optical_flow_feat = optical_flow_results['flow_features']
                     
-                    # Apply on audio features (expand to sequence first)
-                    audio_seq = audio_features.unsqueeze(1).expand(-1, 5, -1)
-                    audio_attended = self.audio_self_attention(audio_seq)
-                    component_contributions['audio_self_attention'] = torch.sigmoid(torch.mean(audio_attended, dim=-1, keepdim=True))
+                    # 2. Camera Metadata Analysis (exposure, focus, white balance)
+                    mobile_metadata_feat = self.camera_metadata_analyzer(video_frames)
+                    component_contributions['camera_metadata'] = torch.sigmoid(
+                        torch.mean(mobile_metadata_feat, dim=-1, keepdim=True)
+                    )
                     
-                    # 2. Temporal Consistency Detector
-                    # Analyze temporal patterns in visual features
-                    temporal_consistency_features = self.temporal_consistency_detector(temporal_visual_features)
-                    component_contributions['advanced_temporal_consistency'] = torch.sigmoid(
-                        torch.mean(temporal_consistency_features, dim=-1, keepdim=True)
+                    # 3. Rolling Shutter Detection (CMOS sensor artifacts)
+                    mobile_shutter_feat = self.rolling_shutter_detector(video_frames)
+                    component_contributions['rolling_shutter'] = torch.sigmoid(
+                        torch.mean(mobile_shutter_feat, dim=-1, keepdim=True)
                     )
-                    advanced_features_list.append(temporal_consistency_features)
                     
-                    # 3. Enhanced Cross-Modal Fusion
-                    enhanced_fused_features = self.enhanced_cross_modal_fusion(
-                        visual_attended, 
-                        audio_attended
+                    # 4. Audio-Visual Sync Analysis (enhanced lip-sync checking)
+                    # Use pooled features for sync analysis
+                    mobile_sync_feat = self.av_sync_analyzer(video_features, audio_features)
+                    component_contributions['mobile_av_sync'] = torch.sigmoid(
+                        torch.mean(mobile_sync_feat, dim=-1, keepdim=True)
                     )
-                    component_contributions['enhanced_fusion'] = torch.sigmoid(
-                        torch.mean(enhanced_fused_features, dim=-1, keepdim=True)
-                    )
-                    advanced_features_list.append(enhanced_fused_features)
                     
-                    # 4. Periodical Feature Extractor
-                    # Extract periodic patterns from visual sequence
-                    periodical_features = self.periodical_extractor(temporal_visual_features)
-                    component_contributions['periodical_patterns'] = torch.sigmoid(
-                        torch.mean(periodical_features, dim=-1, keepdim=True)
+                    # 5. Depth Analysis (monocular estimation + optional real sensor data)
+                    # Check if real depth map is provided in inputs
+                    depth_map = inputs.get('depth_map', None)
+                    depth_results = self.mobile_depth_analyzer(video_frames, depth_map)
+                    component_contributions['mobile_depth'] = torch.sigmoid(
+                        torch.mean(depth_results['depth_features'], dim=-1, keepdim=True)
                     )
-                    advanced_features_list.append(periodical_features)
                     
-                    # 5. Multi-Scale Feature Fusion
-                    # Apply on visual features across multiple scales
-                    multiscale_features = self.multiscale_fusion(temporal_visual_features)
-                    component_contributions['multiscale_features'] = torch.sigmoid(
-                        torch.mean(multiscale_features, dim=-1, keepdim=True)
+                    # 6. Mobile Sensor Fusion (combines all mobile features)
+                    mobile_fused_features = self.mobile_sensor_fusion(
+                        mobile_optical_flow_feat,
+                        mobile_metadata_feat,
+                        mobile_shutter_feat,
+                        mobile_sync_feat,
+                        depth_results['depth_features']
                     )
-                    advanced_features_list.append(multiscale_features)
+                    
+                    # Add to advanced features list
+                    advanced_features_list.append(mobile_fused_features)
+                    component_contributions['mobile_sensor_fusion'] = torch.sigmoid(
+                        torch.mean(mobile_fused_features, dim=-1, keepdim=True)
+                    )
                     
                     if self.debug:
-                        print(f"[INFO] Advanced components applied successfully")
-                        print(f"[INFO] Generated {len(advanced_features_list)} advanced feature tensors")
+                        print(f"[INFO] Mobile sensor features extracted successfully")
+                        print(f"       - Optical flow: {mobile_optical_flow_feat.shape}")
+                        print(f"       - Camera metadata: {mobile_metadata_feat.shape}")
+                        print(f"       - Rolling shutter: {mobile_shutter_feat.shape}")
+                        print(f"       - A-V sync: {mobile_sync_feat.shape}")
+                        print(f"       - Depth: {depth_results['depth_features'].shape}")
+                        print(f"       - Fused mobile features: {mobile_fused_features.shape}")
                         
                 except Exception as e:
                     if self.debug:
-                        print(f"[WARNING] Error in advanced components: {e}")
+                        print(f"[WARNING] Error in mobile sensor analysis: {e}")
                         import traceback
                         traceback.print_exc()
-                    # Continue without advanced features
-                    advanced_features_list = []
+                    # Continue without mobile sensor features
+            
+            # ========== ADVANCED MODEL COMPONENTS INTEGRATION ==========
+            # ❌ DISABLED: Advanced components are too heavy for mobile deployment
+            # # Apply advanced components if available
+            # 
+            # if hasattr(self, 'use_advanced_components') and self.use_advanced_components:
+            #     if self.debug:
+            #         print("[INFO] Applying advanced model components...")
+            #     
+            #     try:
+            #         # 1. Self-Attention Pooling for temporal features
+            #         # Apply on temporal visual features (before mean pooling)
+            #         visual_attended = self.visual_self_attention(temporal_visual_features)
+            #         component_contributions['visual_self_attention'] = torch.sigmoid(torch.mean(visual_attended, dim=-1, keepdim=True))
+            #         
+            #         # Apply on audio features (expand to sequence first)
+            #         audio_seq = audio_features.unsqueeze(1).expand(-1, 5, -1)
+            #         audio_attended = self.audio_self_attention(audio_seq)
+            #         component_contributions['audio_self_attention'] = torch.sigmoid(torch.mean(audio_attended, dim=-1, keepdim=True))
+            #         
+            #         # 2. Temporal Consistency Detector
+            #         # Analyze temporal patterns in visual features
+            #         temporal_consistency_features = self.temporal_consistency_detector(temporal_visual_features)
+            #         component_contributions['advanced_temporal_consistency'] = torch.sigmoid(
+            #             torch.mean(temporal_consistency_features, dim=-1, keepdim=True)
+            #         )
+            #         advanced_features_list.append(temporal_consistency_features)
+            #         
+            #         # 3. Enhanced Cross-Modal Fusion
+            #         enhanced_fused_features = self.enhanced_cross_modal_fusion(
+            #             visual_attended, 
+            #             audio_attended
+            #         )
+            #         component_contributions['enhanced_fusion'] = torch.sigmoid(
+            #             torch.mean(enhanced_fused_features, dim=-1, keepdim=True)
+            #         )
+            #         advanced_features_list.append(enhanced_fused_features)
+            #         
+            #         # 4. Periodical Feature Extractor
+            #         # Extract periodic patterns from visual sequence
+            #         periodical_features = self.periodical_extractor(temporal_visual_features)
+            #         component_contributions['periodical_patterns'] = torch.sigmoid(
+            #             torch.mean(periodical_features, dim=-1, keepdim=True)
+            #         )
+            #         advanced_features_list.append(periodical_features)
+            #         
+            #         # 5. Multi-Scale Feature Fusion
+            #         # Apply on visual features across multiple scales
+            #         multiscale_features = self.multiscale_fusion(temporal_visual_features)
+            #         component_contributions['multiscale_features'] = torch.sigmoid(
+            #             torch.mean(multiscale_features, dim=-1, keepdim=True)
+            #         )
+            #         advanced_features_list.append(multiscale_features)
+            #         
+            #         if self.debug:
+            #             print(f"[INFO] Advanced components applied successfully")
+            #             print(f"[INFO] Generated {len(advanced_features_list)} advanced feature tensors")
+            #             
+            #     except Exception as e:
+            #         if self.debug:
+            #             print(f"[WARNING] Error in advanced components: {e}")
+            #             import traceback
+            #             traceback.print_exc()
+            #         # Continue without advanced features
+            #         advanced_features_list = []
+            # Skip advanced components - all disabled
             
             # ====== AUXILIARY LOSS COMPUTATION FOR COMPONENT DIVERSITY ======
             auxiliary_outputs = {}
@@ -3973,36 +4190,8 @@ class MultiModalDeepfakeModel(nn.Module):
                     print(f"[CONTRASTIVE] ✅ Fused contrastive features: {combined_features.shape}")
                     print(f"[CONTRASTIVE] ✅ Similarity score: {similarity_score.mean().item():.4f}")
                 
-            elif hasattr(self, 'use_advanced_components') and self.use_advanced_components and len(advanced_features_list) > 0:
-                # Use enhanced cross-modal fusion
-                combined_features = enhanced_fused_features  # Already computed in advanced components section
-                # If enhanced fusion outputs do not match transformer's d_model, project them
-                try:
-                    target_dim = None
-                    # infer transformer's expected d_model if possible
-                    if hasattr(self, 'transformer') and hasattr(self.transformer, 'layers') and len(self.transformer.layers) > 0:
-                        first = self.transformer.layers[0]
-                        if hasattr(first, 'self_attn'):
-                            target_dim = getattr(first.self_attn, 'embed_dim', None)
-                    if target_dim is None and hasattr(self, 'combined_projection') and hasattr(self.combined_projection, 'out_features'):
-                        target_dim = self.combined_projection.out_features
-
-                    if target_dim is not None and combined_features.shape[-1] != target_dim:
-                        if getattr(self, 'enhanced_projection', None) is not None:
-                            if self.debug:
-                                print(f"[INFO] Projecting enhanced fusion from {combined_features.shape[-1]} -> {target_dim}")
-                            combined_features = self.enhanced_projection(combined_features)
-                        else:
-                            # Fallback: try to use combined_projection if available
-                            if getattr(self, 'combined_projection', None) is not None:
-                                if self.debug:
-                                    print(f"[INFO] Using combined_projection to project enhanced fusion from {combined_features.shape[-1]} -> {self.combined_projection.out_features}")
-                                combined_features = self.combined_projection(combined_features)
-                except Exception:
-                    # If projection fails, continue and let the transformer error be raised with diagnostics
-                    pass
-                if self.debug:
-                    print(f"[INFO] Using enhanced cross-modal fusion, output shape: {combined_features.shape}")
+            # ✅ DEPLOYMENT: Standard fusion (single video - no original available)
+            # This path also used during training if original video not provided
             elif self.fusion_type == 'attention':
                 combined_features = self.fusion_module(video_features, audio_features)
             else:  # Default to concat

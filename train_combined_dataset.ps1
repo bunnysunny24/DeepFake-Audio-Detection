@@ -74,17 +74,23 @@ Write-Host "Training completed" -ForegroundColor Green
 # Remove-Item Env:CUDA_CACHE_MAXSIZE
 
 Write-Host ""
-Write-Host ("="*70) -ForegroundColor Green
+Write-Host ("="*80) -ForegroundColor Green
 Write-Host "TRAINING COMPLETE" -ForegroundColor Green
-Write-Host ("="*70) -ForegroundColor Green
+Write-Host ("="*80) -ForegroundColor Green
 Write-Host ""
 Write-Host "PRODUCTION-READY MODEL TRAINED" -ForegroundColor Cyan
 Write-Host ""
-Write-Host "Features Enabled:" -ForegroundColor White
-Write-Host "   - 40+ Multimodal Components (facial, physiological, audio, forensic)" -ForegroundColor Gray
-Write-Host "   - Production Robustness (social media compression, lighting, resolution)" -ForegroundColor Gray
-Write-Host "   - Auxiliary Losses (component diversity, prevents overfitting)" -ForegroundColor Gray
-Write-Host "   - Quantization-Aware Training (INT8 deployment from epoch 15)" -ForegroundColor Gray
+Write-Host "ARCHITECTURE:" -ForegroundColor Yellow
+Write-Host "   - 31 Training Components (27 always-active + 4 contrastive learning)" -ForegroundColor Gray
+Write-Host "   - 27 Deployment Components (contrastive learning disabled in production)" -ForegroundColor Gray
+Write-Host "   - Contrastive Learning: Trains on fake+original pairs, deployment uses learned weights" -ForegroundColor Gray
+Write-Host "   - Mobile Sensors (6): Optical flow, camera metadata, rolling shutter, A-V sync, depth" -ForegroundColor Gray
+Write-Host ""
+Write-Host "PRODUCTION ROBUSTNESS:" -ForegroundColor Yellow
+Write-Host "   - Social Media Compression (Instagram, TikTok, WhatsApp, YouTube)" -ForegroundColor Gray
+Write-Host "   - Resolution Degradation (224px -> 45px)" -ForegroundColor Gray
+Write-Host "   - Adaptive Lighting (low-light, overexposed, shadows)" -ForegroundColor Gray
+Write-Host "   - Quantization-Aware Training (INT8 from epoch 15)" -ForegroundColor Gray
 Write-Host ""
 Write-Host "Output Files:" -ForegroundColor Cyan
 Write-Host "   - checkpoints/best_model.pth           (Best FP32 model)" -ForegroundColor Gray
