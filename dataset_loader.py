@@ -2299,7 +2299,8 @@ def collate_fn(batch):
                 valid_values.append(v)
                 valid_indices.append(i)
         if key in ['video_frames', 'audio', 'audio_spectrogram', 'facial_landmarks', 'mfcc_features', 'pulse_signal', 'skin_color_variations', 'head_pose', 'eye_blink_features', 'frequency_features',
-                   'original_facial_landmarks', 'original_mfcc_features', 'original_pulse_signal', 'original_skin_color_variations', 'original_head_pose', 'original_eye_blink_features', 'original_frequency_features']:
+                   'original_facial_landmarks', 'original_mfcc_features', 'original_pulse_signal', 'original_skin_color_variations', 'original_head_pose', 'original_eye_blink_features', 'original_frequency_features',
+                   'voice_stress_features', 'original_voice_stress_features']:
             try:
                 if valid_values and all(isinstance(v, torch.Tensor) for v in valid_values):
                     if len(valid_values) == actual_batch_size:
@@ -2352,6 +2353,8 @@ def collate_fn(batch):
                         result[key] = torch.zeros(actual_batch_size, 16)
                     elif key == 'frequency_features' or key == 'original_frequency_features':
                         result[key] = torch.zeros(actual_batch_size, 1, 16, 16)
+                    elif key == 'voice_stress_features' or key == 'original_voice_stress_features':
+                        result[key] = torch.zeros(actual_batch_size, 6)
                     else:
                         result[key] = None
                 if isinstance(result[key], torch.Tensor):

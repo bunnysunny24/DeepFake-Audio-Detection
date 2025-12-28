@@ -37,7 +37,7 @@ python train_multimodal.py `
   --log_file "D:\Bunny\Deepfake\backend\Models\outputs\training_log.txt" `
   --batch_size 8 `
   --num_epochs 30 `
-  --max_samples 100 `
+  --max_samples 50 `
   --learning_rate 5e-5 `
   --weight_decay 0.0001 `
   --detect_faces `
@@ -61,7 +61,7 @@ python train_multimodal.py `
   --enable_skin_color_analysis `
   --enable_advanced_physiological `
   --enable_face_mesh `
-  --num_workers 4 `
+  --num_workers 1 `
   --pin_memory `
   --amp_enabled `
   --grad_accum_steps 2 `
