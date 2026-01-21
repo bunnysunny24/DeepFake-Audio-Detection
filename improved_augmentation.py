@@ -1,4 +1,4 @@
-﻿"""
+"""
 Enhanced Augmentation Pipeline for Deepfake Detection
 
 COMBINED VERSION: Merges improved_augmentation.py + production_robustness.py
