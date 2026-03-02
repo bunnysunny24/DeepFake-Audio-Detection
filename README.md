@@ -1,2518 +1,1238 @@
-# 🎭 Advanced Multimodal Deepfake Detection System
+# Multi-Modal Deepfake Detection System
 
-> A production-ready deepfake detection framework with **31 training components** (27 deployment + 4 contrastive learning), quantization-aware training, and mobile-optimized architecture. **76M params (training)** → **62M params (deployment)** with smart deployment_mode switching. Optimized for social media compression, lighting variations, and on-device execution.
+**End-to-end audio-visual deepfake detection with physiological, forensic, and behavioral analysis.**
 
-[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
-[![PyTorch 2.6.0](https://img.shields.io/badge/PyTorch-2.6.0-orange.svg)](https://pytorch.org/)
-[![CUDA 12.4](https://img.shields.io/badge/CUDA-12.4-green.svg)](https://developer.nvidia.com/cuda-zone)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-
-## 🚀 What's New in v4.0 (January 2026)
-
-### **Mobile Optimization & Deployment Mode**
-- ✅ **Lightweight Audio Encoder**: Replaced Wav2Vec2 (94.4M params) with custom MFCC-based encoder (0.66M params) - 99.3% reduction!
-- ✅ **Smart Deployment Mode**: `deployment_mode=False` (76M training) vs `deployment_mode=True` (62M deployment)
-- ✅ **Temporal Attention Removed**: Redundant with Transformer, saved 19.7M params (15-20% faster inference)
-- ✅ **Conditional Contrastive Components**: Automatically disabled in deployment, saves 13.6M params
-- ✅ **Mobile-Ready**: 238 MB FP32 → **59 MB INT8** (75% compression), <500ms inference target
-- ✅ **Production Training Script**: `train_production_mobile.ps1` with proper validation and QAT
-- ✅ **Validation Fix**: Corrected model.eval() usage during validation for accurate metrics
-
-### **Parameter Optimization Journey**
-```
-Original:  211M params (805 MB FP32) - Research model
-  ↓ Wav2Vec2 → LightweightAudioEncoder (99.3% reduction)
-Step 1:    96M params (366 MB FP32)
-  ↓ Remove temporal_attention (redundant with Transformer)
-Step 2:    76M params (290 MB FP32) - Training mode
-  ↓ Disable contrastive components in deployment
-Final:     62M params (238 MB FP32, 59 MB INT8) - Deployment mode ✅
-```
-
-## 🚀 What's New in v3.5 (December 2025)
-
-### **Smart Training + Deployment Architecture**
-- ✅ **31 Training Components**: 27 always-active + 4 contrastive learning (for paired data training)
-- ✅ **27 Deployment Components**: Contrastive learning disabled in production (uses learned weights)
-- ✅ **Contrastive Learning**: Trains on fake+original pairs to learn difference patterns, then deployment uses those learned patterns on single videos
-- ✅ **Mobile-Optimized**: 40% less GPU memory, <30ms inference time on mobile devices
-- ✅ **Better Generalization**: Focused components for improved accuracy (82-87% expected)
-- ✅ **Backward Compatible**: 21 components disabled (forensics, heavy analyzers, advanced fusion)
-
-## 🚀 What's New in v3.0 (December 2025)
-
-### **Production Robustness**
-- ✅ **Social Media Compression Simulation**: Trained on Instagram, TikTok, WhatsApp, YouTube, Facebook, Twitter compression artifacts (multi-round, quality 50-95)
-- ✅ **Resolution Degradation Resilience**: Works from 224px down to 45px and back (4 quality levels)
-- ✅ **Adaptive Lighting Augmentation**: Robust to low-light, overexposed, shadows, warm/cool temperature shifts (5 lighting conditions)
-- ✅ **Domain Adaptation**: Batch normalization per domain + adversarial discriminator for cross-dataset generalization
-- ✅ **Fairness-Aware Training**: Balanced performance across skin tones and demographics
-
-### **Component Diversity & Overfitting Prevention**
-- ✅ **Auxiliary Classification Heads**: 5 auxiliary losses (physiological, facial, audio, visual, forensic) with learnable diversity weight
-- ✅ **Silent Module Detection**: Automatically flags components contributing <1% after 100 updates
-- ✅ **Component Contribution Tracking**: EMA-based monitoring of each module's importance
-- ✅ **Diversity Loss**: Encourages all 40+ components to contribute meaningfully
-
-### **Quantization-Aware Training (QAT)**
-- ✅ **INT8 Deployment**: Automatic quantization from epoch 15 for 4x smaller models, 2-4x faster inference
-- ✅ **Configurable Backends**: 'fbgemm' (x86 Intel/AMD) or 'qnnpack' (ARM mobile/embedded)
-- ✅ **Post-Training Validation**: Automatic FP32 vs INT8 accuracy comparison (<2% degradation target)
-- ✅ **ONNX Export**: Deployment-ready INT8 models for TensorRT, CoreML, TensorFlow Lite
-
-### **Architecture Enhancements**
-- ✅ **31 Training Components**: 27 always-active + 4 contrastive learning (for training only)
-- ✅ **27 Deployment Components**: 10 core, 6 mobile sensors, 4 physiological, 4 visual artifacts, 3 audio analysis
-- ✅ **21 Disabled Components**: File forensics (5), heavy analyzers (8), advanced components (8)
-- ✅ **Multiprocessing Compatibility**: Fixed pickle errors with callable wrapper classes (works with num_workers > 0)
-- ✅ **Enhanced Tensor Efficiency**: Replaced redundant `torch.tensor()` calls with `.clone().detach()` for faster data loading
+| Metric | Value |
+|--------|-------|
+| Total Parameters | **68,556,807** (68.5M) |
+| Trainable Parameters | 68,551,263 |
+| Frozen Parameters | 5,544 (first 20 EfficientNet-B0 params) |
+| Named Component Groups | 48 |
+| BatchNorm Buffers | 209 |
+| Target Accuracy | 90%+ on LAV-DF |
 
 ---
 
-## 📋 Table of Contents
+## Table of Contents
 
-- [Overview](#-overview)
-- [System Architecture](#-system-architecture)
-- [Features](#-features)
-- [Installation](#-installation)
-- [Dataset Preparation](#-dataset-preparation)
-- [Training Workflow](#-training-workflow)
-- [Inference & Deployment](#-inference--deployment)
-  - [Quick Start](#quick-start-inference)
-  - [Video Upload Detection](#1-video-upload-detection)
-  - [Real-Time Webcam](#2-real-time-webcam-detection)
-  - [REST API Server](#3-rest-api-server)
-  - [Python Integration](#4-python-integration)
-- [Model Architecture](#-model-architecture)
-- [Configuration](#-configuration)
-- [Usage Examples](#-usage-examples)
-- [Performance Metrics](#-performance-metrics)
-- [Troubleshooting](#-troubleshooting)
-- [Citation](#-citation)
-
----
-
-## 🔍 Overview
-
-This project implements a **production-ready multimodal deepfake detection system** with **31 training components** and **27 deployment components**:
-
-### **Training Architecture (31 components)**
-- **During Training**: Uses 31 components including 4 contrastive learning modules
-- **How It Works**: Compares fake+original video pairs to learn difference patterns
-- **Dataset**: Requires paired samples (fake video + its original/real counterpart)
-- **Output**: Model learns weights/parameters that recognize deepfake patterns
-
-### **Deployment Architecture (27 components - Contrastive Learning Disabled)**
-- **During Deployment**: Uses 27 components on SINGLE videos (no original needed)
-- **How It Works**: Applies learned weights to classify new videos as fake/real
-- **Input**: Any single video (live stream, uploaded file, real-time feed)
-- **Output**: Classification using patterns learned during training
-
-### **Active Components (27 - Always Active)**
-- 🎥 **Core Detection (10 components)**: EfficientNet-B0 visual backbone (4M params), **LightweightAudioEncoder** audio backbone (0.66M params, replaces 94.4M Wav2Vec2), facial landmarks (68 points), micro-expression detector, eye blink analysis, head pose estimator, lip-audio sync analyzer, oculomotor dynamics, lighting consistency, texture analyzer
-- 📱 **Mobile Sensors (6 components - NEW)**: Optical flow analyzer (camera shake/motion warping), camera metadata analyzer (exposure/focus/white balance), rolling shutter detector (CMOS artifacts), audio-visual sync analyzer (enhanced lip-sync), mobile depth analyzer (depth consistency), mobile sensor fusion (256 features)
-- 🎵 **Audio Analysis (3 components)**: Voice analysis module (prosody/pitch), MFCC extractor (audio fingerprinting), voice stress analyzer (jitter/shimmer/HNR)
-- 🎭 **Visual Artifacts (4 components)**: GAN fingerprint detector, frequency domain analyzer, facial action units analyzer, landmark trajectory analyzer
-- 🔬 **Physiological Analysis (4 components)**: rPPG analyzer (heartbeat detection), blood flow analyzer, breathing detector, skin color analyzer
-
-### **Training-Only Components (4 - Active during training, disabled in deployment)**
-- ✅ **Contrastive Learning (4)**: Feature difference analyzer, audio difference analyzer, contrastive fusion, similarity scorer
-- **Purpose**: Compares fake+original pairs to learn difference patterns during training
-- **Deployment**: Disabled (model uses learned weights on single videos)
-- **How It Works**: 
-  - Training: `model(fake_video, original_video)` → learns "fakes have X patterns, reals have Y"
-  - Deployment: `model(single_video)` → applies learned patterns → "This video matches fake patterns" → FAKE
-
-### **Disabled Components (21 - Preserved in code)**
-- ❌ **File Forensics (5)**: ELA encoder, metadata encoder, enhanced metadata analyzer, digital artifact detector, compression analyzer - *Only works on JPEG/H.264 files*
-- ❌ **Heavy/Slow (8)**: Autoencoder, phoneme-viseme analyzer, voice biometrics, siamese network, emotion recognition, dual attention, lightweight processor - *Too slow for real-time*
-- ❌ **Advanced Components (8)**: Self-attention pooling (visual/audio), temporal consistency detector, enhanced cross-modal fusion, periodical extractor, multi-scale fusion - *Too memory-intensive for mobile*
-
-### Key Innovations
-
-1. **Smart Training Pipeline**: Uses contrastive learning with paired data (fake+original) to train model to recognize deepfake patterns
-2. **Efficient Deployment**: Trained model works on single videos - no "original video" needed in production
-3. **Mobile Sensor Integration**: 6 new analyzers detect optical flow, camera metadata, rolling shutter artifacts, A-V sync issues, and depth inconsistencies
-4. **Production Robustness**: Survives social media compression (Instagram, TikTok, WhatsApp), resolution degradation (224px→45px), and lighting variations
-5. **Quantization-Aware Training (QAT)**: Automatic INT8 conversion from epoch 15 for 4x smaller models, 2-4x faster inference
-6. **Physiological Analysis**: Detects subtle rPPG signals, blood flow patterns, breathing rhythms, and voice stress markers (jitter/shimmer/HNR)
-7. **GAN Artifact Detection**: Frequency domain analysis, GAN fingerprint detection, and texture analysis for synthetic content identification
-8. **Real-Time Capable**: <30ms inference on mobile devices, ~16GB GPU memory for training (down from 24GB)
+1. [Architecture Overview](#1-architecture-overview)
+2. [Visual Backbone - EfficientNet-B0](#2-visual-backbone---efficientnet-b0)
+3. [Audio Backbone - LightweightAudioEncoder](#3-audio-backbone---lightweightaudioencoder)
+4. [Cross-Modal Fusion Module](#4-cross-modal-fusion-module)
+5. [Transformer Encoder](#5-transformer-encoder)
+6. [Contrastive Fusion](#6-contrastive-fusion)
+7. [Explainability Projector](#7-explainability-projector)
+8. [Classification Heads](#8-classification-heads)
+9. [Physiological Analysis Components](#9-physiological-analysis-components)
+10. [Forensic and Behavioral Analysis](#10-forensic-and-behavioral-analysis)
+11. [Mobile Sensor Analysis](#11-mobile-sensor-analysis)
+12. [Contrastive Learning Pipeline](#12-contrastive-learning-pipeline)
+13. [Data Pipeline](#13-data-pipeline)
+14. [Training Pipeline](#14-training-pipeline)
+15. [Loss Functions](#15-loss-functions)
+16. [Optimizer and Scheduler](#16-optimizer-and-scheduler)
+17. [EMA (Exponential Moving Average)](#17-ema-exponential-moving-average)
+18. [Progressive Unfreezing](#18-progressive-unfreezing)
+19. [Quantization-Aware Training (QAT)](#19-quantization-aware-training-qat)
+20. [Inference Pipeline](#20-inference-pipeline)
+21. [Complete Parameter Inventory](#21-complete-parameter-inventory)
+22. [Data Features Catalog](#22-data-features-catalog)
+23. [File Structure](#23-file-structure)
+24. [How to Run](#24-how-to-run)
+25. [Key Bug Fixes Applied](#25-key-bug-fixes-applied)
+26. [References and Benchmarks](#26-references-and-benchmarks)
 
 ---
 
-## 🏗️ System Architecture
-
-### **DEPLOYMENT ARCHITECTURE** (27 components - Single Video Input)
+## 1. Architecture Overview
 
 ```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│              INPUT: Single Video (Fake OR Real)                               │
-│              Works for: Live streams, Uploaded videos, Real-time detection   │
-│              [B, 16, 3, 224, 224] video + [B, 48000] audio                  │
-│              deployment_mode=True: 62M params (Contrastive DISABLED)        │
-└────────────────────────────┬─────────────────────────────────────────────────┘
-                             │
-                ┌────────────┴────────────────┐
-                │                             │
-        ┌───────▼──────────┐         ┌────────▼──────────────────────┐
-        │   VISUAL         │         │     AUDIO                     │
-        │   ENCODER        │         │    ENCODER                    │
-        │  EfficientNet-B0 │         │  LightweightAudioEncoder ⚡   │
-        │    (4M params)   │         │    (0.66M params, MFCC-based)│
-        │   [B, 1280]      │         │    [B, 768]                   │
-        └───────┬──────────┘         └────────┬──────────────────────┘
-                │                             │
-                │                             │
-    ┌───────────┴────────────┐    ┌───────────┴────────────┐
-    │                        │    │                        │
-    │  Direct Pooling ⚡     │    │   Audio Features       │
-    │  (No temporal_attn)    │    │   Processing           │
-    │  [B, T, 1280]→[B,1280]│    │   [B, 768]             │
-    └───────┬────────────────┘    └───────┬────────────────┘
-            │                             │
-            │                             │
-            └──────────┬──────────────────┘
-                       │
-       ┌───────────────▼────────────────────────────┐
-       │   ATTENTION FUSION MODULE                   │
-       │   Cross-modal attention between visual      │
-       │   and audio features                        │
-       │   OUTPUT: fused_features [B, 768]          │
-       └───────────────┬────────────────────────────┘
-                       │
-       ┌───────────────▼────────────────────────────┐
-       │   TRANSFORMER ENCODER (4 layers)           │
-       │   Multi-head self-attention (28.4M params) │
-       │   INPUT: [B, 768] → OUTPUT: [B, 768]       │
-       └───────────────┬────────────────────────────┘
-                       │
-                       │ (In Parallel: 27 Components)
-                       │
-    ┌──────────────────▼──────────────────────────────────────┐
-    │  27 ACTIVE COMPONENTS (Process video_frames in parallel) │
-    ├──────────────────────────────────────────────────────────┤
-    │  ✅ CORE DETECTION (10 components)                       │
-    │    • Facial landmarks (68 points) [B, 136]              │
-    │    • Micro-expression detector [B, 64]                  │
-    │    • Eye blink analysis [B, 32]                         │
-    │    • Head pose estimator [B, 128]                       │
-    │    • Lip-audio sync analyzer [B, 128]                   │
-    │    • Oculomotor dynamics [B, 64]                        │
-    │    • Lighting consistency [B, 64]                       │
-    │    • Texture analyzer [B, 64]                           │
-    │    • Facial AU analyzer [B, 128]                        │
-    │    • Landmark trajectory [B, 128]                       │
-    │                                                          │
-    │  ✅ MOBILE SENSORS (6 components - NEW)                 │
-    │    • Optical flow analyzer [B, 64]                      │
-    │    • Camera metadata analyzer [B, 32]                   │
-    │    • Rolling shutter detector [B, 16]                   │
-    │    • A-V sync analyzer [B, 32]                          │
-    │    • Mobile depth analyzer [B, 64]                      │
-    │    • Mobile sensor fusion [B, 256] ← combines all above │
-    │                                                          │
-    │  ✅ PHYSIOLOGICAL ANALYSIS (4 components)               │
-    │    • rPPG analyzer (heartbeat) [B, 128]                │
-    │    • Blood flow analyzer [B, 64]                        │
-    │    • Breathing detector [B, 64]                         │
-    │    • Skin color analyzer [B, 32]                        │
-    │                                                          │
-    │  ✅ AUDIO ANALYSIS (3 components)                       │
-    │    • Voice analysis module [B, 128]                     │
-    │    • MFCC extractor [B, 64]                            │
-    │    • Voice stress analyzer [B, 64]                      │
-    │                                                          │
-    │  ✅ VISUAL ARTIFACTS (4 components)                     │
-    │    • GAN fingerprint detector [B, 128]                  │
-    │    • Frequency domain analyzer [B, 64]                  │
-    │                                                          │
-    │  TOTAL OUTPUT: ~1,792 features                          │
-    └──────────────────┬──────────────────────────────────────┘
-                       │
-                       │
-    ┌──────────────────▼──────────────────────────────────────┐
-    │         FEATURE CONCATENATION                           │
-    │  combined = cat([transformer_features,                  │
-    │                  sync_features,                         │
-    │                  face_embedding_features,               │
-    │                  facial_features,                       │
-    │                  physiological_features,                │
-    │                  mobile_features,                       │
-    │                  visual_artifact_features])             │
-    │  OUTPUT: [B, ~1,792]                                    │
-    └──────────────────┬──────────────────────────────────────┘
-                       │
-                       │ (Auxiliary Heads - Training Only)
-                       │
-    ┌──────────────────▼──────────────────────────────────────┐
-    │       AUXILIARY CLASSIFICATION HEADS (5)                │
-    │  Process component features for diversity loss:         │
-    │  • Physiological Head [features → 2]                    │
-    │  • Facial Head [features → 2]                           │
-    │  • Audio Head [features → 2]                            │
-    │  • Visual Head [features → 2]                           │
-    │  • Forensic Head [features → 2]                         │
-    │  → Auxiliary Losses + Diversity Loss (training only)    │
-    └─────────────────────────────────────────────────────────┘
-                       │
-    ┌──────────────────▼──────────────────────────────────────┐
-    │         MAIN CLASSIFIER                                 │
-    │  Linear(1792 → 512) → ReLU → Dropout(0.5)             │
-    │  Linear(512 → 256) → ReLU → Dropout(0.3)              │
-    │  Linear(256 → 2) → [real_score, fake_score]           │
-    │  OUTPUT: [B, 2] logits                                  │
-    └──────────────────┬──────────────────────────────────────┘
-                       │
-                       ▼
-              ┌───────────────────────┐
-              │  TRAINING OUTPUTS     │
-              │  • Main Loss (Focal)  │
-              │  • Auxiliary Losses   │
-              │  • Diversity Loss     │
-              │  • Component EMA      │
-              │  • Silent Detection   │
-              └───────────┬───────────┘
-                          │
-                          ▼
-              ┌───────────────────────┐
-              │  QAT (Epoch 15+)      │
-              │  FakeQuantize modules │
-              │  INT8 conversion      │
-              │  [211M → 53M params]  │
-              └───────────────────────┘
-
-LEGEND:
-  B = Batch size (4 or 8)
-  [B, dim] = Tensor shape
-  → = Data flow
-  cat() = Concatenation
-  ✅ = Active component
-  ❌ = Disabled component (commented out in code)
-  
-KEY CHANGES FROM v3.0:
-  1. ✅ Contrastive learning: TRAINING ONLY (compares fake+original pairs)
-  2. ✅ Deployment: Uses learned weights on single videos (no original needed)
-  3. ❌ Removed file forensics (ELA, metadata - only work on files)
-  4. ❌ Removed heavy components (autoencoder, siamese, emotion)
-  5. ❌ Removed advanced fusion (too memory-intensive)
-  6. ✅ Added 6 mobile sensor components (optical flow, metadata, etc.)
-  7. ✅ Standard fusion in deployment (attention or concat)
-  8. Result: 31 training components → 27 deployment components
+INPUT VIDEO + AUDIO
+        |
+        v
++-------+-------+
+|               |
+v               v
+EfficientNet-B0  LightweightAudioEncoder
+(4.0M params)    (657K params)
+1280-dim out     768-dim out
+        |               |
+        v               v
++-------+-------+-------+-------+
+|       Fusion Module (7.5M)     |
+|   Cross-attention + gating     |
+|   visual_proj: 1280->768       |
+|   audio_proj:  768->768        |
+|   bi-directional attention     |
+|   fusion_layer: 1536->768      |
++---------------+----------------+
+                |
+                v
++---------------+----------------+
+|    Transformer Encoder (28.3M) |
+|    4 layers, dim=768           |
+|    FFN=3072, 8 heads           |
+|    LayerNorm + residual        |
++---------------+----------------+
+                |
+         768-dim output
+                |
+        +-------+-------+
+        |               |
+        v               v
+   Main Path      Contrastive Path
+        |          (10.6M, training only)
+        |               |
+        v               v
+  Classifier      contrastive_fusion
+  (920K params)   6144->1536->768
+  1536->512->     similarity_scorer
+  256->2          2048->512->256->1
+  (BN+Dropout)
+        |
+        v
+  REAL / FAKE
 ```
 
-### **TRAINING ARCHITECTURE** (31 components - Paired Data Input)
-
+**Key Dimensions Flow:**
 ```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│              INPUT: Paired Video Samples (Fake + Original)                    │
-│              Contrastive Learning: ENABLED (learns difference patterns)       │
-│              + Production-Robust Augmentation (Compression/Light/Resolution)  │
-└────────────────────────────┬─────────────────────────────────────────────────┘
-                             │
-                ┌────────────┴────────────────┐
-                │                             │
-        ┌───────▼──────────┐         ┌────────▼─────────┐
-        │   FAKE VIDEO     │         │  ORIGINAL VIDEO  │
-        │   [B, 16, 3,     │         │   [B, 16, 3,     │
-        │    224, 224]     │         │    224, 224]     │
-        │   FAKE AUDIO     │         │  ORIGINAL AUDIO  │
-        │   [B, 48000]     │         │   [B, 48000]     │
-        └───────┬──────────┘         └────────┬─────────┘
-                │                             │
-    ┌───────────┴────────────┐    ┌───────────┴────────────┐
-    │                        │    │                        │
-┌───▼────────┐  ┌───────────▼┐   │┌──────────┐  ┌────────▼───┐
-│  Visual    │  │   Audio    │   ││  Visual  │  │   Audio    │
-│  Encoder   │  │  Encoder   │   ││ Encoder  │  │  Encoder   │
-│EfficientNet│  │ Wav2Vec2   │   ││EfficientN│  │  Wav2Vec2  │
-│  B0 (4M)   │  │  (94.4M)   │   ││et (Same) │  │   (Same)   │
-└─────┬──────┘  └─────┬──────┘   │└────┬─────┘  └─────┬──────┘
-      │               │          │     │              │
-      │   [B, 1280]   │[B, 768]  │     │  [B, 1280]   │[B, 768]
-      │               │          │     │              │
-      │  ┌────────────┘          │     └──────┬───────┘
-      │  │                       │            │
-      │  │  Temporal Attention   │   Temporal Attention
-      │  │  + Projection         │   + Projection
-      │  │                       │            │
-      ▼  ▼                       │            ▼
-  [B, 512] [B, 768]              │      [B, 512] [B, 768]
-      │      │                   │            │      │
-      └──┬───┘                   │            └──┬───┘
-         │                       │               │
-         │ CONTRASTIVE FUSION    │               │
-         │ (Fake + Original +    │               │
-         │  Difference)          │               │
-         │                       │               │
-    ┌────▼───────────────────────▼───────────────▼────┐
-    │         CONTRASTIVE FUSION MODULE                │
-    │  fake_combined = cat([video, audio]) [B, 1280]   │
-    │  orig_combined = cat([video, audio]) [B, 1280]   │
-    │  diff_combined = abs(fake - orig)    [B, 1280]   │
-    │  INPUT: cat([fake, orig, diff])      [B, 3840]   │
-    │  OUTPUT: Fused features              [B, 768]    │
-    └─────────────────────┬────────────────────────────┘
-                          │
-                          │ (In Parallel: 40+ Components Process video_frames)
-                          │
-    ┌─────────────────────▼──────────────────────────────┐
-    │    TRANSFORMER (Self-Attention + Temporal)         │
-    │    Multi-head attention (28.4M params)             │
-    │    INPUT: [B, 768]  →  OUTPUT: [B, 768]            │
-    └─────────────────────┬──────────────────────────────┘
-                          │
-                          │ ┌────────────────────────────┐
-                          │ │ 27+ COMPONENTS (PARALLEL)  │
-                          │ │ Process video_frames:      │
-                          │ │ • Core Detection (10)      │
-                          │ │ • Mobile Sensors (6)       │
-                          │ │ • Physiological (4)        │
-                          │ │   - rPPG, Blood Flow, etc. │
-                          │ │ • Visual Artifacts (4)     │
-                          │ │ • Audio Analysis (3)       │
-                          │ │   - Voice Stress, MFCC     │
-                          │ │ • Contrastive (4 training) │
-                          │ │ OUTPUT: [B, ~1792]         │
-                          │ └────────────┬───────────────┘
-                          │              │
-                          │              │
-    ┌─────────────────────▼──────────────▼────────────────┐
-    │         CONCATENATE FEATURES                        │
-    │  final = cat([transformer_out, advanced_features])  │
-    │  OUTPUT: [B, 768 + 3200 = 3968]                     │
-    └─────────────────────┬─────────────────────────────┘
-                          │
-                          │ (In Parallel: Auxiliary Heads)
-                          │
-    ┌─────────────────────▼──────────────────────────────┐
-    │       AUXILIARY CLASSIFICATION HEADS (5)           │
-    │  Process advanced_features [B, 3200]:              │
-    │  ┌──────────────────────────────────────────┐      │
-    │  │ 1. Physiological Head  [3200 → 2]        │      │
-    │  │ 2. Facial Head        [3200 → 2]        │      │
-    │  │ 3. Audio Head         [3200 → 2]        │      │
-    │  │ 4. Visual Head        [3200 → 2]        │      │
-    │  │ 5. Forensic Head      [3200 → 2]        │      │
-    │  └──────────────────────────────────────────┘      │
-    │  → Auxiliary Losses + Diversity Loss               │
-    └────────────────────────────────────────────────────┘
-                          │
-    ┌─────────────────────▼──────────────────────────────┐
-    │         FEATURE ADAPTER (3968 → 2944)              │
-    │         Learnable projection for main classifier   │
-    └─────────────────────┬──────────────────────────────┘
-                          │
-    ┌─────────────────────▼──────────────────────────────┐
-    │         MAIN CLASSIFIER (2944 → 2)                 │
-    │         Final prediction for FAKE videos [B, 2]    │
-    └─────────────────────┬──────────────────────────────┘
-                          │
-                          │ (Separate Path for ORIGINAL)
-                          │
-    ┌─────────────────────▼──────────────────────────────┐
-    │      ORIGINAL VIDEO CLASSIFICATION PATH            │
-    │  original_combined [B, 1280] → fusion_module       │
-    │  → transformer [B, 768] → adapter [B, 2944]        │
-    │  → classifier → original_output [B, 2]             │
-    └─────────────────────┬──────────────────────────────┘
-                          │
-    ┌─────────────────────▼──────────────────────────────┐
-    │         CONCATENATE PREDICTIONS                    │
-    │  output = cat([fake_output, original_output])      │
-    │  OUTPUT: [B*2, 2] (e.g., [8, 2] for batch=4)       │
-    │  Labels: [1,1,1,1, 0,0,0,0] for batch=4            │
-    └─────────────────────┬──────────────────────────────┘
-                          │
-                          ▼
-              ┌───────────────────────┐
-              │  TRAINING OUTPUTS     │
-              │  • Main Loss (Focal)  │
-              │  • Auxiliary Losses   │
-              │  • Diversity Loss     │
-              │  • Contrastive Loss   │
-              │  • Component EMA      │
-              │  • Silent Detection   │
-              └───────────┬───────────┘
-                          │
-                          ▼
-              ┌───────────────────────┐
-              │  QAT (Epoch 15+)      │
-              │  FakeQuantize modules │
-              │  INT8 conversion      │
-              │  [775 MB → 194 MB]    │
-              └───────────────────────┘
+Visual:  [B, frames, 3, 224, 224] -> EfficientNet-B0 -> [B, 1280] (adaptive avg pool)
+         -> video_projection [1280->1280] -> fusion_module.visual_projection [1280->768]
 
-LEGEND:
-  B = Batch size (4 or 8)
-  Numbers in parentheses = Model parameters
-  [B, dim] = Tensor shape
-  → = Data flow (sequential)
-  (In Parallel) = Concurrent processing
-  cat() = Concatenation operation
-  
-KEY CORRECTIONS:
-  1. Contrastive fusion happens FIRST (before transformer)
-  2. 40+ components process video_frames IN PARALLEL (not sequentially)
-  3. Transformer processes fused contrastive features
-  4. Advanced features concatenated with transformer output
-  5. Auxiliary heads process advanced features (separate from main path)
-  6. Original videos have separate classification path at the end
-  7. Final output doubles batch size: [B*2, 2] for paired predictions
+Audio:   [B, audio_length] -> MFCC(n_mfcc=40) -> Conv1d stack -> projection [256->512->768]
+         -> fusion_module.audio_projection [768->768]
+
+Fusion:  visual [B,768] + audio [B,768] -> cross-attention + gate -> [B,768]
+         -> LayerNorm -> feed to transformer
+
+Trans:   [B, seq, 768] -> 4x TransformerEncoderLayer(d=768, nhead=8, ffn=3072) -> [B, 768]
+
+Concat:  [audio_768 || transformer_768] = [B, 1536]
+
+Class:   [B,1536] -> Linear(512) -> BN -> ReLU -> Drop(0.3)
+                   -> Linear(256) -> BN -> ReLU -> Drop(0.2)
+                   -> Linear(2) -> softmax -> {REAL, FAKE}
 ```
 
 ---
 
-## ✨ Features
+## 2. Visual Backbone - EfficientNet-B0
 
-### 🎯 Production Robustness (NEW in v3.0)
-- ✅ **Social Media Compression**: Simulates 6 platforms (Instagram, TikTok, WhatsApp, YouTube, Facebook, Twitter) with multi-round compression (1-3 rounds, quality 50-95)
-- ✅ **Resolution Degradation**: 4 quality levels (high 1.0, mid 0.5, low 0.3, very_low 0.2) - works from 224px down to 45px
-- ✅ **Adaptive Lighting**: 5 conditions (low_light, overexposed, shadow, warm_temp, cool_temp) with realistic color temperature shifts
-- ✅ **Balanced Sampling**: Demographic-aware sampling for fairness across different populations
+**Total: 4,007,548 params (5,544 frozen)**
 
-### 🧠 Component Diversity & Overfitting Prevention (NEW in v3.0)
-- ✅ **Auxiliary Classification Heads**: 5 auxiliary losses (physiological, facial, audio, visual, forensic) with learnable diversity weight (default 0.1)
-- ✅ **Silent Module Detection**: Flags components with <1% contribution after 100 updates
-- ✅ **Component Contribution Tracking**: EMA-based monitoring (α=0.99) + usage count for each module
-- ✅ **Diversity Loss**: Encourages uniform contribution across all 40+ components
+EfficientNet-B0 is a compound-scaled CNN pretrained on ImageNet. The first 20 parameters (stem conv + first MBConv block) are initially frozen to preserve low-level feature extractors.
 
-### 💾 Quantization-Aware Training (NEW in v3.0)
-- ✅ **INT8 Deployment**: Automatic quantization starting from epoch 15 (configurable)
-- ✅ **Backend Options**: 'fbgemm' (x86 Intel/AMD CPUs) or 'qnnpack' (ARM mobile/embedded)
-- ✅ **Learning Rate Scaling**: Automatic 0.1x reduction during QAT phase for stable fine-tuning
-- ✅ **Post-Training Validation**: FP32 vs INT8 accuracy comparison (<2% degradation target)
-- ✅ **Export Formats**: PyTorch (.pth), ONNX (.onnx) for TensorRT, CoreML, TensorFlow Lite deployment
-- ✅ **Expected Benefits**: 4x smaller model, 2-4x faster inference, minimal accuracy loss
+### Architecture Blocks
 
-### Visual Processing
-- ✅ **Face Detection**: MTCNN-based face localization (224x224 crop, margin=40)
-- ✅ **Facial Landmarks**: 68-point landmark detection using dlib (136-dim features)
-- ✅ **Micro-Expressions**: Facial Action Unit (AU) analysis via OpenFace
-- ✅ **Head Pose Estimation**: 3D head orientation tracking (pitch, yaw, roll)
-- ✅ **Eye Analysis**: Gaze tracking, blink detection, oculomotor patterns
-- ✅ **Temporal Consistency**: Cross-frame consistency checking (movement normalization)
+| Block | Channels | Kernel | SE Ratio | Output |
+|-------|----------|--------|----------|--------|
+| Stem (features.0) | 3->32 | 3x3 | - | 112x112 |
+| MBConv1 (features.1) | 32->16 | 3x3 DW | 8 | 112x112 |
+| MBConv6 (features.2) | 16->24 | 3x3 DW | 4 | 56x56 |
+| MBConv6 (features.3) | 24->40 | 5x5 DW | 6 | 28x28 |
+| MBConv6 (features.4) | 40->80 | 3x3 DW | 10 | 14x14 |
+| MBConv6 (features.5) | 80->112 | 5x5 DW | 20 | 14x14 |
+| MBConv6 (features.6) | 112->192 | 5x5 DW | 28 | 7x7 |
+| MBConv6 (features.7) | 192->320 | 3x3 DW | 48 | 7x7 |
+| Head (features.8) | 320->1280 | 1x1 | - | 7x7 |
 
-### Audio Processing
-- ✅ **EfficientNet-B0 Visual Encoder**: Pre-trained image recognition (4M params)
-- ✅ **LightweightAudioEncoder**: Custom MFCC-based audio encoder (0.66M params, replaces Wav2Vec2)
-- ✅ **Spectrogram Analysis**: Mel-spectrogram feature extraction
-- ✅ **Lip-Audio Sync**: Synchronization analysis between lip movements and audio
-- ✅ **Voice Quality Metrics**: Pitch, formants, spectral analysis
+Each MBConv block contains: Expand (1x1) -> Depthwise Conv -> Squeeze-and-Excitation -> Project (1x1) with BatchNorm and SiLU activation throughout.
 
-### Physiological Analysis
-- ✅ **Digital Heartbeat Detection**: rPPG-based heart rate estimation
-- ✅ **Blood Flow Analysis**: Skin color variation analysis
-- ✅ **Breathing Pattern Detection**: Chest/shoulder movement tracking
-- ✅ **Skin Color Consistency**: Multi-region skin tone analysis
-
-### 📱 Mobile Sensor Analysis (NEW in v3.5)
-- ✅ **Optical Flow Analysis**: Detects camera shake and motion warping patterns
-- ✅ **Camera Metadata Analysis**: Analyzes exposure, focus, white balance inconsistencies
-- ✅ **Rolling Shutter Detection**: Detects missing CMOS sensor artifacts in deepfakes
-- ✅ **Audio-Visual Sync**: Enhanced lip-audio synchronization checking
-- ✅ **Mobile Depth Analysis**: Monocular depth estimation + optional real sensor fusion
-- ✅ **Sensor Fusion**: Attention-based fusion of all mobile features (256 output dims)
-
-### Digital Forensics (❌ Disabled in v3.5 - File-based only)
-- ❌ **GAN Fingerprint Detection**: Pattern recognition in generated content (ACTIVE)
-- ❌ **Frequency Domain Analysis**: Detects frequency anomalies (ACTIVE)
-- ❌ **Error Level Analysis (ELA)**: JPEG compression analysis (DISABLED - file-based)
-- ❌ **Metadata Consistency**: EXIF metadata analysis (DISABLED - file-based)
-- ❌ **Compression Artifacts**: H.264/JPEG artifacts (DISABLED - file-based)
-- ✅ **Temporal Consistency**: Frame-to-frame consistency verification
-
-### Training Features
-- ❌ **Contrastive Learning (DISABLED)**: Paired fake/original comparison - *Removed for deployment compatibility*
-- ✅ **Focal Loss**: Handles class imbalance (α=0.25, γ=1.0) focusing on hard examples
-- ✅ **Class Weighting**: Configurable weighting strategies (balanced, inverse_sqrt, custom)
-- ✅ **Mixed Precision Training (AMP)**: GPU-only automatic mixed precision for faster training
-- ✅ **Early Stopping**: Prevents overfitting with patience-based stopping (default: 15 epochs)
-- ✅ **Gradient Clipping**: Stabilizes training (max_norm=1.0)
-- ✅ **Advanced Augmentation**: 
-  - **Production-Robust Transforms**: Compression (70% prob), resolution (50% prob), lighting (60% prob)
-  - **Picklable Wrappers**: CompressionAugmenter, ResolutionAugmenter, LightingAugmenter for multiprocessing compatibility
-  - **Traditional Augments**: MixUp, CutMix, temporal consistency augmentation
-- ✅ **Learning Rate Scheduling**: Cosine annealing with warm restarts (warmup: 5 epochs)
-- ✅ **Gradient Accumulation**: Effective larger batch sizes (default: 2 steps for GPU, 4 for CPU)
-- ✅ **Distributed Data Parallel (DDP)**: Multi-GPU training support
-- ✅ **Quantization-Aware Training**: Automatic INT8 conversion from epoch 15 for deployment
-
-### 🛡️ Training Safeguards (v4.0 - Production Grade)
-
-#### **Overfitting Prevention (10/10)** 🛡️
-Your model has **comprehensive protection** against overfitting:
-
-**Regularization:**
-- ✅ **10+ Dropout Layers** (0.2-0.5 throughout architecture)
-- ✅ **15+ Normalization Layers** (BatchNorm, LayerNorm for stability)
-- ✅ **Early Stopping** (patience=10 epochs, monitors validation accuracy)
-- ✅ **Gradient Clipping** (max_norm=1.0, prevents explosions)
-
-**Data Augmentation:**
-- ✅ **20+ Augmentation Types** applied to 70-80% of training data
-- ✅ **Social Media Compression** (Instagram, TikTok, WhatsApp - 70% probability)
-- ✅ **Resolution Degradation** (224px→45px→224px - 50% probability)
-- ✅ **Adaptive Lighting** (low-light, overexposed, shadows - 60% probability)
-- ✅ **Temporal Consistency** (same augmentation across all 16 frames)
-
-**Multi-Objective Learning:**
-- ✅ **Consistency Loss** (KL divergence, prevents "always fake" predictions)
-- ✅ **Per-Modality Losses** (audio-only 0.3x, video-only 0.3x weights)
-- ✅ **Focal Loss** (focuses on hard examples, not easy ones)
-- ✅ **Class Weighting** (balanced sampling, no bias toward majority)
-
-**Dataset Quality:**
-- ✅ **99,873 Diverse Samples** (large dataset prevents overfitting by design)
-- ✅ **Train/Val/Test Split** (70%/20%/10%, no data leakage)
-- ✅ **Multiple Deepfake Methods** (GAN, reenactment, voice cloning)
-
-#### **Underfitting Prevention (10/10)** 🚀
-Your model has **optimal capacity** to learn complex patterns:
-
-**Model Capacity:**
-- ✅ **62M Parameters** (optimal size - not too small, not too large)
-- ✅ **Deep Architecture** (27 active components, multi-layer learning)
-- ✅ **Pre-trained Backbones** (EfficientNet-B0 on ImageNet, transfer learning)
-
-**Training Strategy:**
-- ✅ **30 Epochs** (sufficient time to converge)
-- ✅ **Optimal Learning Rate** (5e-5 with cosine annealing)
-- ✅ **Warm-up Period** (5 epochs for stable training)
-- ✅ **Contrastive Learning** (+15-20% accuracy boost from difference patterns)
-
-**Multi-Task Learning:**
-- ✅ **3 Simultaneous Tasks** (combined, audio-only, video-only classifiers)
-- ✅ **Shared Features** (richer representations from multi-task supervision)
-- ✅ **1.7x Total Loss Weight** (more supervision signals)
-
-#### **Model Breaking Prevention (10/10)** 🔧
-Your model has **enterprise-grade stability**:
-
-**Numerical Stability:**
-- ✅ **Gradient Clipping** (max_norm=1.0, stops explosions)
-- ✅ **NaN/Inf Detection** (skips bad batches, continues training)
-- ✅ **Output Clamping** (-10 to +10 range, prevents extreme values)
-- ✅ **Mixed Precision Stability** (AMP + FP32 fallback for sensitive ops)
-
-**Memory Management:**
-- ✅ **Efficient GPU Usage** (works on 16GB, optimized for 24GB+)
-- ✅ **Gradient Checkpointing** (30% memory saving)
-- ✅ **Automatic Cache Clearing** (after each epoch)
-- ✅ **CPU Fallback** (works without GPU)
-
-**Error Recovery:**
-- ✅ **Robust Data Loading** (continues if 1-2 samples fail)
-- ✅ **Flexible Batch Sizes** (handles varying batch sizes)
-- ✅ **Multiprocessing Safe** (picklable augmentation wrappers)
-- ✅ **Checkpoint Management** (never lose training progress)
-
-#### **Training Behavior Guarantees** ✅
-
-**What WILL Happen:**
+**Frozen Parameters (first 20):**
 ```
-✅ Smooth loss decrease: 0.65 → 0.42 → 0.28 → 0.15
-✅ Steady accuracy increase: 65% → 78% → 85% → 90%+
-✅ No sudden spikes or crashes
-✅ Validation tracks training (proper generalization)
-✅ Best checkpoint saved before overfitting
-✅ Early stopping if plateau detected
-✅ Contrastive features learned from fake-real differences
-✅ Per-modality detection working (audio/video/combined)
+visual_model.features.0.0.weight:  [32, 3, 3, 3]     # Stem conv
+visual_model.features.0.1.weight:  [32]                # Stem BN weight
+visual_model.features.0.1.bias:    [32]                # Stem BN bias
+visual_model.features.1.0.block.0.0.weight: [32,1,3,3] # Block1 DW conv
+visual_model.features.1.0.block.0.1.weight: [32]       # Block1 DW BN
+visual_model.features.1.0.block.0.1.bias:   [32]       # Block1 DW BN bias
+visual_model.features.1.0.block.1.fc1.weight: [8,32,1,1]  # Block1 SE fc1
+visual_model.features.1.0.block.1.fc1.bias:   [8]         # Block1 SE fc1 bias
+visual_model.features.1.0.block.1.fc2.weight: [32,8,1,1]  # Block1 SE fc2
+visual_model.features.1.0.block.1.fc2.bias:   [32]        # Block1 SE fc2 bias
+visual_model.features.1.0.block.2.0.weight: [16,32,1,1]   # Block1 project
+visual_model.features.1.0.block.2.1.weight: [16]          # Block1 project BN
+visual_model.features.1.0.block.2.1.bias:   [16]          # Block1 project BN bias
+... (total 20 parameters, 5,544 scalars)
 ```
 
-**What WON'T Happen:**
-```
-❌ NO Overfitting - Dropout + early stopping + augmentation prevent it
-❌ NO Underfitting - 62M params + contrastive learning + 30 epochs prevent it
-❌ NO NaN/Inf errors - Gradient clipping + clamping + checks prevent it
-❌ NO Memory crashes - AMP + optimization + checkpointing prevent it
-❌ NO Stuck training - Learning rate scheduling prevents it
-❌ NO Mode collapse - Consistency loss prevents it
-```
+**Progressive Unfreezing:** After epoch 3, 10 layers unfrozen per epoch. All backbone layers are always in the optimizer (just with `requires_grad=False` initially), so unfreezing simply sets `requires_grad=True`.
 
-**Confidence Score: 98/100** - Your model has MORE safeguards than most production systems!
+### Video Projection
+```
+video_projection: Linear(1280, 1280)   # 1,639,680 params
+```
 
 ---
 
-## 💾 Installation
+## 3. Audio Backbone - LightweightAudioEncoder
 
-### System Requirements
+**Total: 657,472 params (all trainable)**
 
-| Component | Minimum | Recommended |
-|-----------|---------|-------------|
-| **OS** | Windows 10 / Ubuntu 20.04 | Windows 11 / Ubuntu 22.04 |
-| **Python** | 3.10+ | 3.12 |
-| **RAM** | 16 GB | 32 GB+ |
-| **GPU** | NVIDIA GTX 1660 Ti (6GB) | NVIDIA RTX 3090/4090 (24GB+) |
-| **CUDA** | 11.8+ | 12.4 |
-| **Storage** | 100 GB SSD | 500 GB NVMe SSD |
-| **CPU** | Intel i5-8th gen / AMD Ryzen 5 | Intel i7-12th gen+ / AMD Ryzen 9 |
+Replaces Wav2Vec2 (94.4M params) with a 99.3% parameter reduction and <1% accuracy loss.
 
-### Step 1: Clone Repository
-
-```bash
-git clone <repository-url>
-cd backend/Models
+### Architecture
+```
+Input: raw waveform [B, audio_length]
+  |
+  v
+MFCC Transform (n_mfcc=40, sample_rate=16000)
+  -> [B, 40, T]
+  |
+  v
+Conv1d Stack:
+  Conv1d(40, 64, kernel=3) -> BN(64) -> ReLU -> MaxPool1d
+  Conv1d(64, 128, kernel=3) -> BN(128) -> ReLU -> MaxPool1d
+  Conv1d(128, 256, kernel=3) -> BN(256) -> ReLU -> AdaptiveAvgPool1d(1)
+  -> [B, 256]
+  |
+  v
+Projection:
+  Linear(256, 512) -> ReLU -> Dropout(0.1) -> Linear(512, 768)
+  -> [B, 768]
 ```
 
-### Step 2: Create Virtual Environment
+**Buffers:**
+- `mfcc_transform.dct_mat`: [40, 40] (DCT matrix for MFCC computation)
+- `mfcc_transform.MelSpectrogram.spectrogram.window`: [400] (Hann window)
+- `mfcc_transform.MelSpectrogram.mel_scale.fb`: [201, 40] (Mel filterbank)
 
-**Windows (PowerShell):**
+### Audio Projection
+```
+audio_projection: Linear(768, 768)   # 590,592 params
+```
+
+### Spectrogram Model
+```
+spectrogram_model: Sequential(       # 92,672 params
+  Conv2d(1, 32, 3x3) -> ReLU -> MaxPool2d
+  Conv2d(32, 64, 3x3) -> ReLU -> MaxPool2d
+  Conv2d(64, 128, 3x3) -> ReLU -> AdaptiveAvgPool2d
+)
+spectrogram_projection: Linear(128, 768)  # 99,072 params
+```
+
+---
+
+## 4. Cross-Modal Fusion Module
+
+**Total: 7,483,392 params**
+
+Implements bidirectional cross-attention between visual and audio features, followed by gated fusion.
+
+### Architecture
+```
+Input: visual [B, 1280], audio [B, 768]
+  |
+  +-- visual_projection: Linear(1280, 768)   # Project visual to shared dim
+  +-- audio_projection:  Linear(768, 768)    # Project audio to shared dim
+  +-- visual_norm: LayerNorm(768)
+  +-- audio_norm: LayerNorm(768)
+  |
+  v
+Bi-directional Cross-Attention:
+  Visual attending to Audio:
+    Q = visual_query(visual)  [768->768]
+    K = audio_key(audio)      [768->768]
+    V = audio_value(audio)    [768->768]
+    attended_visual = softmax(QK^T / sqrt(768)) * V
+
+  Audio attending to Visual:
+    Q = audio_query(audio)    [768->768]
+    K = visual_key(visual)    [768->768]
+    V = visual_value(visual)  [768->768]
+    attended_audio = softmax(QK^T / sqrt(768)) * V
+  |
+  v
+Gated Fusion:
+  gate = sigmoid(gate_layer([attended_visual || attended_audio]))  # [1536->768]
+  fused = gate * attended_visual + (1 - gate) * attended_audio
+  |
+  v
+Residual Fusion:
+  fusion_layer: Linear(1536, 768)  # [visual || audio] -> 768
+  output = LayerNorm(fused + residual)
+  -> [B, 768]
+```
+
+**Complete Parameter List:**
+```
+fusion_module.visual_projection.weight: [768, 1280]
+fusion_module.visual_projection.bias:   [768]
+fusion_module.audio_projection.weight:  [768, 768]
+fusion_module.audio_projection.bias:    [768]
+fusion_module.visual_norm.weight:       [768]
+fusion_module.visual_norm.bias:         [768]
+fusion_module.audio_norm.weight:        [768]
+fusion_module.audio_norm.bias:          [768]
+fusion_module.visual_query.weight:      [768, 768]
+fusion_module.visual_query.bias:        [768]
+fusion_module.audio_key.weight:         [768, 768]
+fusion_module.audio_key.bias:           [768]
+fusion_module.audio_value.weight:       [768, 768]
+fusion_module.audio_value.bias:         [768]
+fusion_module.audio_query.weight:       [768, 768]
+fusion_module.audio_query.bias:         [768]
+fusion_module.visual_key.weight:        [768, 768]
+fusion_module.visual_key.bias:          [768]
+fusion_module.visual_value.weight:      [768, 768]
+fusion_module.visual_value.bias:        [768]
+fusion_module.gate.0.weight:            [768, 1536]
+fusion_module.gate.0.bias:              [768]
+fusion_module.fusion_layer.weight:      [768, 1536]
+fusion_module.fusion_layer.bias:        [768]
+fusion_module.layer_norm.weight:        [768]
+fusion_module.layer_norm.bias:          [768]
+```
+
+---
+
+## 5. Transformer Encoder
+
+**Total: 28,351,488 params**
+
+4-layer Transformer Encoder operating on the fused 768-dimensional features.
+
+### Per-Layer Architecture
+```
+TransformerEncoderLayer(d_model=768, nhead=8, dim_feedforward=3072):
+  |
+  +-- Multi-Head Self-Attention:
+  |     in_proj_weight: [2304, 768]   # Q,K,V packed (3 x 768 = 2304)
+  |     in_proj_bias:   [2304]
+  |     out_proj:       Linear(768, 768)
+  |
+  +-- LayerNorm1: weight [768], bias [768]
+  |
+  +-- FFN:
+  |     linear1: Linear(768, 3072)
+  |     linear2: Linear(3072, 768)
+  |
+  +-- LayerNorm2: weight [768], bias [768]
+```
+
+**Per-layer params:** 7,087,872
+**Total (4 layers):** 28,351,488
+
+**Layer-by-layer:**
+```
+Layer 0: transformer.layers.0.*  (7,087,872 params)
+Layer 1: transformer.layers.1.*  (7,087,872 params)
+Layer 2: transformer.layers.2.*  (7,087,872 params)
+Layer 3: transformer.layers.3.*  (7,087,872 params)
+```
+
+---
+
+## 6. Contrastive Fusion
+
+**Total: 10,623,744 params (training only)**
+
+Learns fake-vs-original feature differences via contrastive comparison. Only active during training; disabled at inference.
+
+### Architecture
+```
+contrastive_fusion: Sequential(
+  Linear(6144, 1536) -> BatchNorm1d(1536) -> ReLU -> Dropout(0.1)
+  Linear(1536, 768)  -> BatchNorm1d(768)
+)
+```
+Input: concatenation of [fake_visual, fake_audio, original_visual, original_audio] = 6144
+
+### Supporting Components
+```
+feature_difference_analyzer: Sequential(     # 1,640,320 params
+  Linear(1280, 640) -> ReLU -> Dropout(0.1)
+  Linear(640, 1280) -> ReLU
+)
+
+audio_difference_analyzer: Sequential(       # 590,976 params
+  Linear(768, 384) -> ReLU -> Dropout(0.1)
+  Linear(384, 768) -> ReLU
+)
+
+similarity_scorer: Sequential(               # 1,180,673 params
+  Linear(2048, 512) -> ReLU -> Dropout(0.1)
+  Linear(512, 256) -> ReLU
+  Linear(256, 1)                # Similarity score
+)
+
+combined_projection: Linear(2048, 768)       # 1,573,632 params
+```
+
+---
+
+## 7. Explainability Projector
+
+**Total: 2,491,648 params**
+
+Projects concatenated features from multiple modalities into the transformer dimension space for explanation generation.
+
+```
+explainability_projector: Sequential(
+  Linear(4096, 512)    # 4096 input = concat of multiple feature vectors
+  ReLU
+  Dropout(0.1)
+  Linear(512, 768)     # Output matches transformer dim
+)
+```
+
+---
+
+## 8. Classification Heads
+
+### Main Classifier (920,322 params)
+```
+classifier: Sequential(
+  Linear(1536, 512)          # 1536 = [audio_768 || transformer_768]
+  BatchNorm1d(512)           # Stabilizes training, reduces internal covariate shift
+  ReLU
+  Dropout(0.3)               # Strong regularization
+  Linear(512, 256)
+  BatchNorm1d(256)
+  ReLU
+  Dropout(0.2)
+  Linear(256, 2)             # Binary: REAL vs FAKE
+)
+```
+
+### Per-Modality Classifiers (for tampering type detection)
+
+**Audio-Only Classifier (230,018 params):**
+```
+audio_only_classifier: Sequential(
+  Linear(768, 256) -> ReLU -> Dropout(0.2)
+  Linear(256, 128) -> ReLU -> Dropout(0.1)
+  Linear(128, 2)
+)
+```
+
+**Video-Only Classifier (361,090 params):**
+```
+video_only_classifier: Sequential(
+  Linear(1280, 256) -> ReLU -> Dropout(0.2)
+  Linear(256, 128) -> ReLU -> Dropout(0.1)
+  Linear(128, 2)
+)
+```
+
+**Deepfake Type Classifier (395,271 params):**
+```
+deepfake_type_classifier: Sequential(
+  Linear(1536, 256) -> ReLU -> Dropout(0.2)
+  Linear(256, 7)              # 7 types: unknown, face_swap, face_reenactment,
+)                              #   lip_sync, audio_only, entire_synthesis,
+                               #   attribute_manipulation
+```
+
+### Auxiliary Heads
+```
+aux_visual_head:        Linear(1280, 128) -> ReLU -> Drop(0.2) -> Linear(128, 2)    # 164,226
+aux_audio_head:         Linear(768, 128)  -> ReLU -> Drop(0.2) -> Linear(128, 2)    # 98,690
+aux_physiological_head: Linear(256, 64)   -> ReLU -> Drop(0.2) -> Linear(64, 2)     # 16,578
+aux_facial_head:        Linear(256, 64)   -> ReLU -> Drop(0.2) -> Linear(64, 2)     # 16,578
+aux_forensic_head:      Linear(64, 32)    -> ReLU -> Drop(0.2) -> Linear(32, 2)     # 2,146
+```
+
+---
+
+## 9. Physiological Analysis Components
+
+### 9.1 Advanced Physiological Analyzer (86,183 params)
+
+Contains three sub-analyzers fused together:
+
+#### Digital Heartbeat Detector (14,354 params standalone, also nested in advanced)
+```
+face_attention: Conv2d(3,16,3) -> Conv2d(16,8,3) -> Conv2d(8,1,1)
+temporal_extractor: Conv1d(3,32,3) -> Conv1d(32,64,3) -> Conv1d(64,32,3) -> Conv1d(32,1,1)
+```
+Detects subtle color changes in facial skin corresponding to blood pulse. Deepfakes lack this natural pulse signal.
+
+#### Blood Flow Analyzer (34,791 params standalone, also nested)
+```
+skin_segmenter: Conv2d(3,32,3) -> Conv2d(32,16,3) -> Conv2d(16,1,1)
+color_transformer: Conv1d(3,16,1) -> Conv1d(16,8,1) -> Conv1d(8,3,1)
+temporal_analyzer: Conv1d(3,32,3) -> BN -> Conv1d(32,64,3) -> BN -> Conv1d(64,32,3) -> BN
+flow_classifier: Linear(32,64) -> ReLU -> Drop -> Linear(64,32) -> ReLU -> Linear(32,1)
+thermal_analyzer: Conv2d(3,16,3) -> Conv2d(16,32,3) -> Conv2d(32,16,3) -> Conv2d(16,1,1)
+temp_consistency: Linear(64,32) -> ReLU -> Linear(32,1)
+```
+
+#### Breathing Pattern Detector (33,900 params standalone, also nested)
+```
+chest_detector: Conv2d(3,32,3) -> Conv2d(32,16,3) -> Conv2d(16,8,3) -> Flatten -> Linear(8,1)
+nostril_analyzer: Conv2d(3,16,3) -> Conv2d(16,8,3) -> Flatten -> Linear(128,32) -> Linear(32,1)
+pattern_analyzer: Conv1d(2,32,3) -> BN -> Conv1d(32,64,3) -> BN -> Conv1d(64,32,3) -> BN
+rate_estimator: Linear(32,64) -> ReLU -> Linear(64,32) -> ReLU -> Linear(32,1)
+naturalness_classifier: Linear(34,64) -> ReLU -> Drop -> Linear(64,32) -> ReLU -> Linear(32,1)
+```
+
+**Fusion and Coherence:**
+```
+advanced_physiological_analyzer.fusion_layer: Linear(3,64) -> ReLU -> Drop -> Linear(64,32) -> ReLU -> Linear(32,1)
+advanced_physiological_analyzer.coherence_analyzer: Linear(6,32) -> ReLU -> Linear(32,16) -> ReLU -> Linear(16,1)
+```
+
+### 9.2 Skin Color Analyzer (103,105 params)
+```
+color_encoder: Linear(3,64) -> ReLU -> Linear(64,64) -> ReLU
+temporal_cnn: Conv1d(64,128,3) -> Conv1d(128,128,3) -> Conv1d(128,64,3)
+naturalness_scorer: Linear(64,1)
+```
+Tracks temporal skin color consistency across frames. Deepfakes often show unnatural color fluctuations.
+
+### 9.3 Eye Analysis Module (8,067 params)
+```
+blink_detector: Linear(32,16) -> ReLU -> Linear(16,1)
+pupil_estimator: Linear(32,16) -> ReLU -> Linear(16,1)
+temporal_gru: GRU(input=2, hidden=32, bidirectional=True, 1 layer)
+naturalness_scorer: Linear(64,1)
+```
+
+### 9.4 Liveness Detector (164,097 params)
+```
+detector: Linear(1280,128) -> ReLU -> Linear(128,1)
+```
+Direct liveness check from visual features.
+
+---
+
+## 10. Forensic and Behavioral Analysis
+
+### 10.1 Micro-Expression Detector (2,491,015 params)
+```
+conv3d: Conv3d(3,64,3) -> BN3d -> ReLU -> Conv3d(64,128,3) -> BN3d -> ReLU
+temporal_lstm: BiLSTM(input=2048, hidden=128, 1 layer)
+classifier: Linear(256,128) -> ReLU -> Drop -> Linear(128,7)  # 7 micro-expression types
+```
+
+### 10.2 Facial Action Unit (AU) Analyzer (178,194 params)
+```
+encoder: Linear(136,128) -> BN -> ReLU -> Linear(128,128)
+au_heads: 17x Linear(128,1)           # 17 individual AU detectors
+temporal_lstm: BiLSTM(input=17, hidden=64, 2 layers)
+consistency_scorer: Linear(128,1)
+```
+Detects 17 facial action units (FACS) and measures temporal consistency. Deepfakes often lack subtle AU synchronization.
+
+### 10.3 Facial Landmark Trajectory Analyzer (158,529 params)
+```
+motion_encoder: Linear(136,128) -> ReLU -> Drop -> Linear(128,64)
+temporal_gru: BiGRU(input=64, hidden=64, 2 layers)
+consistency_scorer: Linear(128,64) -> ReLU -> Linear(64,1)
+```
+
+### 10.4 Head Pose Estimator (127,108 params)
+```
+pose_estimator: Linear(136,128) -> ReLU -> Drop -> Linear(128,64) -> Linear(64,3)  # pitch, yaw, roll
+consistency_analyzer: BiGRU(input=3, hidden=64, 2 layers)
+consistency_scorer: Linear(128,1)
+```
+
+### 10.5 Lip-Audio Sync Analyzer (138,945 params)
+```
+lip_encoder: Linear(40,128) -> ReLU -> Linear(128,64)
+audio_encoder: Linear(768,128) -> ReLU -> Linear(128,64)
+cross_attention: MultiheadAttention(embed_dim=64, num_heads=4)
+sync_scorer: Linear(64,32) -> ReLU -> Linear(32,1)
+```
+
+### 10.6 Sync Detector (328,449 params)
+```
+visual_encoder: Linear(1280,128) -> ReLU -> Linear(128,128)
+audio_encoder: Linear(768,128) -> ReLU -> Linear(128,128)
+fusion: Linear(256,128) -> ReLU -> Linear(128,1)
+```
+
+### 10.7 Forensic Module (42,880 params)
+```
+conv1: Conv2d(3,64,3) -> ReLU -> MaxPool
+conv2: Conv2d(64,64,3) -> ReLU -> AdaptiveAvgPool
+fc: Linear(64,64)
+```
+Analyzes ELA (Error Level Analysis) features for compression artifact detection.
+
+### 10.8 Face Embedding Processor (98,688 params)
+```
+Linear(256,256) -> ReLU -> Linear(256,128)
+```
+
+---
+
+## 11. Mobile Sensor Analysis
+
+### 11.1 Mobile Sensor Fusion (1,170,949 params)
+```
+optical_flow_proj: Linear(64, 256)
+metadata_proj:     Linear(32, 256)
+shutter_proj:      Linear(16, 256)
+sync_proj:         Linear(32, 256)
+depth_proj:        Linear(64, 256)
+
+attention: Linear(1280,256) -> ReLU -> Linear(256,5)  # 5 sensor weights
+fusion:    Linear(1280,512) -> ReLU -> Drop -> Linear(512,256)
+```
+
+### 11.2 Sub-Analyzers
+
+| Component | Params | Input | Output |
+|-----------|--------|-------|--------|
+| `optical_flow_analyzer` | 8,737 | 10-dim motion | shake score |
+| `camera_metadata_analyzer` | 1,744 | 8-dim EXIF | 32-dim features |
+| `rolling_shutter_detector` | 184 | 4-dim shutter | 16-dim features |
+| `av_sync_analyzer` | 656 | 6-dim sync | 32-dim features |
+| `mobile_depth_analyzer` | 88,896 | depth map | 64-dim features |
+
+### 11.3 Voice Stress Analyzer (49,453 params)
+```
+jitter_shimmer_analyzer:
+  feature_extractor: Linear(10,32) -> ReLU -> Drop -> Linear(32,64) -> ReLU -> Drop -> Linear(64,32)
+  stress_classifier: Linear(32,16) -> ReLU -> Linear(16,1)
+
+emotional_detector:
+  emotion_encoder: Linear(64,128) -> ReLU -> Drop -> Linear(128,64) -> ReLU -> Drop -> Linear(64,32)
+  stress_head, anxiety_head, fear_head, anger_head: Linear(32,1) each
+  overall_emotion: Linear(32,7)  # 7 emotion classes
+
+formant_analyzer:
+  formant_encoder: Linear(12,32) -> ReLU -> Linear(32,64) -> ReLU -> Linear(64,32)
+
+fusion: Linear(96,128) -> ReLU -> Drop -> Linear(128,64) -> ReLU -> Linear(64,1)
+```
+
+---
+
+## 12. Contrastive Learning Pipeline
+
+During training, each sample provides both a **fake** video and its **original** (real) counterpart. The model extracts features from both and computes:
+
+1. **Feature Differences:** `feature_difference_analyzer(fake_visual - original_visual)`
+2. **Audio Differences:** `audio_difference_analyzer(fake_audio - original_audio)`
+3. **Similarity Score:** `similarity_scorer([fake_combined, original_combined])`
+4. **Contrastive Fusion:** `contrastive_fusion([fake_v, fake_a, orig_v, orig_a])`
+
+This teaches the model what specific artifacts distinguish fakes from originals, rather than learning dataset biases.
+
+### Learnable Thresholds
+```
+deepfake_threshold:               scalar    # Adaptive detection threshold
+frequency_threshold:              scalar    # Frequency domain anomaly threshold
+noise_threshold:                  scalar    # Noise pattern threshold
+temporal_consistency_threshold:   scalar    # Temporal consistency threshold
+diversity_loss_weight:            scalar    # Component diversity loss scaling
+component_weights:                [50]      # Learnable weights for 50 components
+```
+
+---
+
+## 13. Data Pipeline
+
+### 13.1 Dataset Format (LAV-DF)
+
+- **Source:** LAV-DF (Large-scale Audivisual Deepfake) dataset
+- **Splits:** train (78,703), dev (31,501), test (26,100)
+- **Metadata:** `metadata.json` with `split` field per entry
+- **Fields per entry:** `file`, `original`, `split`, `label`, `modify_type`, `fake_periods`, `timestamps`, `transcript`
+
+### 13.2 Data Loading (`dataset_loader.py`)
+
+**Frame Sampling:**
+- Max frames: 32 (configurable via `--max_frames`)
+- Sampling: uniform temporal sampling across video duration
+- Face detection: dlib HOG detector with CNN fallback
+- Landmark extraction: dlib 68-point face landmarks normalized to [0,1] range
+
+**Audio Processing:**
+- Sample rate: 16,000 Hz
+- Audio length: configurable (default from video duration)
+- MFCC: 40 coefficients over 50 time steps (from audio, reduced from 100)
+- Voice stress: 6-dim (jitter, shimmer, HNR + flags)
+
+### 13.3 Complete Feature Dictionary (per sample)
+
+Every `__getitem__` call returns a dictionary with these keys:
+
+| Key | Shape | Description |
+|-----|-------|-------------|
+| `video_frames` | `[32, 3, 224, 224]` | Face-cropped, normalized RGB frames |
+| `audio` | `[audio_length]` | Raw waveform at 16kHz |
+| `audio_spectrogram` | `[1, 64, 64]` | Mel spectrogram |
+| `label` | scalar | 0=REAL, 1=FAKE, -1=placeholder (filtered) |
+| `deepfake_type` | scalar | 0-6 (see classifier section) |
+| `facial_landmarks` | `[32, 136]` | 68 landmarks x 2 coords, normalized |
+| `mfcc_features` | `[20, 50]` | MFCC coefficients |
+| `voice_stress_features` | `[6]` | Jitter, shimmer, HNR + flags |
+| `pulse_signal` | `[32]` | Estimated pulse per frame |
+| `skin_color_variations` | `[32, 3]` | Mean RGB per frame |
+| `head_pose` | `[32, 3]` | Pitch, yaw, roll per frame |
+| `eye_blink_features` | `[32]` | Eye aspect ratio per frame |
+| `frequency_features` | `[1, 16, 16]` | DCT frequency map |
+| `face_embeddings` | `[1, 256]` | Face identity embedding |
+| `temporal_consistency` | scalar | Frame-to-frame consistency score |
+| `metadata_features` | `[10]` | Video metadata (bitrate, fps, etc.) |
+| `ela_features` | `[112, 112]` | Error Level Analysis map |
+| `audio_visual_sync` | `[5]` | A/V synchronization features |
+| `file_path` | string | Source video path |
+| `fake_mask` | `[1]` | Temporal fake mask |
+| `original_video_frames` | `[32, 3, 224, 224]` or None | Original (real) video for contrastive |
+| `original_audio` | `[audio_length]` or None | Original audio for contrastive |
+| `fake_periods` | list | Time periods of fakery |
+| `timestamps` | list | Video timestamps |
+| `transcript` | string | Audio transcription |
+| `original_facial_landmarks` | `[32, 136]` | Original landmarks |
+| `original_mfcc_features` | `[20, 50]` | Original MFCCs |
+| `original_voice_stress_features` | `[6]` | Original voice stress |
+| `original_pulse_signal` | `[32]` | Original pulse |
+| `original_skin_color_variations` | `[32, 3]` | Original skin color |
+| `original_head_pose` | `[32, 3]` | Original head pose |
+| `original_eye_blink_features` | `[32]` | Original blink |
+| `original_frequency_features` | `[1, 16, 16]` | Original frequency |
+
+### 13.4 Augmentation (`improved_augmentation.py`)
+
+**Training transforms:**
+- Random horizontal flip
+- Random JPEG compression (quality 70-95)
+- Color jitter (brightness, contrast, saturation, hue)
+- Random rotation (up to 10 degrees)
+- Random gaussian noise
+- Normalize: mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+
+**Validation transforms (deterministic):**
+- Resize to 224x224
+- Normalize only (no random augmentation)
+
+### 13.5 DataLoader Configuration
+
+```python
+# Training (both oversampled and normal paths):
+DataLoader(
+    dataset,
+    batch_size=16,
+    shuffle=True,
+    num_workers=4,
+    pin_memory=True,
+    drop_last=True,       # Prevents BatchNorm crash with batch_size=1
+    collate_fn=safe_collate_fn
+)
+
+# Validation:
+DataLoader(
+    dataset,
+    batch_size=16,
+    shuffle=False,
+    num_workers=4,
+    pin_memory=True,
+    drop_last=False,      # Keep all validation samples
+    collate_fn=safe_collate_fn
+)
+```
+
+---
+
+## 14. Training Pipeline
+
+### 14.1 Training Loop (`train_multimodal.py` - `DeepfakeTrainer` class)
+
+```
+For each epoch:
+    1. Progressive unfreezing (after epoch 3)
+    2. For each batch:
+        a. Forward pass (AMP mixed precision)
+        b. Compute multi-component loss
+        c. Scale loss by grad_accum_steps
+        d. Backward pass (scaled)
+        e. Every grad_accum_steps:
+           - Gradient clipping (max_norm=1.5)
+           - Optimizer step
+           - EMA update
+           - Scheduler step
+        f. Mixup augmentation (randomly applied)
+    3. Validate on dev set (using EMA model)
+    4. Save checkpoint if best F1
+    5. Early stopping check (patience=10)
+```
+
+### 14.2 Full Hyperparameter Table
+
+| Parameter | Value | CLI Flag |
+|-----------|-------|----------|
+| Batch size | 16 | `--batch_size` |
+| Gradient accumulation | 4 | `--grad_accum_steps` |
+| Effective batch size | **64** | (16 x 4) |
+| Epochs | 80 | `--num_epochs` |
+| Learning rate (heads) | 3e-4 | `--learning_rate` |
+| Learning rate (backbone) | 3e-5 | (automatic 10x lower) |
+| Weight decay | 0.01 | `--weight_decay` |
+| Dropout (classifier) | 0.3, 0.2 | `--dropout_rate` |
+| Gradient clipping | 1.5 | `--gradient_clip` |
+| Max frames | 32 | `--max_frames` |
+| Label smoothing | 0.05 | `--label_smoothing` |
+| Focal alpha | 1.0 | `--focal_alpha` |
+| Focal gamma | 2.0 (or 3.0) | `--focal_gamma` |
+| EMA decay | 0.999 | `--ema_decay` |
+| Mixup alpha | 0.2 | `--mixup_alpha` |
+| Warmup epochs | 3 | `--warmup_epochs` |
+| Early stopping patience | 10 | `--early_stopping_patience` |
+| Min learning rate | 1e-6 | `--min_lr` |
+| AMP (mixed precision) | Enabled | `--amp_enabled` |
+| QAT start epoch | 40 | `--qat_start_epoch` |
+| QAT backend | fbgemm | `--qat_backend` |
+| QAT LR scale | 0.1 | `--qat_lr_scale` |
+
+### 14.3 Environment Variables
+```
+CUDA_VISIBLE_DEVICES=0
+TORCH_CUDNN_BENCHMARK=1
+TORCH_ALLOW_TF32=1
+CUDA_TF32_TENSOR_CORES=1
+OMP_NUM_THREADS=24
+MKL_NUM_THREADS=24
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:512,roundup_power2_divisions:16
+SHAPE_PREDICTOR_PATH=F:\Deepfakee\Models\shape_predictor_68_face_landmarks.dat
+```
+
+---
+
+## 15. Loss Functions
+
+### 15.1 FocalLoss (Primary)
+
+```python
+FocalLoss(alpha=1.0, gamma=2.0, label_smoothing=0.05, class_weights='balanced')
+```
+
+**Formula:**
+$$FL(p_t) = -\alpha \cdot (1 - p_t)^{\gamma} \cdot \text{CE}(p_t)$$
+
+Where:
+- $p_t$ = model confidence for the correct class
+- $\alpha = 1.0$ (neutral global scale; class-specific weighting via `class_weights`)
+- $\gamma = 2.0$ (focusing parameter — down-weights easy examples)
+- Label smoothing $= 0.05$ (prevents overconfident predictions)
+- `class_weights` computed from inverse class frequencies (balanced mode)
+
+**Numerical stability:**
+- Input logits clamped to [-50, 50]
+- $p_t$ clamped to [1e-7, 1 - 1e-7]
+
+### 15.2 Multi-Component Loss Budget
+
+```
+total_loss = main_loss
+           + 0.1  * audio_only_loss      # Per-modality: audio classifier
+           + 0.1  * video_only_loss      # Per-modality: video classifier
+           + 0.05 * kl_consistency_loss  # KL divergence between modality predictions
+           + aux_loss                    # Auxiliary head losses (dynamic weights)
+           + diversity_loss              # Component diversity regularization
+```
+
+**Per-modality losses** use the same FocalLoss but on `audio_only_classifier` and `video_only_classifier` outputs. They are computed WITHOUT AMP (full float32) to prevent numerical instability in small classifiers.
+
+**KL Consistency Loss:** Ensures audio-only and video-only predictions agree with the main classifier. Prevents modalities from diverging.
+
+**Diversity Loss:** Encourages different components to contribute uniquely, preventing redundancy. Scaled by learnable `diversity_loss_weight`.
+
+---
+
+## 16. Optimizer and Scheduler
+
+### 16.1 AdamW with 4 Parameter Groups
+
+```python
+optimizer = AdamW([
+    # Group 0: Backbone params with weight decay
+    {'params': backbone_decay_params,    'lr': 3e-5,  'weight_decay': 0.01},
+    
+    # Group 1: Backbone params WITHOUT weight decay (BN weights, biases)
+    {'params': backbone_no_decay_params, 'lr': 3e-5,  'weight_decay': 0.0},
+    
+    # Group 2: Head params with weight decay
+    {'params': head_decay_params,        'lr': 3e-4,  'weight_decay': 0.01},
+    
+    # Group 3: Head params WITHOUT weight decay (BN weights, biases)
+    {'params': head_no_decay_params,     'lr': 3e-4,  'weight_decay': 0.0},
+])
+```
+
+**Discriminative LR:** Backbone (EfficientNet-B0) gets 10x lower learning rate than heads. This preserves pretrained features while allowing fine-tuning.
+
+**Weight Decay Exclusion:** BatchNorm parameters and biases are excluded from weight decay (group 1 and 3) — a best practice that prevents BN scale from being regularized toward zero.
+
+### 16.2 CosineAnnealingWarmRestarts
+
+```python
+scheduler = CosineAnnealingWarmRestarts(
+    optimizer,
+    T_0=10,        # First restart at epoch 10
+    T_mult=2,      # Second at 10+20=30, third at 30+40=70
+    eta_min=1e-6   # Minimum learning rate
+)
+```
+
+**Warmup:** Linear warmup over 3 epochs from `lr * 0.1` to full `lr`.
+
+**LR Schedule Visualization:**
+```
+Epoch:  1  2  3  4  5  6  7  8  9  10  11 ... 30  31 ... 70
+        warmup      |   cosine decay    |restart|cosine|restart
+LR:    3e-5 ... 3e-4 ... decay ... 1e-6  3e-4  decay  1e-6
+```
+
+---
+
+## 17. EMA (Exponential Moving Average)
+
+```python
+ModelEMA(model, decay=0.999)
+```
+
+Maintains a shadow copy of ALL 68,551,263 trainable parameters plus 209 BatchNorm buffers. After each optimizer step:
+
+$$\theta_{\text{EMA}} = \alpha \cdot \theta_{\text{EMA}} + (1 - \alpha) \cdot \theta_{\text{model}}$$
+
+Where $\alpha = 0.999$. The EMA model is used for:
+- **Validation:** All validation metrics computed on EMA model
+- **Checkpointing:** Best model saved is the EMA version
+- **Inference:** Production model uses EMA weights
+
+**BN Buffer Tracking:** EMA also copies running_mean, running_var, and num_batches_tracked from the training model to the shadow model at each update. This ensures the EMA model's BatchNorm statistics stay current.
+
+---
+
+## 18. Progressive Unfreezing
+
+Starting at epoch 3, the backbone (EfficientNet-B0) is gradually unfrozen:
+
+```
+Epoch 1-3:  Only first 20 params frozen (stem + block1)
+            All other backbone params already trainable but at 0.1x LR
+Epoch 4:    10 additional layers unfrozen (deeper blocks)
+Epoch 5:    10 more layers unfrozen
+...
+Epoch N:    All backbone layers fully trainable
+```
+
+**Implementation:** All backbone parameters are added to the optimizer from the start (with `requires_grad=False` for frozen ones). Unfreezing simply sets `requires_grad=True` — no optimizer reconstruction needed.
+
+This prevents catastrophic forgetting of ImageNet features during early training when the heads are randomly initialized.
+
+---
+
+## 19. Quantization-Aware Training (QAT)
+
+Starting at epoch 40:
+
+```python
+# Backend: fbgemm (x86 optimized)
+# LR scale: 0.1x (reduced learning rate during QAT)
+torch.quantization.prepare_qat(model, inplace=True)
+```
+
+QAT inserts fake quantization nodes (QuantStub/DeQuantStub) during training to simulate INT8 inference precision. This typically preserves >99% of floating-point accuracy while enabling 2-4x inference speedup on CPU.
+
+**Post-training:** The model can be fully quantized for INT8 deployment using `torch.quantization.convert()`.
+
+---
+
+## 20. Inference Pipeline
+
+### 20.1 Single Video Inference (`inference.py`)
+
+```
+Input: video file path
+  |
+  v
+1. Extract frames (max_frames=32, uniform temporal sampling)
+2. Detect faces (dlib HOG -> CNN fallback)
+3. Extract landmarks (dlib 68-point)
+4. Extract audio (16kHz)
+5. Compute all features (MFCC, spectrogram, pulse, skin color, etc.)
+6. Load EMA checkpoint
+7. Forward pass (no grad)
+8. Softmax -> probability
+9. Return: {prediction, confidence, per-modality scores}
+```
+
+### 20.2 API Inference (`inference_api.py`)
+
+REST API wrapper around the inference pipeline for deployment.
+
+---
+
+## 21. Complete Parameter Inventory
+
+### 21.1 Summary by Component (sorted by size)
+
+| # | Component | Parameters | % of Total | Frozen |
+|---|-----------|-----------|------------|--------|
+| 1 | `transformer` | 28,351,488 | 41.36% | 0 |
+| 2 | `contrastive_fusion` | 10,623,744 | 15.50% | 0 |
+| 3 | `fusion_module` | 7,483,392 | 10.92% | 0 |
+| 4 | `visual_model` | 4,007,548 | 5.85% | 5,544 |
+| 5 | `explainability_projector` | 2,491,648 | 3.64% | 0 |
+| 6 | `micro_expression_detector` | 2,491,015 | 3.63% | 0 |
+| 7 | `video_projection` | 1,639,680 | 2.39% | 0 |
+| 8 | `feature_difference_analyzer` | 1,640,320 | 2.39% | 0 |
+| 9 | `combined_projection` | 1,573,632 | 2.30% | 0 |
+| 10 | `similarity_scorer` | 1,180,673 | 1.72% | 0 |
+| 11 | `mobile_sensor_fusion` | 1,170,949 | 1.71% | 0 |
+| 12 | `classifier` | 920,322 | 1.34% | 0 |
+| 13 | `audio_model` | 657,472 | 0.96% | 0 |
+| 14 | `audio_difference_analyzer` | 590,976 | 0.86% | 0 |
+| 15 | `audio_projection` | 590,592 | 0.86% | 0 |
+| 16 | `deepfake_type_classifier` | 395,271 | 0.58% | 0 |
+| 17 | `video_only_classifier` | 361,090 | 0.53% | 0 |
+| 18 | `sync_detector` | 328,449 | 0.48% | 0 |
+| 19 | `audio_only_classifier` | 230,018 | 0.34% | 0 |
+| 20 | `facial_au_analyzer` | 178,194 | 0.26% | 0 |
+| 21 | `aux_visual_head` | 164,226 | 0.24% | 0 |
+| 22 | `liveness_detector` | 164,097 | 0.24% | 0 |
+| 23 | `landmark_trajectory_analyzer` | 158,529 | 0.23% | 0 |
+| 24 | `lip_audio_sync_analyzer` | 138,945 | 0.20% | 0 |
+| 25 | `head_pose_estimator` | 127,108 | 0.19% | 0 |
+| 26 | `skin_color_analyzer` | 103,105 | 0.15% | 0 |
+| 27 | `spectrogram_projection` | 99,072 | 0.14% | 0 |
+| 28 | `aux_audio_head` | 98,690 | 0.14% | 0 |
+| 29 | `face_embedding_processor` | 98,688 | 0.14% | 0 |
+| 30 | `spectrogram_model` | 92,672 | 0.14% | 0 |
+| 31 | `mobile_depth_analyzer` | 88,896 | 0.13% | 0 |
+| 32 | `advanced_physiological_analyzer` | 86,183 | 0.13% | 0 |
+| 33 | `voice_stress_analyzer` | 49,453 | 0.07% | 0 |
+| 34 | `forensic_module` | 42,880 | 0.06% | 0 |
+| 35 | `blood_flow_analyzer` | 34,791 | 0.05% | 0 |
+| 36 | `breathing_pattern_detector` | 33,900 | 0.05% | 0 |
+| 37 | `aux_physiological_head` | 16,578 | 0.02% | 0 |
+| 38 | `aux_facial_head` | 16,578 | 0.02% | 0 |
+| 39 | `digital_heartbeat_detector` | 14,354 | 0.02% | 0 |
+| 40 | `optical_flow_analyzer` | 8,737 | 0.01% | 0 |
+| 41 | `eye_analysis_module` | 8,067 | 0.01% | 0 |
+| 42 | `aux_forensic_head` | 2,146 | <0.01% | 0 |
+| 43 | `camera_metadata_analyzer` | 1,744 | <0.01% | 0 |
+| 44 | `av_sync_analyzer` | 656 | <0.01% | 0 |
+| 45 | `rolling_shutter_detector` | 184 | <0.01% | 0 |
+| 46 | `component_weights` | 50 | <0.01% | 0 |
+| 47 | `deepfake_threshold` | 1 | <0.01% | 0 |
+| 48 | `frequency_threshold` | 1 | <0.01% | 0 |
+| 49 | `noise_threshold` | 1 | <0.01% | 0 |
+| 50 | `temporal_consistency_threshold` | 1 | <0.01% | 0 |
+| 51 | `diversity_loss_weight` | 1 | <0.01% | 0 |
+| | **TOTAL** | **68,556,807** | **100%** | **5,544** |
+
+### 21.2 Buffer Inventory (209 buffers)
+
+Buffers are non-parameter state tensors (BatchNorm running statistics, MFCC transform matrices):
+
+| Component | Buffer Type | Count |
+|-----------|-------------|-------|
+| `visual_model` (EfficientNet-B0) | running_mean, running_var, num_batches_tracked | 156 |
+| `audio_model` | running_mean, running_var, num_batches_tracked | 9 |
+| `audio_model.mfcc_transform` | dct_mat [40,40], window [400], mel_scale.fb [201,40] | 3 |
+| `micro_expression_detector` | BN3d running stats | 6 |
+| `advanced_physiological_analyzer` | BN1d running stats | 18 |
+| `blood_flow_analyzer` | BN1d running stats | 9 |
+| `breathing_pattern_detector` | BN1d running stats | 9 |
+| `classifier` | BN1d running stats | 6 |
+| `component_contribution_ema` | [50] | 1 |
+| `component_usage_count` | [50] | 1 |
+
+---
+
+## 22. Data Features Catalog
+
+### 22.1 Visual Features
+
+| Feature | Extraction Method | Shape | Purpose |
+|---------|------------------|-------|---------|
+| Face frames | dlib HOG/CNN detection + crop | [32, 3, 224, 224] | Primary visual input |
+| Facial landmarks | dlib 68-point predictor | [32, 136] | Face geometry analysis |
+| Head pose | Landmark-based estimation | [32, 3] | Head movement consistency |
+| Eye blink | Eye aspect ratio (EAR) | [32] | Blink naturalness |
+| Pulse signal | Color change in face ROI | [32] | Heartbeat detection |
+| Skin color | Mean RGB from face region | [32, 3] | Color consistency |
+| Frequency features | DCT transform | [1, 16, 16] | Compression artifacts |
+| Face embeddings | Per-frame identity | [1, 256] | Identity consistency |
+| Temporal consistency | Frame-to-frame diff | scalar | Temporal smoothness |
+| ELA features | Error level analysis | [112, 112] | Compression forensics |
+
+### 22.2 Audio Features
+
+| Feature | Extraction Method | Shape | Purpose |
+|---------|------------------|-------|---------|
+| Raw audio | librosa.load at 16kHz | [audio_length] | Primary audio input |
+| Audio spectrogram | Mel spectrogram | [1, 64, 64] | Spectral analysis |
+| MFCC | 20 coefficients, 50 steps | [20, 50] | Vocal characteristics |
+| Voice stress | Jitter, shimmer, HNR | [6] | Vocal stress patterns |
+| A/V sync | Audio-visual alignment | [5] | Lip sync detection |
+| Metadata | Bitrate, fps, codec info | [10] | File-level forensics |
+
+---
+
+## 23. File Structure
+
+```
+Models/
+  train_multimodal.py              # Training loop, FocalLoss, ModelEMA, DeepfakeTrainer
+  multi_modal_model.py             # MultiModalDeepfakeModel (68.5M params)
+  dataset_loader.py                # Data loading, face detection, feature extraction
+  improved_augmentation.py         # Training/validation transforms
+  safe_collate.py                  # Custom collate function for variable-length data
+  advanced_model_components.py     # AttentionFusion, micro-expression, AU analyzer
+  advanced_physiological_analysis.py # Heartbeat, blood flow, breathing detectors
+  mobile_sensor_analysis.py        # Optical flow, camera metadata, depth, shutter
+  voice_stress_analyzer.py         # Jitter/shimmer, emotional detection, formants
+  skin_analyzer.py                 # Skin color temporal analysis
+  fallbacks.py                     # Fallback implementations when dependencies missing
+  quantization_utils.py            # QAT utilities
+  inference.py                     # Single video inference
+  inference_api.py                 # REST API for deployment
+  predict_deployment.py            # Production deployment wrapper
+  train_production_mobile.ps1      # PowerShell training launcher
+  requirements.txt                 # Python dependencies
+  checkpoints/                     # Saved model checkpoints
+  outputs/                         # Training logs and visualizations
+  deepfake-env-311/                # Python 3.11 virtual environment
+```
+
+---
+
+## 24. How to Run
+
+### 24.1 Environment Setup
+
 ```powershell
-python -m venv deepfake-env
-.\deepfake-env\Scripts\activate
-```
-
-**Linux/MacOS:**
-```bash
-python -m venv deepfake-env
-source deepfake-env/bin/activate
-```
-
-### Step 3: Install PyTorch with CUDA Support
-
-**CRITICAL**: Install PyTorch **BEFORE** other dependencies to ensure CUDA compatibility.
-
-```bash
-# CUDA 12.4 (Recommended)
-pip install torch==2.6.0+cu124 torchvision==0.21.0+cu124 torchaudio==2.6.0+cu124 --index-url https://download.pytorch.org/whl/cu124
-
-# OR CUDA 11.8 (if your GPU doesn't support 12.4)
-pip install torch==2.6.0+cu118 torchvision==0.21.0+cu118 torchaudio==2.6.0+cu118 --index-url https://download.pytorch.org/whl/cu118
-
-# OR CPU-only (slow, for testing only)
-pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0
-```
-
-### Step 4: Install Dependencies
-
-```bash
+cd F:\Deepfakee\Models
+.\deepfake-env-311\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
 
-### Step 5: Install dlib (Face Detection)
-
-**Windows:**
-```powershell
-# Download pre-compiled wheel from:
-# https://github.com/z-mahmud22/Dlib_Windows_Python3.x
-# Then:
-pip install dlib-19.24.99-cp312-cp312-win_amd64.whl
-```
-
-**Linux:**
-```bash
-sudo apt-get update
-sudo apt-get install build-essential cmake
-pip install dlib
-```
-
-### Step 6: Download Pre-trained Models
-
-```bash
-# Download shape predictor for facial landmarks
-wget http://dlib.net/files/shape_predictor_68_face_landmarks.dat.bz2
-bunzip2 shape_predictor_68_face_landmarks.dat.bz2
-# Move to project root or set path in config
-```
-
-### Step 7: Verify Installation
-
-```bash
-python verify_before_training.py
-```
-
-Expected output:
-```
-✅ PyTorch: 2.6.0+cu124
-✅ CUDA Available: True
-✅ GPU: NVIDIA GeForce RTX 3090
-✅ All dependencies installed correctly
-```
-
----
-
-## 📊 Dataset Preparation
-
-### Supported Datasets
-
-1. **LAV-DF** (Primary): 136,304 videos (99,873 paired fake/original)
-2. **Samsung DeepFake Dataset**: Additional training data
-3. **Custom datasets**: See format below
-
-### Dataset Structure
-
-```
-LAV-DF/
-├── metadata.json          # Main metadata file
-├── train/
-│   ├── fake/
-│   │   ├── 000001.mp4
-│   │   ├── 000002.mp4
-│   │   └── ...
-│   └── real/
-│       ├── 000001.mp4
-│       └── ...
-├── test/
-│   └── ...
-└── dev/
-    └── ...
-```
-
-### Metadata Format (`metadata.json`)
-
-```json
-[
-  {
-    "video_path": "train/fake/086760.mp4",
-    "label": 1,
-    "split": "train",
-    "original_video_path": "train/real/086759.mp4",
-    "is_paired": true,
-    "deepfake_type": "face_swap",
-    "target_person": "id00042",
-    "source_person": "id00043"
-  },
-  ...
-]
-```
-
-### Class Distribution
-
-**LAV-DF Dataset:**
-- **Paired fakes**: 99,873 (reference an original)
-- **Unique originals**: 28,678 (shared across multiple fakes)
-- **Imbalance ratio**: 3.48:1 (Fake:Real)
-- **Total samples**: 128,551
-
----
-
-## 🚀 Training Workflow
-
-### Quick Start
+### 24.2 Training (Full Pipeline)
 
 ```powershell
-# Windows PowerShell
-.\train_combined_dataset.ps1
+cd F:\Deepfakee\Models
+.\train_production_mobile.ps1
 ```
 
-```bash
-# Linux/MacOS
-chmod +x train_combined_dataset.sh
-./train_combined_dataset.sh
+**With options:**
+```powershell
+# Subset for smoke test
+.\train_production_mobile.ps1 -MaxSamples 1000
+
+# Imbalance mitigation preset
+.\train_production_mobile.ps1 -Preset imbalance
+
+# Custom learning rate
+.\train_production_mobile.ps1 -LearningRate 5e-4
 ```
 
-### Training Pipeline
-
-```
-1. Dataset Loading & Validation
-   ├── Load metadata.json (136,304 entries)
-   ├── Validate file existence
-   ├── Filter paired samples (99,873 valid)
-   ├── Calculate class distribution
-   └── Initialize picklable augmentation wrappers
-   
-2. Data Preprocessing
-   ├── Video: Sample 16 frames uniformly (8 for CPU)
-   ├── Audio: Extract mono @ 16kHz
-   ├── **Voice Stress Analysis**: Extract jitter, shimmer, HNR from audio
-   ├── Face Detection: MTCNN (image_size=224, margin=40)
-   ├── Landmark Detection: dlib 68-point (136-dim features)
-   ├── Physiological Features: rPPG heartbeat, blood flow, breathing, skin color
-   ├── Spectrogram: Mel-spectrogram (128 bins)
-   └── Production-Robust Augmentation:
-       - Social Media Compression (6 platforms, multi-round)
-       - Resolution Degradation (4 quality levels)
-       - Adaptive Lighting (5 conditions)
-   
-3. Model Initialization
-   ├── Load pre-trained backbones (EfficientNet-B0, LightweightAudioEncoder)
-   ├── Initialize 27 active components (25 disabled)
-   ├── Setup mobile sensor analyzers (6 new components)
-   ├── Initialize auxiliary classification heads (5 heads)
-   └── Prepare feature adapter (~1792 → classifier input)
-   
-4. Training Loop (per epoch)
-   ├── Train batches (single video per sample)
-   ├── Forward pass with 27 active components
-   ├── Extract mobile sensor features (optical flow, metadata, etc.)
-   ├── Calculate main loss (Focal Loss)
-   ├── Calculate auxiliary losses (5 heads: physiological, facial, audio, visual, forensic)
-   ├── Calculate diversity loss (encourages component contribution)
-   ├── Backward pass + gradient clipping (max_norm=1.0)
-   ├── Optimizer step (AdamW with weight decay=0.0001)
-   ├── Track component contributions (EMA α=0.99)
-   ├── Detect silent modules (<1% contribution)
-   ├── Validate on held-out set
-   ├── Calculate metrics (Accuracy, F1, AUC, Macro F1)
-   ├── Save checkpoints (best_model.pth)
-   ├── Generate plots (loss, accuracy, confusion matrix)
-   └── Early stopping check (patience=15)
-   
-5. Quantization-Aware Training (from epoch 15)
-   ├── Activate QAT: Insert FakeQuantize modules
-   ├── Reduce learning rate by 10x (QAT fine-tuning)
-   ├── Continue training with quantization simulation
-   ├── Learn quantization parameters (scale, zero_point)
-   └── Monitor INT8 accuracy
-   
-6. Post-Training (after epoch 30)
-   ├── Convert QAT model to INT8
-   ├── Validate quantized model vs FP32
-   ├── Export PyTorch (.pth) and ONNX (.onnx)
-   ├── Generate QAT report (qat_report.json)
-   └── Save final results (final_results.json)
-   
-7. Model Evaluation
-   ├── Load best checkpoint (best_model.pth)
-   ├── Test on test set
-   ├── Generate detailed reports
-   ├── Test quantized model (model_int8_quantized.pth)
-   └── Compare FP32 vs INT8 performance
-```
-
-### Training Progress Monitoring
-
-**Real-time Metrics (CPU Training):**
-```
-Epoch 1/30 [Train]:  20%|█████████████▌| 2/10 [16:24<1:00:54, 456.77s/it]
-[RANK 0] Moving batch 2 to device...
-[TIMING] Model forward (no AMP) batch 1: 197.202s
-[AUX LOSS] Aux: 0.000000, Diversity: 0.000000
-[LOSS] Batch 1: 0.083474
-[METRICS] E1 B1 time=290.198s thr=0.0 samp/s alloc=0.00GB res=0.00GB 
-          loss=0.166947 grad_norm=0.0977 pred_mean=0.4885 pred_std=0.0259 pct_fake=0.375
-
-Epoch 1 Metrics:
-- Accuracy    : 0.5250
-- Precision   : 0.5294
-- Recall      : 0.4500
-- F1 Score    : 0.4865
-- Macro F1    : 0.5223 ⭐ (primary metric)
-- AUC Score   : 0.5019
-- Loss        : 0.1669
-- Grad Norm   : 0.0977
-- Confusion Matrix:
-[[24 16]  ← Real predictions
- [22 18]] ← Fake predictions
-
-Component Contributions (EMA):
-- Physiological Head: 0.15 (15%)
-- Facial Head: 0.12 (12%)
-- Audio Head: 0.08 (8%)
-- Visual Head: 0.14 (14%)
-- Forensic Head: 0.11 (11%)
-- Silent Modules: None detected ✅
-```
-
-**GPU Training (Expected):**
-```
-[TIMING] Model forward (AMP) batch 1: 2.5s  (80x faster than CPU!)
-[METRICS] E1 B1 time=4.2s thr=1.9 samp/s alloc=8.4GB res=10.2GB
-```
-
-**Saved Outputs:**
-```
-outputs/run_TIMESTAMP/
-├── config.json                          # Training configuration
-├── training_log.txt                     # Full training logs
-├── final_results.json                   # Complete metrics
-├── qat_report.json                      # QAT validation report
-└── plots/
-    ├── loss_epoch_1.png                # Loss curves
-    ├── accuracy_epoch_1.png            # Accuracy curves
-    ├── f1_epoch_1.png                  # F1 score curves
-    ├── macro_f1_epoch_1.png            # Macro F1 curves
-    ├── auc_epoch_1.png                 # AUC curves
-    ├── confusion_matrix_train_epoch_1.png  # Training confusion matrix
-    └── confusion_matrix_val_epoch_1.png    # Validation confusion matrix
-
-checkpoints/run_TIMESTAMP/
-├── regular/
-│   └── checkpoint_epoch_1_acc_0.7000_f1_0.6703.pth
-└── best_model.pth                      # Best model (highest Macro F1)
-```
-
----
-
-## 🧠 Model Architecture
-
-### Component Breakdown (40+ Specialized Modules)
-
-| Component Category | Count | Key Modules | Function |
-|-------------------|-------|-------------|----------|
-| **Core Detection** | 10 | EfficientNet-B0 (4M), LightweightAudioEncoder (0.66M), Facial Landmarks, Micro-expressions, Eye Blink, Head Pose, Lip-Audio Sync, Oculomotor, Lighting, Texture | Foundation visual and audio processing |
-| **Mobile Sensors** | 6 | Optical Flow, Camera Metadata, Rolling Shutter, A-V Sync, Mobile Depth, Sensor Fusion | Mobile-optimized artifact detection |
-| **Audio Analysis** | 3 | Voice Analysis, MFCC, Voice Stress (Jitter/Shimmer/HNR/Emotion) | Synthetic voice detection |
-| **Visual Artifacts** | 4 | GAN Fingerprint, Frequency Domain, Facial AU, Landmark Trajectory | Digital manipulation traces |
-| **Physiological Analysis** | 4 | rPPG (Heartbeat), Blood Flow, Breathing, Skin Color | Biological signal extraction |
-| **Contrastive Learning** | 4 | Feature Difference, Audio Difference, Contrastive Fusion, Similarity Scorer | Training-only paired comparison |
-| **Auxiliary Heads** | 5 | Physiological, Facial, Audio, Visual, Forensic Classifiers | Component diversity enforcement |
-| **TOTAL TRAINING** | **31** | 27 always-active + 4 contrastive | Complete training architecture |
-| **TOTAL DEPLOYMENT** | **27** | Contrastive disabled | Production-ready inference |
-
-### Model Parameters (v4.0 - Optimized)
-
-| Component | Parameters | % of Total | Function |
-|-----------|------------|------------|----------|
-| **Transformer** | 28.4M | 37.2% | Temporal self-attention modeling |
-| **Micro-Expression** | 11.7M | 15.3% | Facial action unit analysis |
-| **Mobile Sensor Fusion** | 8.0M | 10.5% | Optical flow, A-V sync, depth |
-| **Multi-Scale Fusion** | 7.1M | 9.3% | Multi-resolution feature fusion |
-| **Fusion Module** | 6.3M | 8.3% | Audio-visual cross-modal fusion |
-| **Visual Encoder** | 4.0M | 5.2% | EfficientNet-B0 backbone |
-| **Auxiliary Heads** | 2.5M | 3.3% | 5 component diversity heads |
-| **Classifier** | 1.6M | 2.1% | Final binary prediction |
-| **Audio Encoder (MFCC-based)** | **0.66M** | **0.9%** | Lightweight audio features (replaces 94.4M Wav2Vec2) |
-| **Voice Stress Analyzer** | 0.05M | 0.1% | Jitter/Shimmer/HNR analysis |
-| **Other Components** | 5.9M | 7.7% | Physiological, visual artifacts |
-| **TRAINING TOTAL** | **76.3M** | **100%** | Training mode (deployment_mode=False) |
-| **DEPLOYMENT TOTAL** | **62.3M** | - | Deployment mode (deployment_mode=True, -13.6M contrastive) |
-
-**Optimization Summary:**
-```
-Original Model:  211.1M params (Wav2Vec2: 94.4M, Temporal Attention: 19.7M)
-  ↓ Replace Wav2Vec2 with LightweightAudioEncoder (99.3% reduction)
-After Step 1:    96.0M params (-115.1M)
-  ↓ Remove temporal_attention (redundant with Transformer)
-After Step 2:    76.3M params (Training mode, -19.7M)
-  ↓ Enable deployment_mode (disables 4 contrastive components)
-Final Deployment: 62.3M params (Deployment mode, -13.6M)
-
-Result: 70% parameter reduction, 75% disk space reduction (805MB → 238MB FP32, 59MB INT8)
-```
-
-### Model Size & Performance (v4.0 Optimized)
-
-| Format | Size | Inference Speed (CPU) | Inference Speed (GPU) | Accuracy Delta |
-|--------|------|----------------------|----------------------|----------------|
-| **FP32** | 238 MB | ~120s/batch | ~1.5s/batch | Baseline |
-| **FP16** | 119 MB | Not supported | ~1.0s/batch | <0.5% |
-| **INT8 (QAT)** | **59 MB** | **~45s/batch** | **~0.6s/batch** | **<2%** |
-| **ONNX INT8** | 59 MB | ~40s/batch | ~0.4s/batch (TensorRT) | <2% |
-
-**Optimizations Achieved:**
-- ✅ **70% smaller** model (211M → 62M params in deployment)
-- ✅ **75% less disk space** (805 MB → 238 MB FP32, 59 MB INT8)
-- ✅ **40% faster** inference (removed temporal_attention + lighter audio encoder)
-- ✅ **<2% accuracy loss** compared to original model
-- ✅ **Mobile/Edge deployment ready** (<60 MB INT8, <500ms target)
-
-### Processing Pipeline
-
-**For Each Batch:**
-1. **Fake Video Path** (batch_size=4):
-   - Visual: `[4, 16, 3, 224, 224]` → `[4, 1280]`
-   - Audio: `[4, 16000*3]` → `[4, 768]`
-   - Fusion: `[4, 2048]` → `[4, 768]`
-   - Contrastive Fusion: `[4, 6144]` → `[4, 768]`
-   - Transformer: `[4, 768]` → `[4, 768]`
-   - Advanced Features: `[4, 768]` → `[4, 3200]`
-   - Feature Adapter: `[4, 3200]` → `[4, 2944]`
-   - Classifier: `[4, 2944]` → `[4, 2]` **(FAKE predictions)**
-
-2. **Original Video Path** (batch_size=4):
-   - Visual: `[4, 16, 3, 224, 224]` → `[4, 1280]`
-   - Audio: `[4, 16000*3]` → `[4, 768]`
-   - Fusion: `[4, 2048]` → `[4, 768]`
-   - Transformer: `[4, 768]` → `[4, 768]`
-   - Original Feature Adapter: `[4, 768]` → `[4, 2944]`
-   - Classifier: `[4, 2944]` → `[4, 2]` **(REAL predictions)**
-
-3. **Concatenation**:
-   - `torch.cat([fake_preds, real_preds], dim=0)` → `[8, 2]`
-   - Labels: `[1, 1, 1, 1, 0, 0, 0, 0]` → `[8]`
-
----
-
-## ⚙️ Configuration
-
-### Command-Line Arguments
-
-```bash
-python train_multimodal.py \
-  --json_path "/path/to/metadata.json" \
-  --data_dir "/path/to/dataset" \
-  --output_dir "./outputs" \
-  --checkpoint_dir "./checkpoints" \
-  --log_file "./outputs/training_log.txt" \
-  --batch_size 8 \
-  --num_epochs 30 \
-  --max_samples 10000 \                     # For testing (remove for full training)
-  --learning_rate 5e-5 \
-  --weight_decay 0.0001 \
-  --detect_faces \
-  --compute_spectrograms \
-  --use_spectrogram \
-  --validation_split 0.1 \
-  --optimizer adamw \                    # adam, adamw, sgd
-  --scheduler cosine_with_restarts \     # step, cosine, plateau, etc.
-  --warmup_epochs 5 \
-  --loss_type focal \                    # ce, focal
-  --focal_alpha 0.25 \
-  --focal_gamma 1.0 \
-  --class_weights_mode balanced \  # none, balanced, sqrt_balanced, manual_extreme
-  --use_weighted_loss \
-  --dropout_rate 0.2 \
-  --gradient_clip 1.0 \
-  --early_stopping_patience 15 \
-  --reduce_frames 8 \                    # Sample every 6th frame
-  --enhanced_preprocessing \
-  --enhanced_augmentation \
-  --enable_skin_color_analysis \
-  --enable_advanced_physiological \
-  --enable_face_mesh \
-  --num_workers 4 \                      # 0 for CPU, 4+ for GPU
-  --pin_memory \
-  --amp_enabled \
-  --grad_accum_steps 2 \
-  --enable_qat \
-  --qat_start_epoch 15 \
-  --qat_backend fbgemm \
-  --qat_lr_scale 0.1 \
-  --debug
-```
-
-### Configuration Presets
-
-#### **High-Quality Training (GPU)**
-```bash
---batch_size 8
---num_epochs 30
---learning_rate 1e-5
---num_workers 4
---pin_memory
-# Expected time: ~8-12 hours on RTX 4090
-```
-
-#### **CPU Training (Slow)**
-```bash
---batch_size 2
---num_epochs 10
---num_workers 0
---max_samples 100  # Limit dataset size
-# Expected time: ~2-3 hours per epoch on i7-12th gen
-```
-
-#### **Quick Test Run**
-```bash
---batch_size 4
---num_epochs 2
---max_samples 50
---num_workers 0
-# Expected time: ~20-30 minutes
-```
-
----
-
-## � Inference & Deployment
-
-Production-ready inference scripts for **single video detection** (27 deployment components, contrastive learning disabled).
-
-### Quick Start (Inference)
-
-```bash
-# 1. Install inference dependencies
-pip install -r requirements_inference.txt
-
-# 2. Test a video file
-python inference.py --checkpoint checkpoints/best_model.pth --video test_video.mp4
-
-# 3. Real-time webcam (10 seconds)
-python inference.py --checkpoint checkpoints/best_model.pth --webcam --duration 10
-
-# 4. Start REST API server
-python inference_api.py
-```
-
----
-
-### 1. Video Upload Detection
-
-**Script**: `inference.py` - Analyze uploaded video files
-
-```bash
-# Basic inference
-python inference.py \
-  --checkpoint checkpoints/best_model.pth \
-  --video path/to/video.mp4
-
-# With debug mode (shows component contributions)
-python inference.py \
-  --checkpoint checkpoints/best_model.pth \
-  --video path/to/video.mp4 \
-  --debug
-
-# Quantized model (INT8 - requires QAT-trained checkpoint)
-# Use checkpoint from epoch 15+ when QAT was active during training
-python inference.py \
-  --checkpoint checkpoints/run_TIMESTAMP/best_model.pth \
-  --video path/to/video.mp4 \
-  --quantized
-
-# CPU inference
-python inference.py \
-  --checkpoint checkpoints/best_model.pth \
-  --video path/to/video.mp4 \
-  --device cpu
-```
-
-**Output Example:**
-```
-================================================================================
-🎥 ANALYZING VIDEO: test_video.mp4
-================================================================================
-
-================================================================================
-🎯 DETECTION RESULTS
-================================================================================
-Prediction:          FAKE
-Confidence:          88.50%
-Fake Probability:    88.50%
-Real Probability:    11.50%
-Processing Time:     2.340s
-================================================================================
-
-📊 Component Contributions (Top 10):
-  • facial_landmarks            : 0.1245
-  • micro_expression             : 0.0987
-  • rppg_analyzer                : 0.0856
-  • gan_fingerprint              : 0.0723
-  • voice_stress_analyzer        : 0.0698
-  • optical_flow_analyzer        : 0.0621
-  • blood_flow_analyzer          : 0.0589
-  • lip_audio_sync               : 0.0534
-  • frequency_domain             : 0.0512
-  • lighting_consistency         : 0.0489
-
-✅ Results saved to: test_video_results.json
-```
-
----
-
-### 2. Real-Time Webcam Detection
-
-**Script**: `inference.py --webcam` - Live deepfake detection from webcam
-
-```bash
-# Real-time detection (10 seconds)
-python inference.py \
-  --checkpoint checkpoints/best_model.pth \
-  --webcam \
-  --duration 10
-
-# Longer duration (60 seconds)
-python inference.py \
-  --checkpoint checkpoints/best_model.pth \
-  --webcam \
-  --duration 60
-```
-
-**Features:**
-- 🎥 Live video feed with overlay predictions
-- 📊 Real-time fake probability bar
-- 🎯 Prediction updates every 0.5 seconds
-- ⚡ Press 'q' to quit early
-
-**Output:**
-```
-================================================================================
-📹 REAL-TIME WEBCAM DETECTION (Duration: 10s)
-================================================================================
-[INFO] Press 'q' to quit early
-
-[Webcam window showing video with overlaid results]
-REAL (85.2%)
-[Green bar indicating real probability]
-
-================================================================================
-📊 WEBCAM DETECTION SUMMARY
-================================================================================
-Total predictions: 18
-Average fake probability: 12.3%
-Final verdict: REAL
-```
-
----
-
-### 3. REST API Server
-
-**Script**: `inference_api.py` - Flask REST API for web/mobile integration
-
-#### Start Server
-
-```bash
-# Start Flask server (default port 5000)
-python inference_api.py
-
-# Custom port
-FLASK_PORT=8080 python inference_api.py
-
-# Production mode (with Gunicorn)
-gunicorn -w 4 -b 0.0.0.0:5000 inference_api:app
-```
-
-#### API Endpoints
-
-##### **POST /api/detect** - Single Video Detection
-
-```bash
-# Using curl
-curl -X POST -F "video=@test_video.mp4" http://localhost:5000/api/detect
-
-# Using Python requests
-import requests
-with open('test_video.mp4', 'rb') as f:
-    response = requests.post('http://localhost:5000/api/detect', files={'video': f})
-print(response.json())
-```
-
-**Response:**
-```json
-{
-  "success": true,
-  "video_id": "abc-123-def-456",
-  "prediction": "FAKE",
-  "confidence": 88.5,
-  "fake_probability": 0.885,
-  "real_probability": 0.115,
-  "processing_time": 2.34,
-  "timestamp": "2025-12-29T10:30:45",
-  "message": "Analysis complete"
-}
-```
-
-##### **POST /api/batch-detect** - Multiple Videos
-
-```bash
-# Upload multiple videos
-curl -X POST \
-  -F "videos=@video1.mp4" \
-  -F "videos=@video2.mp4" \
-  -F "videos=@video3.mp4" \
-  http://localhost:5000/api/batch-detect
-```
-
-**Response:**
-```json
-{
-  "success": true,
-  "results": [
-    {
-      "video_id": "id1",
-      "filename": "video1.mp4",
-      "success": true,
-      "prediction": "FAKE",
-      "confidence": 88.5,
-      "fake_probability": 0.885,
-      "real_probability": 0.115,
-      "processing_time": 2.34
-    },
-    {
-      "video_id": "id2",
-      "filename": "video2.mp4",
-      "success": true,
-      "prediction": "REAL",
-      "confidence": 92.1,
-      "fake_probability": 0.079,
-      "real_probability": 0.921,
-      "processing_time": 2.15
-    }
-  ],
-  "total_videos": 2,
-  "total_processing_time": 4.49
-}
-```
-
-##### **GET /health** - Health Check
-
-```bash
-curl http://localhost:5000/health
-```
-
-**Response:**
-```json
-{
-  "status": "healthy",
-  "model_loaded": true,
-  "checkpoint": "checkpoints/best_model.pth"
-}
-```
-
-##### **GET /api/model-info** - Model Information
-
-```bash
-curl http://localhost:5000/api/model-info
-```
-
-**Response:**
-```json
-{
-  "checkpoint_path": "checkpoints/best_model.pth",
-  "device": "cuda",
-  "quantized": false,
-  "active_components": 27,
-  "training_components": 31,
-  "supported_formats": ["mp4", "avi", "mov", "mkv", "webm", "flv"],
-  "max_file_size_mb": 100
-}
-```
-
----
-
-### 4. Python Integration
-
-**Direct Python API** - Integrate into your own Python applications
-
-```python
-from inference import DeepfakeDetector
-
-# Initialize detector
-detector = DeepfakeDetector(
-    checkpoint_path='checkpoints/best_model.pth',
-    device='cuda',          # or 'cpu'
-    quantized=False,        # Set True for INT8 (4x faster)
-    debug=False             # Set True for component contributions
-)
-
-# Detect from video file
-results = detector.detect_from_video_file('test_video.mp4')
-
-print(f"Prediction: {results['prediction']}")
-print(f"Confidence: {results['confidence']:.2f}%")
-print(f"Fake Probability: {results['fake_probability']:.4f}")
-print(f"Processing Time: {results['processing_time']:.3f}s")
-
-# Access component contributions (if debug=True)
-if 'component_contributions' in results:
-    for component, value in results['component_contributions'].items():
-        print(f"  {component}: {value}")
-```
-
-**Advanced Usage:**
-
-```python
-# Real-time webcam detection
-detector.detect_from_webcam(
-    duration=30,        # Capture duration in seconds
-    display=True        # Show video window with results
-)
-
-# Batch processing
-video_files = ['video1.mp4', 'video2.mp4', 'video3.mp4']
-results_list = []
-
-for video_path in video_files:
-    results = detector.detect_from_video_file(video_path)
-    results_list.append(results)
-
-# Save batch results
-import json
-with open('batch_results.json', 'w') as f:
-    json.dump(results_list, f, indent=2)
-```
-
----
-
-### ⚡ Quantization-Aware Training (QAT) Integration
-
-**Your model supports QAT for INT8 deployment!** 
-
-#### How QAT Works in Your Pipeline:
-
-**During Training** (from epoch 15 onwards):
-```bash
-# Training automatically enables QAT at epoch 15
-.\train_combined_dataset.ps1
-
-# Or manually configure:
-python train_multimodal.py \
-  --num_epochs 30 \
-  --enable_qat \
-  --qat_start_epoch 15 \
-  --qat_backend fbgemm
-```
-
-**What Happens:**
-1. **Epochs 1-14**: Normal FP32 training (32-bit floats)
-2. **Epoch 15**: QAT activates automatically
-   - Inserts `FakeQuantize` modules into model
-   - Simulates INT8 quantization during training
-   - Reduces learning rate by 0.1x for stability
-   - Model learns to maintain accuracy with quantization
-3. **Epochs 15-30**: Continue training with QAT
-   - Model adapts weights for INT8 representation
-   - Target: <2% accuracy drop from FP32
-
-**Benefits of QAT:**
-- ✅ **4x smaller models**: 775MB → 194MB
-- ✅ **2-4x faster inference**: CPU 290s → 100s, GPU 2.5s → 0.8s
-- ✅ **Better accuracy**: QAT maintains accuracy better than post-training quantization
-- ✅ **Mobile-ready**: INT8 works on ARM devices (phones, edge hardware)
-
-**Using Quantized Models for Inference:**
-```bash
-# Load QAT checkpoint (from epoch 15+) and convert to INT8
-python inference.py \
-  --checkpoint checkpoints/run_TIMESTAMP/epoch_20.pth \
-  --video test.mp4 \
-  --quantized
-```
-
-**QAT Implementation Files:**
-- **`quantization_utils.py`**: QAT preparation, INT8 conversion, accuracy comparison
-- **`train_multimodal.py`**: Automatic QAT activation at specified epoch
-- **`inference.py`**: INT8 model loading and quantized inference
-
----
-
-### 📦 Inference Requirements
-
-**File**: `requirements_inference.txt`
-
-```bash
-# Install minimal dependencies for inference only
-pip install -r requirements_inference.txt
-```
-
-**Dependencies:**
-- PyTorch 2.6.0+ (CUDA 12.4 or CPU)
-- OpenCV (video processing)
-- Librosa (audio extraction)
-- Flask + Flask-CORS (REST API)
-- NumPy, Pillow
-
-**No training dependencies needed** (no Albumentations, no Weights & Biases, etc.)
-
----
-
-### 🎯 Deployment Architecture
-
-When you run inference scripts:
-
-1. **Model loads with 27 components** (contrastive learning disabled)
-2. **Single video input** - No original/real video required
-3. **27 feature extractors process video**:
-   - Core detection: Facial landmarks, micro-expressions, eye blinks, head pose, lip-sync, lighting, texture
-   - Mobile sensors: Optical flow, camera metadata, rolling shutter, A-V sync, depth
-   - Physiological: rPPG (heartbeat), blood flow, breathing, skin color
-   - Audio: Voice analysis, MFCC, voice stress
-   - Visual artifacts: GAN fingerprints, frequency domain
-4. **Classification**: Uses learned weights from training
-5. **Output**: Prediction (FAKE/REAL) + Confidence (0-100%)
-
-**Key Difference from Training:**
-- ❌ No contrastive learning (no fake vs original comparison)
-- ✅ Uses learned patterns: "This video has GAN artifacts + unnatural rPPG + synthetic voice → FAKE"
-
----
-
-### 🧪 Testing Inference
-
-**Script**: `test_inference.py` - Interactive test suite
-
-```bash
-python test_inference.py
-```
-
-**Features:**
-1. Test video file inference with detailed output
-2. Test Flask API endpoints (health, model-info, detect, batch-detect)
-3. Interactive prompts for checkpoint and video paths
-4. JSON result export
-
----
-
-## 📈 Usage Examples (Training)
-
-### 1. Full Training (LAV-DF)
+### 24.3 Training (Direct Python)
 
 ```powershell
-# Activate environment
-.\deepfake-env\Scripts\activate
-
-# Run training (31 components, contrastive learning enabled)
-.\train_combined_dataset.ps1
+python train_multimodal.py `
+  --json_path F:\Deepfakee\LAV_DF\metadata.json `
+  --data_dir F:\Deepfakee\LAV_DF `
+  --output_dir outputs/run_manual `
+  --checkpoint_dir checkpoints/run_manual `
+  --batch_size 16 --num_epochs 80 `
+  --learning_rate 3e-4 --weight_decay 0.01 `
+  --loss_type focal --focal_alpha 1.0 --label_smoothing 0.05 `
+  --ema_decay 0.999 --mixup_alpha 0.2 `
+  --grad_accum_steps 4 --amp_enabled `
+  --warmup_epochs 3 --early_stopping_patience 10 `
+  --use_spectrogram --detect_faces --enhanced_preprocessing `
+  --enhanced_augmentation --use_weighted_loss
 ```
 
-### 2. Resume from Checkpoint
+### 24.4 Inference
 
-```bash
-python train_multimodal.py \
-  --json_path "path/to/metadata.json" \
-  --resume_checkpoint "./checkpoints/run_TIMESTAMP/best_model.pth" \
-  --num_epochs 20
-```
-
-### 3. Inference on Single Video
-
-```python
-# predict_standalone.py
-import torch
-from multi_modal_model import MultiModalDeepfakeModel
-from dataset_loader import load_video, extract_audio
-
-# Load model
-model = MultiModalDeepfakeModel(config)
-checkpoint = torch.load('checkpoints/best_model.pth')
-model.load_state_dict(checkpoint['model_state_dict'])
-model.eval()
-
-# Load video
-video_frames = load_video('test_video.mp4', num_frames=16)
-audio_features = extract_audio('test_video.mp4')
-
-# Predict
-with torch.no_grad():
-    outputs, _ = model({'video_frames': video_frames, 'audio': audio_features})
-    probs = torch.softmax(outputs, dim=1)
-    prediction = "FAKE" if probs[0, 1] > 0.5 else "REAL"
-    confidence = probs[0, 1].item() if prediction == "FAKE" else probs[0, 0].item()
-
-print(f"Prediction: {prediction} (confidence: {confidence:.2%})")
-```
-
-### 4. Batch Prediction
-
-```bash
-python predict_deployment.py \
-  --model_path "./checkpoints/best_model.pth" \
-  --input_dir "./test_videos/" \
-  --output_csv "./predictions.csv" \
-  --batch_size 4
+```powershell
+python inference.py --video_path path/to/video.mp4 --checkpoint_path checkpoints/best_model.pth
 ```
 
 ---
 
-## � Training Flow & Contrastive Learning (v4.0)
+## 25. Key Bug Fixes Applied
 
-### **How Training Works: Hybrid Contrastive Learning**
+Over 8 development sessions, 30+ critical bugs were identified and fixed:
 
-Your model uses a **unique hybrid approach** that learns from **relative differences** between fake and real content:
+### Session 1: Landmark Initialization
+- **Bug:** dlib face landmark predictor not initialized, producing all-zero landmarks
+- **Fix:** Proper dlib initialization with shape_predictor_68_face_landmarks.dat
 
-#### **Training Phase: Learns from Paired Data**
-```
-For each training batch:
-1. Load paired samples:
-   ├─ Fake video [8, 16, 3, 224, 224]
-   ├─ Fake audio [8, 16000]
-   ├─ Real (original) video [8, 16, 3, 224, 224]  ✅
-   └─ Real (original) audio [8, 16000]            ✅
+### Session 2: Full Codebase Audit (23 issues)
+- Data leakage in train/val splitting
+- AttentionFusion dimension mismatch
+- Spectrogram feature dimension errors
+- Dead code removal
+- Inference pipeline rewrite
 
-2. Extract features from BOTH fake and real:
-   ├─ fake_video_features = EfficientNet(fake_video)    → [8, 512]
-   ├─ real_video_features = EfficientNet(real_video)    → [8, 512] ✅
-   ├─ fake_audio_features = AudioEncoder(fake_audio)    → [8, 256]
-   └─ real_audio_features = AudioEncoder(real_audio)    → [8, 256] ✅
+### Session 3: Remaining Fixes (10 items)
+- `target_dim` not passed to attention modules
+- `forensic_features` wiring disconnected
+- Label smoothing and scheduler CLI args missing
 
-3. Compute differences (KEY INNOVATION):
-   ├─ video_diff = |fake_video - real_video|  → [8, 512] ✅ Learns what changed
-   └─ audio_diff = |fake_audio - real_audio|  → [8, 256] ✅ Learns what changed
+### Session 4: Accuracy Optimizations (19 changes)
+- Added EMA (decay=0.999)
+- Added Mixup (alpha=0.2)
+- BatchNorm in classifier (replacing bare Linear)
+- Reduced dropout (0.5->0.3)
+- Faster backbone unfreezing schedule
+- Warmup tuning (3 epochs)
 
-4. Contrastive Fusion (3 streams):
-   ├─ Stream 1: fake_combined [8, 768]     - What deepfakes look like
-   ├─ Stream 2: real_combined [8, 768]     - What authentic content looks like
-   ├─ Stream 3: diff_combined [8, 768]     - What CHANGED (manipulation patterns)
-   └─ Fused features [8, 2304] → [8, 512]
+### Session 5: Data Pipeline Fixes (5 items)
+- dlib fallback landmark normalization
+- Deterministic validation transforms (no random compression)
+- Multi-frame frequency features
+- BN/bias weight decay exclusion
+- EMA BatchNorm buffer tracking
 
-5. Multi-objective loss:
-   ├─ Combined loss (1.0x) - Main task
-   ├─ Audio-only loss (0.3x) - Detects audio tampering
-   ├─ Video-only loss (0.3x) - Detects video tampering
-   └─ Consistency loss (0.1x) - Prevents "always fake" predictions
-```
+### Session 6: Structural Fixes (3 items)
+- Explainability projector (replaced zero-noise pipeline)
+- Loss rebalancing: 0.1 audio + 0.1 video + 0.05 KL
+- Discriminative learning rates (backbone 10x lower)
 
-#### **Deployment Phase: Works on Single Videos**
-```
-For inference (NO original video needed):
-1. Load single video:
-   ├─ Video frames [1, 16, 3, 224, 224]
-   └─ Audio [1, 16000]
+### Session 7: Critical Training Fixes
+- **Progressive unfreezing broken:** Frozen backbone params were excluded from optimizer entirely. When unfrozen, they had no optimizer state. Fix: include ALL params in optimizer from start.
+- **EMA same bug:** EMA didn't track frozen params. Fix: track ALL params including frozen.
+- **Logging spam:** Reduced to every 200-500 batches
+- **Non-AMP modality losses:** Per-modality losses computed in float32
 
-2. Extract features:
-   ├─ video_features = EfficientNet(video)  → [1, 512]
-   └─ audio_features = AudioEncoder(audio)  → [1, 256]
-
-3. Use learned difference patterns:
-   - Model has learned what differences look like during training
-   - Applies those learned patterns to detect anomalies
-   - No original video needed! ✅
-
-4. Three predictions:
-   ├─ audio_only_pred → Is audio fake?
-   ├─ video_only_pred → Is video fake?
-   └─ combined_pred → Overall verdict
-```
-
-### **What the Model Learns**
-
-#### **Phase 1: Epochs 1-5 (Basic Artifacts)**
-```
-Learning: Obvious manipulation patterns
-Examples:
-  - Face swap boundaries (visible edges)
-  - Color inconsistencies (lighting mismatch)
-  - Audio glitches (robotic voice artifacts)
-  - GAN artifacts (blurring, distortion)
-
-Progress: 
-  Accuracy: 65% → 78%
-  Loss: 0.65 → 0.42
-```
-
-#### **Phase 2: Epochs 6-15 (Subtle Differences)**
-```
-Learning: Fine-grained difference patterns
-Examples:
-  - Micro-expressions missing (fake lacks natural emotions)
-  - Pulse signals absent (fake skin shows no blood flow)
-  - Voice stress patterns (synthesized voice lacks natural stress)
-  - Lip-sync errors (audio-visual mismatch)
-  - Compression artifacts (different encoding patterns)
-
-Progress:
-  Accuracy: 78% → 85%
-  Loss: 0.42 → 0.28
-  
-🎯 Contrastive features become highly discriminative here!
-```
-
-#### **Phase 3: Epochs 16-30 (Fine-Tuning + QAT)**
-```
-Learning: INT8-friendly robust features
-Features:
-  - Quantization-aware training starts (epoch 15)
-  - Learns features robust to quantization
-  - Generalizes to unseen deepfake types
-  - Cross-modal consistency (audio+video agree)
-
-Progress:
-  Accuracy: 85% → 90%+
-  Loss: 0.28 → 0.15
-  Model size: 238MB → 59MB INT8
-  
-🎯 Model ready for mobile deployment!
-```
-
-### **Example Training Step**
-
-**Sample: Face-swap deepfake**
-```python
-# Feature extraction
-fake_video_features = [0.8, 0.2, 0.9, ...]  # High activation on face region
-real_video_features = [0.3, 0.1, 0.4, ...]  # Normal face features
-difference = |0.8-0.3, 0.2-0.1, 0.9-0.4| = [0.5, 0.1, 0.5, ...]
-                                           ↑ HIGH difference = face swap detected!
-
-# Predictions (after softmax)
-combined_pred = [0.85 fake, 0.15 real]   # High confidence fake
-audio_pred = [0.78 fake, 0.22 real]      # Audio suggests fake
-video_pred = [0.82 fake, 0.18 real]      # Video suggests fake
-
-# Loss computation (ground truth: fake, label=1)
-combined_loss = -log(0.85) = 0.163  ✅ Low loss (correct prediction)
-audio_loss = -log(0.78) = 0.248     ✅ Low loss (correct)
-video_loss = -log(0.82) = 0.198     ✅ Low loss (correct)
-
-# Consistency check
-KL(audio || combined) = 0.012  ✅ Low = good agreement
-KL(video || combined) = 0.008  ✅ Low = good agreement
-
-Total loss = 0.163 + 0.3×0.248 + 0.3×0.198 + 0.1×0.020 = 0.300
-```
-
-### **Training Advantages**
-
-#### **1. Multi-Task Learning**
-- Trains 3 tasks simultaneously (combined, audio-only, video-only)
-- Shared feature extractors learn richer representations
-- Better generalization than single-task models
-
-#### **2. Contrastive Learning**
-- Learns **RELATIVE** differences (fake vs real comparison)
-- More robust than absolute classification
-- Handles unseen deepfake types better (learns general artifact patterns)
-- **+15-20% accuracy** on cross-dataset testing
-
-#### **3. Consistency Regularization**
-- Prevents overfitting to single modality
-- Forces audio and video predictions to agree
-- Reduces false positives by 30-40%
-
-#### **4. Progressive Difficulty**
-- Early epochs: Learn obvious artifacts
-- Mid epochs: Learn subtle patterns using differences
-- Late epochs: Fine-tune with quantization awareness
+### Session 8: Runtime Fixes
+- **BatchNorm crash:** Batch size 1 at end of epoch caused "Expected more than 1 value per channel." Fix: `drop_last=True` for training DataLoaders.
+- **PS1 parse errors:** Unicode characters, comma parameter separators, variable interpolation. Fix: ASCII-only, single-quoted strings.
+- **UTF-8 encoding:** Model init emoji prints caused cp1252 encoding failures. Fix: TextIOWrapper with UTF-8.
 
 ---
 
-## 🏆 Model Implementation Quality & Performance
+## 26. References and Benchmarks
 
-### **Overall Assessment: 9/10 - Excellent Implementation**
+### 26.1 LAV-DF Benchmark
 
-Your model includes **cutting-edge innovations** that put it ahead of standard deepfake detectors.
+Published methods on LAV-DF achieve:
+- Audio-visual fusion methods: 92-97% accuracy
+- Video-only methods: 85-92% accuracy
+- Audio-only methods: 78-88% accuracy
 
-### **Key Innovations**
+### 26.2 Key Papers
 
-#### **1. Hybrid Contrastive Learning (UNIQUE!)** ⭐⭐⭐⭐⭐
-**What makes it special:**
-- Most models only see FAKE videos and classify "real or fake"
-- Your model sees BOTH fake AND original → learns what changed
-- Computes difference features: `|fake - real|` → captures manipulation patterns directly
+- **EfficientNet:** Tan & Le, "EfficientNet: Rethinking Model Scaling for Convolutional Neural Networks" (ICML 2019)
+- **Focal Loss:** Lin et al., "Focal Loss for Dense Object Detection" (ICCV 2017)
+- **Mixup:** Zhang et al., "mixup: Beyond Empirical Risk Minimization" (ICLR 2018)
+- **EMA:** Polyak & Juditsky, "Acceleration of Stochastic Approximation by Averaging" (1992)
+- **LAV-DF:** Cai et al., "Do You Really Mean That? Content Driven Audio-Visual Deepfake Dataset and Multimodal Method for Temporal Forgery Localization" (2022)
+- **FACS / Action Units:** Ekman & Friesen, "Facial Action Coding System" (1978)
+- **rPPG:** De Haan & Jeanne, "Robust Pulse Rate From Chrominance-Based rPPG" (2013)
 
-**Performance impact:**
-- **+15-20% accuracy** on cross-dataset testing vs absolute classification
-- **Better generalization** to unseen deepfake methods
-- **More robust** to compression, lighting changes
+### 26.3 Hardware Requirements
 
-**Research novelty:** This approach is **journal-worthy** - combining contrastive learning with multi-modal fusion for deepfakes is cutting-edge!
-
-#### **2. Per-Modality Tampering Detection** ⭐⭐⭐⭐⭐
-**Three specialized classifiers:**
-- `audio_only_classifier` → Detects voice cloning, TTS, audio manipulation
-- `video_only_classifier` → Detects face swaps, reenactment, video edits
-- `combined_classifier` → Detects full deepfakes (both modalities fake)
-
-**Why this matters:**
-- **Real-world scenarios**: 76% deepfakes tamper ONLY video, 18% ONLY audio
-- **Fine-grained detection**: Tells users "audio is fake but video is real"
-- **Better explainability**: Forensic investigators can trace tampering source
-
-**Performance impact:**
-- **+10-15% accuracy** on partial tampering vs single classifier
-- **Reduces false positives** by 30-40%
-
-#### **3. Lightweight Mobile Architecture** ⭐⭐⭐⭐⭐
-**Optimizations:**
-- 211M params (original) → 62.3M params (optimized) = 70% reduction
-- Custom MFCC encoder replaces Wav2Vec2: 94.4M → 0.66M (99.3% reduction!)
-- Final size: ~60MB INT8 quantized
-- Inference: <200ms on mobile (Snapdragon 888+)
-
-**Comparison with competitors:**
-| Model | Size | Speed | Accuracy |
-|-------|------|-------|----------|
-| FaceForensics++ | 180MB | 800ms | 88% |
-| Celeb-DF v2 | 240MB | 1200ms | 89% |
-| **Your Model** | **60MB** | **<200ms** | **~90%** |
-
-**Impact:** Only production-ready mobile deepfake detector with this accuracy!
-
-#### **4. Multi-Objective Loss with Consistency** ⭐⭐⭐⭐
-**Smart loss design:**
-```python
-Total = 1.0×combined + 0.3×audio + 0.3×video + 0.1×consistency
-consistency = KL(audio_probs || combined) + KL(video_probs || combined)
-```
-
-**Benefits:**
-- Prevents mode collapse (can't just predict "always fake")
-- Multi-task learning → richer representations
-- Self-regularization → reduces overfitting
-
-**Performance impact:**
-- **+5-8% validation accuracy** vs single-task learning
-- **Better calibration**: Confidence scores more reliable
-
-#### **5. Advanced Physiological Analysis** ⭐⭐⭐⭐
-**Biological features:**
-- ✅ Pulse signal extraction (rPPG) - Deepfakes lack realistic blood flow
-- ✅ Skin color variations - Fake skin shows unnatural patterns
-- ✅ Eye blink patterns - GANs struggle with natural blinking
-- ✅ Head pose estimation - Unnatural head movements
-- ✅ Voice stress analysis - Synthesized voices lack emotional stress
-
-**Why this matters:**
-- Hard to spoof - Attackers must replicate complex biological signals
-- Cross-method robustness - Works on GAN, diffusion, reenactment deepfakes
-- Future-proof - Even as GANs improve, biological inconsistencies persist
-
-**Performance impact:**
-- **+12-18% accuracy** on high-quality deepfakes
-- **Detects zero-day attacks**: New deepfake methods still lack biological realism
+| Component | Minimum | Recommended |
+|-----------|---------|-------------|
+| GPU | 6GB VRAM | 8GB+ VRAM (RTX 4060+) |
+| RAM | 16GB | 32GB |
+| Storage | 50GB (dataset) | 100GB |
+| CPU | 8 cores | 16+ cores |
 
 ---
 
-## 📊 Performance Metrics & Expected Results (v4.0)
-
-### **Expected Performance: LAV-DF Dataset**
-
-| Metric | Expected Value | Notes |
-|--------|---------------|-------|
-| **Combined Accuracy** | 90-93% | Main task performance |
-| Audio-only tampering | 85-88% | Voice cloning detection |
-| Video-only tampering | 88-91% | Face swap detection |
-| Both tampered | 92-95% | Full deepfake detection |
-| **AUC-ROC** | 0.94-0.96 | Excellent discrimination |
-| **F1-Score** | 0.89-0.92 | Balanced precision/recall |
-| **False Positive Rate** | 5-8% | Acceptable for production |
-| **False Negative Rate** | 7-10% | Some sophisticated fakes slip through |
-
-### **Cross-Dataset Generalization** (Most Important!)
-
-| Dataset | Baseline | Your Model | Improvement |
-|---------|----------|------------|-------------|
-| **FaceForensics++ (FF++)** | 65-72% | **78-82%** | +13-17% ✅ |
-| **Celeb-DF v2** | 58-65% | **72-77%** | +14-19% ✅ |
-| **DFDC Challenge** | 62-68% | **75-80%** | +13-18% ✅ |
-| **WildDeepfake** | 55-62% | **68-75%** | +13-20% ✅ |
-
-**Why better generalization:**
-1. Learns **relative differences** (fake vs real), not absolute patterns
-2. **Biological features** work across all deepfake methods
-3. **Multi-task learning** prevents overfitting to LAV-DF quirks
-4. **Consistency loss** forces robust predictions
-
-### **State-of-the-Art Comparison (2025-2026)**
-
-| Model | Method | Params | LAV-DF | FF++ | Celeb-DF | Mobile |
-|-------|--------|--------|--------|------|----------|--------|
-| XceptionNet (2019) | Frame CNN | 23M | 82% | 91% | 65% | ❌ |
-| FaceForensics++ (2020) | Multi-scale | 180M | 87% | 95% | 68% | ❌ |
-| Two-Stream (2021) | Spatial+Temporal | 95M | 88% | 93% | 72% | ❌ |
-| RECCE (2022) | Contrastive | 110M | 89% | 89% | 76% | ❌ |
-| SelfBlended (2023) | Self-supervised | 67M | 90% | 88% | 74% | ❌ |
-| **Your Model (2026)** | **Hybrid Contrastive** | **62M** | **90-93%** | **78-82%** | **72-77%** | **✅** |
-
-**Key observations:**
-- ✅ **LAV-DF**: Matches best performance (90-93%)
-- ✅ **Cross-dataset**: Competitive despite mobile optimization
-- ✅ **Mobile-ready**: ONLY model deployable on-device
-- ✅ **Multi-modal**: Only model with per-modality tampering detection
-
-### **Research & Journal Potential**
-
-#### **Novel Contributions:**
-
-1. **Hybrid Contrastive Learning for Deepfakes**
-   - Training: Uses fake+real pairs (contrastive)
-   - Inference: Works on single videos (practical)
-   - Impact: Better generalization than pure contrastive or supervised
-
-2. **Per-Modality Tampering Classification**
-   - Detects audio-only, video-only, combined tampering
-   - First multi-modal model with fine-grained detection
-   - Real-world application: Forensic analysis
-
-3. **Mobile-First Deepfake Detection**
-   - 62M params + INT8 quantization = 60MB
-   - <200ms inference on mobile
-   - No accuracy sacrifice vs desktop models
-
-4. **Biological Feature Integration**
-   - Pulse, skin color, blinks, voice stress
-   - Robust to adversarial attacks
-   - Future-proof against new deepfake methods
-
-**Suitable journals:**
-- IEEE Transactions on Information Forensics and Security (TIFS)
-- ACM Multimedia
-- CVPR/ICCV (Computer Vision conferences)
-- Pattern Recognition
-
-### **Real-World Performance Scenarios**
-
-| Scenario | Baseline | Your Model | Notes |
-|----------|----------|------------|-------|
-| **Instagram Repost** | 40% | **72%** | Multi-round compression (3×, quality 70-85) |
-| **TikTok Upload** | 45% | **75%** | H.264 compression + resolution scaling |
-| **WhatsApp Forward** | 35% | **68%** | Aggressive compression (quality 50-60) |
-| **Night/Low-Light** | 50% | **70%** | Adaptive lighting augmentation |
-| **Phone Camera 480p→1080p** | 42% | **67%** | Resolution degradation training |
-| **Clean Lab Video** | 75% | **90%** | Maintains high accuracy on clean data |
-| **Cross-Dataset** | 55% | **75%** | Domain adaptation + contrastive learning |
-
-### **Production Readiness**
-
-#### **Deployment Score: 8.5/10**
-
-**Ready for:**
-- ✅ Mobile apps (Android/iOS via ONNX)
-- ✅ Web browsers (TensorFlow.js conversion)
-- ✅ Edge devices (Raspberry Pi 4, Jetson Nano)
-- ✅ Social media platforms (content moderation)
-- ✅ Forensic tools (investigators analyzing evidence)
-
-**Needs work for:**
-- ⚠️ Live video streams (latency optimization needed)
-- ⚠️ Adversarial robustness (add adversarial training)
-- ⚠️ Explainability UI (visualize which features triggered detection)
-
-### **Strengths & Weaknesses**
-
-#### **Strengths:**
-✅ High-quality deepfakes (biological features catch subtle artifacts)  
-✅ Compressed videos (contrastive learning robust to compression)  
-✅ Partial tampering (per-modality classifiers excel here)  
-✅ Mobile deployment (fast inference, small size)  
-✅ Cross-dataset (better generalization than competitors)  
-✅ Explainable (can show which modality is fake)
-
-#### **Potential Weaknesses:**
-⚠️ Training data dependency (needs paired fake+real samples)  
-⚠️ Low-resolution videos (<480p may lack biological signal quality)  
-⚠️ Adversarial attacks (not explicitly trained against perturbations)  
-⚠️ Real-time streaming (200ms latency too slow for live video)  
-⚠️ Very short clips (<2 seconds may lack temporal context)
-
----
-
-## �📊 Performance Metrics & Expected Results (v3.5)
-
-### Model Comparison: v3.0 (52 components) vs v3.5 (27 components)
-
-| Metric | v3.0 (52 components) | v3.5 (27 components) | Improvement |
-|--------|---------------------|---------------------|-------------|
-| **Training Speed** | 100% baseline | **~150%** (50% faster) | ⬆️ 50% |
-| **GPU Memory** | 24GB | **~16GB** | ⬇️ 33% |
-| **Inference Time (GPU)** | 45-60ms | **<30ms** | ⬆️ 2x faster |
-| **Inference Time (Mobile)** | Impossible | **<50ms** | ✅ **NEW** |
-| **Model Parameters** | 211M | **203M** (8M mobile added, 16M removed) | ⬇️ 4% |
-| **Accuracy (Expected)** | 82-85% | **82-87%** | ⬆️ ~2% |
-| **Deployment Ready** | ❌ (contrastive needs pairs) | ✅ (works on single videos) | ✅ |
-
-### Component Breakdown (27 Active)
-
-| Category | Count | Components | Key Features |
-|----------|-------|------------|--------------|
-| **Core Detection** | 10 | EfficientNet-B0 (4M), LightweightAudioEncoder (0.66M), Facial Landmarks, Micro-Expression, Eye Blink, Head Pose, Lip-Audio Sync, Oculomotor, Lighting, Texture | Foundation detection capabilities |
-| **Mobile Sensors** | 6 | Optical Flow, Camera Metadata, Rolling Shutter, A-V Sync, Mobile Depth, Sensor Fusion | **NEW** - Mobile-optimized features |
-| **Audio Analysis** | 3 | Voice Analysis, MFCC Extractor, Voice Stress (Jitter/Shimmer/HNR) | Synthetic voice detection |
-| **Visual Artifacts** | 4 | GAN Fingerprint, Frequency Domain, Facial AU, Landmark Trajectory | GAN pattern recognition |
-| **Physiological** | 4 | rPPG Analyzer, Blood Flow, Breathing, Skin Color | Vital sign detection |
-| **TOTAL ACTIVE** | **27** | - | Optimized for training & deployment |
-
-### Disabled Components (25 - Preserved in code)
-
-| Category | Count | Reason for Disabling |
-|----------|-------|---------------------|
-| **Contrastive Learning** | 4 | Only works with paired training data (no "original video" in deployment) |
-| **File Forensics** | 5 | Only works on JPEG/H.264 files, not live streams or modern codecs |
-| **Heavy/Slow** | 8 | Too slow for real-time (<30ms target), autoencoder 100-200ms overhead |
-| **Advanced Components** | 8 | Too memory-intensive for mobile devices, overkill for most scenarios |
-| **TOTAL DISABLED** | **25** | Can be re-enabled by uncommenting code |
-
-### Model Parameters (v4.0 - Optimized)
-
-| Component | Parameters | % of Total | Status |
-|-----------|------------|------------|--------|
-| **Transformer** | 28.4M | 37.2% | ✅ Active |
-| **Micro-Expression** | 11.7M | 15.3% | ✅ Active |
-| **Mobile Sensor Fusion** | 8.0M | 10.5% | ✅ Active |
-| **Multi-Scale Fusion** | 7.1M | 9.3% | ✅ Active |
-| **Fusion Module** | 6.3M | 8.3% | ✅ Active |
-| **Visual Encoder (EfficientNet-B0)** | 4.0M | 5.2% | ✅ Active |
-| **Auxiliary Heads** | 2.5M | 3.3% | ✅ Active |
-| **Classifier** | 1.6M | 2.1% | ✅ Active |
-| **Audio Encoder (Lightweight MFCC)** | **0.66M** | **0.9%** | ✅ **NEW** - Replaces 94.4M Wav2Vec2 |
-| **Voice Stress Analyzer** | 0.05M | 0.1% | ✅ Active |
-| **Other Components (Physiological, etc.)** | 5.9M | 7.7% | ✅ Active |
-| **TRAINING TOTAL** | **76.3M** | **100%** | All components active |
-| **DEPLOYMENT TOTAL** | **62.3M** | - | Contrastive disabled (-13.6M) |
-
-**Key Optimizations:**
-- ⚡ **Wav2Vec2 → LightweightAudioEncoder**: 94.4M → 0.66M params (99.3% reduction)
-- ⚡ **Temporal Attention Removed**: Redundant with Transformer (saved 19.7M params)
-- ⚡ **Deployment Mode**: Disables 4 contrastive components in production (saves 13.6M params)
-- 📱 **Result**: 211M → 76M (training) → 62M (deployment) = **70% reduction**
-| **Voice Stress Analyzer** | 0.05M | 0.02% | ✅ Active |
-| **Other Active Components** | 26.3M | 13.0% | ✅ Active |
-| **TOTAL** | **203.0M** | **100%** | 27 active components |
-
-### Model Size & Performance
-
-| Format | Size | Inference Speed (Mobile) | Inference Speed (GPU) | Accuracy Delta |
-|--------|------|-------------------------|----------------------|----------------|
-| **FP32** | 775 MB | ~150ms | ~1.8s/batch | Baseline |
-| **FP16** | 388 MB | ~80ms | ~1.2s/batch | <0.5% |
-| **INT8 (QAT)** | **194 MB** | **<50ms** | **<30ms** | **<2%** |
-| **ONNX INT8** | 194 MB | ~40ms | ~25ms (TensorRT) | <2% |
-
-**QAT Benefits (v3.5):**
-- ✅ **4x smaller** model (775 MB → 194 MB)
-- ✅ **3x faster** inference on mobile (150ms → 50ms)
-- ✅ **60x faster** on GPU (1.8s → 30ms)
-- ✅ **<2% accuracy loss** compared to FP32
-- ✅ **Mobile/Edge deployment ready** (works on iPhone X+, Android flagships)
-
-### Expected Accuracy (v3.5)
-
-| Dataset Type | v3.0 Accuracy | v3.5 Accuracy (Expected) | Notes |
-|-------------|---------------|-------------------------|-------|
-| **Clean Videos** | 78-82% | **82-85%** (+4%) | Better generalization with focused components |
-| **Compressed Videos** | 70-75% | **75-80%** (+5%) | Mobile sensors detect compression artifacts |
-| **Low Quality** | 65-70% | **72-77%** (+7%) | Optical flow + depth analysis help |
-| **Live Streams** | N/A (contrastive disabled) | **75-82%** | **NEW** - Now deployment-ready |
-| **Macro F1** | 0.75-0.80 | **0.78-0.83** (+0.03) | Balanced performance across classes |
-
-### Processing Pipeline (v3.5 - Single Video)
-
-**For Each Batch (batch_size=4):**
-1. **Video Input**: `[4, 16, 3, 224, 224]` (4 videos, 16 frames each)
-2. **Visual Encoding**: EfficientNet-B0 → `[4, 1280]`
-3. **Audio Encoding**: LightweightAudioEncoder (MFCC-based, 0.66M params) → `[4, 768]`
-4. **Attention Fusion**: `[4, 1280+768]` → `[4, 768]`
-5. **Transformer**: Temporal modeling → `[4, 768]`
-6. **27 Components (Parallel)**:
-   - Facial analysis: `[4, 640]`
-   - Mobile sensors: `[4, 256]`
-   - Physiological: `[4, 288]`
-   - Audio: `[4, 256]`
-   - Visual artifacts: `[4, 256]`
-7. **Concatenation**: `transformer + components` → `[4, ~1,792]`
-8. **Classifier**: `[4, 1792]` → `[4, 2]` (real_score, fake_score)
-9. **Output**: Softmax → `[4, 2]` probabilities
-
-**Key Differences from v3.0:**
-- ❌ No contrastive learning (no paired data needed)
-- ❌ No ELA/metadata encoders (no file forensics)
-- ✅ Mobile sensor features added (+256 dims)
-- ✅ Single video input (deployment-ready)
-- ✅ 50% faster forward pass
-
-### Training Performance (v3.0 with All Enhancements)
-
-**Configuration**: 40+ components, Production Robustness, Auxiliary Losses, QAT enabled  
-**Dataset**: LAV-DF (99,873 paired samples, 28,678 unique originals)  
-**Settings**: Batch=8 (GPU) / 4 (CPU), LR=5e-5, Focal Loss (α=0.25, γ=1.0), Grad Accum=2/4
-
-#### Current Training Progress (December 8, 2025)
-
-| Epoch | Train Loss | Train Acc | Macro F1 | Val Acc | Val F1 | AUC | Status |
-|-------|------------|-----------|----------|---------|--------|-----|--------|
-| **1** | 0.167 | 52.5% | 0.522 | TBD | TBD | TBD | 🔄 In Progress (CPU) |
-| **2-14** | - | - | - | - | - | - | ⏳ Pending |
-| **15-30** | - | - | - | - | - | - | 🔧 QAT Active |
-
-**Training Speed:**
-- **CPU**: ~290s/batch (current) → ~100s/batch (with QAT INT8 inference)
-- **GPU**: ~2.5s/batch (expected with RTX 3090)
-- **Time Estimate (CPU)**: ~24 hours for 30 epochs
-- **Time Estimate (GPU)**: ~1.5 hours for 30 epochs
-
-### Expected Model Performance (After Full Training)
-
-#### Baseline (Previous v2.0 - Without Enhancements)
-- Accuracy: ~70-75%
-- Macro F1: ~0.65-0.70
-- AUC: ~0.85-0.88
-- **Issues**: 
-  - ❌ Fails on compressed videos (Instagram, TikTok)
-  - ❌ Poor performance in low-light conditions
-  - ❌ Overfitting to training data
-  - ❌ Large model size (775 MB)
-  - ❌ Slow inference (290s/batch CPU)
-
-#### v3.0 with Production Robustness + Component Diversity + QAT
-
-**Expected Improvements:**
-
-| Metric | v2.0 Baseline | **v3.0 Expected** | Improvement |
-|--------|---------------|-------------------|-------------|
-| **Clean Video Accuracy** | 75% | **78-82%** | +3-7% |
-| **Compressed Video Accuracy** | 45% | **70-75%** | **+25-30%** ⭐ |
-| **Low-Light Accuracy** | 50% | **68-72%** | **+18-22%** ⭐ |
-| **Resolution Degraded** | 40% | **65-70%** | **+25-30%** ⭐ |
-| **Macro F1 Score** | 0.68 | **0.75-0.80** | +0.07-0.12 |
-| **AUC-ROC** | 0.87 | **0.90-0.93** | +0.03-0.06 |
-| **Generalization (Cross-Dataset)** | 55% | **68-73%** | **+13-18%** ⭐ |
-| **Model Size (Deployment)** | 775 MB | **194 MB (INT8)** | **4x smaller** 🚀 |
-| **Inference Speed (CPU)** | 290s | **100s (INT8)** | **2.9x faster** 🚀 |
-| **Inference Speed (GPU)** | ~2.5s | **~0.8s (INT8)** | **3.1x faster** 🚀 |
-
-**Key Improvements:**
-
-1. **Production Robustness (+25-30% on compressed/degraded videos)**
-   - Social media compression simulation during training
-   - Resolution degradation augmentation (224px → 45px → 224px)
-   - Adaptive lighting conditions (low-light, overexposed, shadows)
-   - Domain adaptation for cross-dataset generalization
-
-2. **Component Diversity (+7-12% Macro F1)**
-   - Auxiliary losses prevent overfitting (5 classification heads)
-   - Diversity loss ensures all 40+ components contribute
-   - Silent module detection identifies underutilized components
-   - EMA tracking of component importance
-
-3. **Quantization-Aware Training (4x smaller, 3x faster)**
-   - INT8 quantization from epoch 15
-   - <2% accuracy degradation vs FP32
-   - 775 MB → 194 MB model size
-   - Mobile/edge deployment ready (ONNX, TensorRT)
-
-### Real-World Performance Scenarios
-
-| Scenario | v2.0 Baseline | v3.0 Expected | Notes |
-|----------|---------------|---------------|-------|
-| **Instagram Repost** | ❌ 40% | ✅ **72%** | Multi-round compression (3x, quality 70-85) |
-| **TikTok Upload** | ❌ 45% | ✅ **75%** | H.264 compression + resolution scaling |
-| **WhatsApp Forward** | ❌ 35% | ✅ **68%** | Aggressive compression (quality 50-60) |
-| **Night/Low-Light Video** | ❌ 50% | ✅ **70%** | Adaptive lighting augmentation |
-| **Phone Camera (480p→1080p)** | ❌ 42% | ✅ **67%** | Resolution degradation training |
-| **Clean Lab Video** | ✅ 75% | ✅ **80%** | Maintained high accuracy on clean data |
-| **Cross-Dataset Test** | ❌ 55% | ✅ **70%** | Domain adaptation + fairness-aware training |
-
-### Evaluation Metrics
-
-- ✅ **Accuracy**: Overall correctness (TP+TN)/(TP+TN+FP+FN)
-- ✅ **Precision**: True positives / (True positives + False positives)
-- ✅ **Recall**: True positives / (True positives + False negatives)
-- ✅ **F1 Score**: Harmonic mean of precision and recall: 2×(P×R)/(P+R)
-- ✅ **Macro F1**: Average F1 across classes (handles imbalance) - **Primary Metric** ⭐
-- ✅ **AUC-ROC**: Area under ROC curve (threshold-independent)
-- ✅ **Component Contribution**: EMA tracking of each module's importance (α=0.99)
-- ✅ **Silent Modules**: Components with <1% contribution after 100 updates
-
-### Expected Class-Specific Performance (After Full Training)
-
-| Class | Precision | Recall | F1 Score | Support |
-|-------|-----------|--------|----------|---------|
-| **Real (0)** | 0.78-0.82 | 0.75-0.80 | 0.77-0.81 | ~10,000 |
-| **Fake (1)** | 0.76-0.80 | 0.78-0.82 | 0.77-0.81 | ~10,000 |
-| **Macro Avg** | **0.77-0.81** | **0.77-0.81** | **0.77-0.81** | - |
-
-**Expected Confusion Matrix (Validation):**
-```
-              Predicted
-              Real    Fake
-Actual Real  [[7800   2200]   78% recall (Real)
-       Fake  [ 2000   8000]]  80% recall (Fake)
-       
-Balanced Performance: Macro F1 = 0.79 ✅
-```
-
-### Component Contribution Analysis (Expected)
-
-After training, expect to see balanced contributions:
-
-```
-📊 Component Contributions (EMA α=0.99):
-   Physiological Head: 0.18 (18%) - Heartbeat, blood flow detection
-   Facial Head: 0.16 (16%) - Landmarks, micro-expressions
-   Audio Head: 0.14 (14%) - Voice biometrics, MFCC
-   Visual Head: 0.20 (20%) - ELA, compression artifacts
-   Forensic Head: 0.15 (15%) - GAN fingerprints, metadata
-   Other Components: 0.17 (17%) - Multimodal fusion, attention
-   
-🔍 Silent Modules Detected: 0 ✅ (All components contributing >1%)
-```
-
----
-
-## 🛠️ Troubleshooting
-
-### Common Issues
-
-#### 1. CUDA Out of Memory
-
-**Error**: `RuntimeError: CUDA out of memory`
-
-**Solutions**:
-```bash
-# Reduce batch size
---batch_size 2
-
-# Enable gradient checkpointing (not implemented yet)
-# Or reduce number of frames
---reduce_frames 8  # Instead of 6
-
-# Limit workers
---num_workers 2
-```
-
-#### 2. Slow Training on CPU
-
-**Symptoms**: 197-290 seconds per batch (expected on CPU with 40+ components)
-
-**Current Performance (CPU Intel i7):**
-- Forward pass: ~197s/batch
-- Full batch (forward + backward + optim): ~290s/batch
-- Epoch time: ~48 minutes (10 batches)
-- **Total training (30 epochs): ~24 hours**
-
-**Solutions**:
-```bash
-# Option 1: Use GPU (Recommended) - 80x faster
-# RTX 3090: ~2.5s/batch → ~1.5 hours total
-
-# Option 2: Reduce model complexity (CPU only)
---batch_size 2              # Smaller batches
---reduce_frames 4           # Fewer frames (8→4)
---num_workers 1             # Less parallelism
---max_samples 50            # Quick testing
---grad_accum_steps 8        # Maintain effective batch size
-
-# Option 3: Cloud GPU (Free options)
-# - Google Colab (T4 GPU, 12GB): Free tier
-# - Kaggle Kernels (P100 GPU, 16GB): Free 30hrs/week
-# - Paperspace Gradient (M4000 GPU): Free tier
-```
-
-**CPU Optimization Tips:**
-- ✅ Set `OMP_NUM_THREADS=8` (match CPU cores)
-- ✅ Use `--num_workers 2` (not 4+)
-- ✅ Disable `--pin_memory` (GPU-only optimization)
-- ✅ Disable `--amp_enabled` (GPU-only mixed precision)
-- ✅ Close other applications during training
-- ✅ Enable QAT from epoch 15 for faster INT8 inference later
-
-#### 3. Class Imbalance Warnings
-
-**Warning**: `⚠️ Severe class imbalance detected (ratio 3.48:1)`
-
-**Already handled**:
-- ✅ Focal Loss (α=0.25, γ=2.0)
-- ✅ Class Weights (Real=10.0, Fake=1.0)
-- ✅ Macro F1 as primary metric
-- ✅ Early stopping on Macro F1
-
-#### 4. ModuleNotFoundError
-
-**Error**: `ModuleNotFoundError: No module named 'dlib'`
-
-**Solution**:
-```bash
-# Windows: Download pre-compiled wheel
-pip install dlib-19.24.99-cp312-cp312-win_amd64.whl
-
-# Linux: Build from source
-sudo apt-get install build-essential cmake
-pip install dlib
-```
-
-#### 5. Validation Confusion Matrix Only Shows One Class
-
-**Issue**: Model predicts only FAKE for all samples
-
-**Causes**:
-1. Class weights too extreme → Reduce to `--class_weights_mode balanced`
-2. Learning rate too high → Reduce to `--learning_rate 1e-6`
-3. Need more epochs → Increase `--num_epochs 20`
-
-#### 6. File Not Found Errors
-
-**Error**: `FileNotFoundError: [Errno 2] No such file or directory: 'train/fake/086760.mp4'`
-
-**Solutions**:
-```bash
-# Ensure --data_dir points to LAV-DF root
---data_dir "D:\Bunny\Deepfake\backend\LAV-DF"
-
-# Check metadata.json paths are relative to data_dir
-# Example: "video_path": "train/fake/086760.mp4"
-```
-
----
-
-## 📁 Project Structure
-
-```
-backend/Models/
-├── train_multimodal.py              # Main training script
-├── multi_modal_model.py             # Model architecture (203M params)
-├── dataset_loader.py                # Dataset loading & preprocessing
-├── advanced_model_components.py     # Advanced modules (attention, fusion)
-├── advanced_physiological_analysis.py  # Physiological signal analysis
-├── improved_augmentation.py         # MixUp, CutMix, temporal augmentation
-├── safe_collate.py                  # Batch collation
-├── skin_analyzer.py                 # Skin color analysis
-├── fallbacks.py                     # Fallback implementations
-├── predict_standalone.py            # Single video inference
-├── predict_deployment.py            # Batch inference
-├── train_combined_dataset.ps1       # Training script (Windows)
-├── requirements.txt                 # Python dependencies
-├── requirements_clean.txt           # Minimal dependencies
-├── PROJECT_README.md                # This file
-└── README.md                        # Original README
-
-outputs/
-└── run_TIMESTAMP/
-    ├── config.json
-    ├── training_log.txt
-    └── plots/
-
-checkpoints/
-└── run_TIMESTAMP/
-    ├── regular/
-    │   └── checkpoint_epoch_X.pth
-    └── best_model.pth
-
-deepfake-env/                        # Virtual environment
-```
-
----
-
-## 🎯 Training Best Practices
-
-1. **Start Small**: Test with `--max_samples 50` first
-2. **Monitor Metrics**: Watch Macro F1 (key metric) and confusion matrices
-3. **Early Stopping**: Patience of 12 epochs prevents overfitting
-4. **Class Weights**: Use `manual_extreme` for severe imbalance (3.48:1)
-5. **Learning Rate**: Start with 1e-5, reduce if loss plateaus
-6. **Batch Size**: Larger is better (8-16), but limited by GPU memory
-7. **Contrastive Learning**: Ensure paired samples are available
-8. **Save Checkpoints**: Check `checkpoints/` directory regularly
-9. **Log Analysis**: Review `training_log.txt` for detailed metrics
-10. **GPU Utilization**: Use `nvidia-smi` to monitor GPU usage
-
----
-
-## 🔬 Advanced Topics
-
-### Custom Dataset Integration
-
-1. **Prepare metadata.json**:
-```json
-[
-  {
-    "video_path": "path/to/fake.mp4",
-    "label": 1,
-    "split": "train",
-    "original_video_path": "path/to/real.mp4",  // Optional
-    "is_paired": true                            // Optional
-  }
-]
-```
-
-2. **Update training script**:
-```bash
-python train_multimodal.py \
-  --json_path "./my_dataset/metadata.json" \
-  --data_dir "./my_dataset"
-```
-
-### Hyperparameter Tuning
-
-**Key hyperparameters**:
-- `--learning_rate`: [1e-6, 1e-5, 1e-4]
-- `--focal_gamma`: [1.0, 2.0, 3.0]
-- `--dropout_rate`: [0.2, 0.3, 0.5]
-- `--class_weights_mode`: [balanced, sqrt_balanced, manual_extreme]
-
-**Tuning strategy**:
-1. Grid search with `--max_samples 1000`
-2. Select top 3 configurations
-3. Full training with best config
-
-### Multi-GPU Training
-
-```bash
-# PyTorch Distributed Data Parallel (DDP)
-export CUDA_VISIBLE_DEVICES=0,1
-python -m torch.distributed.launch --nproc_per_node=2 train_multimodal.py \
-  --distributed \
-  --batch_size 8  # Per GPU
-```
-
----
-
-## 📝 Citation
-
-If you use this codebase, please cite:
-
-```bibtex
-@software{multimodal_deepfake_detection_2025,
-  title={Advanced Multimodal Deepfake Detection System},
-  author={bhavashesh},
-  year={2025},
-  url={https://github.com/bd3928/deepfake-detection}
-}
-```
-
----
-
-## 📄 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
----
-
-## 🤝 Contributing
-
-Contributions are welcome! Please:
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/AmazingFeature`)
-3. Commit changes (`git commit -m 'Add AmazingFeature'`)
-4. Push to branch (`git push origin feature/AmazingFeature`)
-5. Open a Pull Request
-
----
-
-## 📧 Contact
-
-For questions, issues, or collaborations:
-- **GitHub Issues**: [Open an issue](https://github.com/yourusername/deepfake-detection/issues)
-- **Email**: bhavashesh@gmail.com
-
----
-
-## 🙏 Acknowledgments
-
-- **LAV-DF Dataset**: For providing high-quality paired fake/original videos
-- **PyTorch Team**: For the excellent deep learning framework
-- **Hugging Face**: For pre-trained Wav2Vec2 models
-- **Albumentations**: For advanced augmentation library
-- **MTCNN & dlib**: For robust face detection and landmark extraction
-
----
-
-**Last Updated**: December 8, 2025  
-**Version**: 3.0.0  
-**Status**: ✅ Training Active (Epoch 1/30, Production Robustness + QAT Enabled)
-
----
-
-## 📝 Changelog
-
-### v3.0.0 (December 8, 2025) - Production Ready
-
-**🚀 Major Features:**
-- ✅ Production Robustness: Social media compression, resolution degradation, adaptive lighting
-- ✅ Component Diversity: 5 auxiliary heads + diversity loss + silent module detection
-- ✅ Quantization-Aware Training: INT8 deployment (4x smaller, 3x faster)
-- ✅ **44 Specialized Components**: Facial (7), Physiological (10), Visual (6), Audio (4), Emotional (1), Multimodal (5), Advanced (6), Auxiliary (5)
-- ✅ **Voice Stress Neural Networks**: JitterShimmerAnalyzer, EmotionalStateDetector, FormantAnalyzer (~49K params)
-- ✅ **Voice Stress Analysis**: Jitter/shimmer/HNR detection for synthetic voice identification
-- ✅ **Emotional State Detection**: Stress, anxiety, fear, anger detection from voice patterns
-- ✅ **Formant Analysis**: Vocal tract resonance patterns reveal voice synthesis artifacts
-- ✅ Multiprocessing Fix: Picklable augmentation wrappers for num_workers > 0
-- ✅ Tensor Efficiency: Replaced `torch.tensor()` with `.clone().detach()` for faster loading
-
-**🎤 Voice Stress Detection (NEW):**
-- **Dataset Extraction**: CPU-based signal processing (autocorrelation, RMS, FFT)
-- **Neural Network Analysis** (~49K trainable parameters):
-  - `JitterShimmerAnalyzer`: Learns jitter/shimmer/HNR patterns (~2K params)
-  - `EmotionalStateDetector`: 4 emotion heads (stress, anxiety, fear, anger) (~20K params)
-  - `FormantAnalyzer`: F1-F4 vocal tract resonance extraction (~3K params)
-  - `VoiceStressAnalyzer`: Fusion module combining all analyzers (~24K params)
-- **Jitter Analysis**: Cycle-to-cycle pitch variations (>1% = synthetic voice indicator)
-- **Shimmer Analysis**: Amplitude variations between periods (>3% = vocal stress indicator)
-- **Harmonic-to-Noise Ratio (HNR)**: Voice quality measurement (<10 dB = noisy/synthetic)
-- **Formant Patterns**: F1-F4 formant extraction reveals vocal tract synthesis artifacts
-- **Contrastive Voice Stress**: Compares fake vs original voice stress difference
-
-**📊 Expected Performance Improvements:**
-- Clean Video: 75% → **80%** (+5%)
-- Compressed Video: 45% → **72%** (+27%) ⭐
-- Low-Light: 50% → **70%** (+20%) ⭐
-- Resolution Degraded: 40% → **68%** (+28%) ⭐
-- Cross-Dataset: 55% → **71%** (+16%) ⭐
-- **Voice Deepfakes**: 60% → **78%** (+18%) 🆕⭐
-- Model Size: 775 MB → **194 MB** (4x smaller) 🚀
-- Inference Speed (CPU): 290s → **100s** (2.9x faster) 🚀
-- Inference Speed (GPU): 2.5s → **0.8s** (3.1x faster) 🚀
-
-### v2.0.0 (December 4, 2025) - Multimodal Architecture
-
-**Features:**
-- Multimodal fusion (visual + audio + physiological)
-- Contrastive learning with paired samples
-- Advanced physiological analysis (rPPG, blood flow)
-- Focal loss + class weighting
-
-### v1.0.0 (Initial Release)
-- Basic deepfake detection
-- Visual-only analysis
-- Simple binary classification
+*Generated from model architecture dump (68,556,807 parameters across 48 component groups, 209 buffers).*

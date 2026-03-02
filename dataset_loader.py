@@ -1,0 +1,3006 @@
+import logging
+import io
+import torch.nn.functional as F
+import scipy
+from scipy import signal
+import json
+import os
+import numpy as np
+import torch
+from torch.utils.data import Dataset, DataLoader, SubsetRandomSampler, Subset, WeightedRandomSampler
+from torchvision import transforms
+import torchaudio
+import cv2
+import warnings
+import random
+import math
+import librosa
+import uuid
+import multiprocessing
+import dlib
+from audiomentations import Compose, AddGaussianNoise, PitchShift, TimeStretch, Shift
+import albumentations as A
+
+# Module logger
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    logging.basicConfig(level=logging.INFO)
+
+# Simple in-process cache to avoid validating the same JSON file multiple times
+# (train/val/test dataset instances currently call _validate_dataset() in __init__,
+# which produced repeated full-dataset validation runs in the logs).
+_dataset_validation_cache = {}
+
+# Import our improved augmentation techniques
+try:
+    from improved_augmentation import (
+        get_advanced_video_transforms, 
+        get_advanced_audio_transforms,
+        TemporalConsistencyAugmenter,
+        mix_up_augmentation
+    )
+except ImportError:
+    print("Warning: improved_augmentation.py not found, falling back to standard augmentation")
+try:
+    from facenet_pytorch import MTCNN
+except ImportError:
+    print("Warning: facenet_pytorch not found, some face detection features will be limited")
+from scipy.signal import spectrogram
+import librosa
+from PIL import Image
+from PIL import Image
+import random
+import math
+import scipy.ndimage as ndimage
+import traceback
+import uuid
+
+# Default number of frames to sample per video (can be overridden per-dataset)
+DEFAULT_MAX_FRAMES = 32
+
+class MultiModalDeepfakeDataset(Dataset):
+    # NOTE: To maximize GPU usage, ensure that all output tensors (e.g., video_frames, audio, features)
+    # are moved to the correct device (e.g., .to('cuda')) in your training loop or collate_fn.
+    # This is typically handled in the training script, not the dataset itself, for best flexibility.
+    def __init__(self, json_path, data_dir, max_frames=DEFAULT_MAX_FRAMES, audio_length=8000, transform=None, audio_transform=None, 
+                 logging=False, phase='train', detect_faces=True, compute_spectrograms=True, temporal_features=True,
+                 enhanced_preprocessing=True, label_assignment_fn=None, load_originals_always=False):
+        if not os.path.exists(json_path):
+            raise FileNotFoundError(f"JSON file not found at: {json_path}")
+        
+        # Load JSON with robust error handling
+        try:
+            with open(json_path, 'r', encoding='utf-8') as f:
+                self.data = json.load(f)
+            print(f"✅ Successfully loaded JSON with {len(self.data)} entries")
+        except json.JSONDecodeError as e:
+            print(f"❌ JSON decode error: {e}")
+            print("🔧 Attempting to repair JSON file...")
+            
+            # Try to load partial JSON by reading line by line
+            self.data = []
+            try:
+                with open(json_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                    
+                # Try to find complete JSON objects
+                if content.startswith('[') and not content.endswith(']'):
+                    # Likely truncated array, try to add closing bracket
+                    content = content.rstrip().rstrip(',') + ']'
+                    self.data = json.loads(content)
+                    print(f"✅ Repaired JSON, loaded {len(self.data)} entries")
+                else:
+                    raise ValueError("Unable to repair JSON automatically")
+                    
+            except Exception as repair_error:
+                print(f"❌ Failed to repair JSON: {repair_error}")
+                raise ValueError(f"JSON file is corrupted and cannot be repaired: {json_path}")
+        except Exception as e:
+            raise ValueError(f"Error loading JSON file {json_path}: {e}")
+
+        self.data_dir = data_dir
+        self.max_frames = max_frames
+        self.audio_length = audio_length
+        self.transform = transform
+        self.audio_transform = audio_transform
+        self.logging = logging  # Enable or disable detailed logging
+        self.phase = phase  # 'train', 'val', or 'test'
+        self.detect_faces = detect_faces
+        self.compute_spectrograms = compute_spectrograms
+        self.temporal_features = temporal_features
+        self.enhanced_preprocessing = enhanced_preprocessing
+        self.label_assignment_fn = label_assignment_fn
+        # When True, for fake samples the loader will attempt to load original video/audio
+        # whenever an `original` path is present in metadata, regardless of `modify_video`/`modify_audio` flags.
+        self.load_originals_always = load_originals_always
+        
+        # Initialize error counters early
+        self.face_detection_error_count = 0
+        self.max_face_detection_errors_to_print = 5  # Reduce error messages for cleaner output
+        self._sample_count = 0  # Track sample count for periodic detailed logging
+        
+        # Optional face detector for more focused analysis
+        # NOTE: initialize MTCNN lazily to avoid pickling issues when using DataLoader workers on Windows.
+        self.face_detector = None
+        self._mtcnn_inited = False
+        self.detect_faces = detect_faces
+
+        # ── Initialize dlib detector + landmark predictor in the MAIN process ──
+        # worker_init_fn only runs for spawned DataLoader workers (num_workers>0).
+        # When num_workers=0, data loading happens in the main process, so we
+        # must initialize here or landmarks will silently be all zeros.
+        self.landmark_predictor_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            'shape_predictor_68_face_landmarks.dat'
+        )
+        # Also honour the SHAPE_PREDICTOR_PATH environment variable
+        env_path = os.environ.get('SHAPE_PREDICTOR_PATH', '')
+        if env_path and os.path.exists(env_path):
+            self.landmark_predictor_path = env_path
+
+        self.dlib_detector = None
+        self.landmark_predictor = None
+        if self.enhanced_preprocessing:
+            try:
+                self.dlib_detector = dlib.get_frontal_face_detector()
+                if os.path.exists(self.landmark_predictor_path):
+                    self.landmark_predictor = dlib.shape_predictor(self.landmark_predictor_path)
+                    print(f"[INIT] dlib landmark predictor loaded from {self.landmark_predictor_path}")
+                else:
+                    print(f"[INIT] WARNING: shape predictor file not found at {self.landmark_predictor_path}")
+            except Exception as e:
+                print(f"[INIT] WARNING: dlib initialization failed: {e}")
+                self.dlib_detector = None
+                self.landmark_predictor = None
+                
+        # Pre-validate the dataset to filter out problematic entries (can be expensive)
+        # Include phase in cache key so train/val/test get separate validated indices
+        cache_key = f"{os.path.abspath(json_path)}::{self.phase}"
+        if cache_key in _dataset_validation_cache:
+            self.valid_indices = _dataset_validation_cache[cache_key]
+            if self.logging:
+                print(f"[DATASET CACHE] Reusing validated indices for {json_path} (count={len(self.valid_indices)})")
+        else:
+            self.valid_indices = self._validate_dataset()
+            # Cache result to avoid repeating full validation for train/val/test instances
+            _dataset_validation_cache[cache_key] = self.valid_indices
+
+        # CONDITIONAL PAIR-ONLY MODE: Only apply when load_originals_always=True
+        # This keeps only fake samples that reference an `original` file for contrastive learning.
+        # When load_originals_always=False (deployment mode), we use ALL samples (real + fake).
+        if self.load_originals_always:
+            paired = [idx for idx in self.valid_indices if self.data[idx].get('n_fakes', 0) > 0 and self.data[idx].get('original')]
+            if len(paired) == 0:
+                logger.warning("Pair-only filtering enabled but no paired samples found; dataset will be empty unless metadata contains 'original' entries.")
+            else:
+                logger.info(f"Pair-only filtering (load_originals_always=True): reduced valid samples {len(self.valid_indices)} -> {len(paired)}")
+                self.valid_indices = paired
+        else:
+            logger.info(f"Deployment mode (load_originals_always=False): using all {len(self.valid_indices)} valid samples (real + fake)")
+
+        # Store class_weights_mode for later use (will be set by training script)
+        self.class_weights_mode = 'balanced'  # Default mode
+        
+        # Recompute class counts and weights after filtering to paired samples
+        self.class_counts = self._count_classes()
+        # Calculate class weights for imbalanced datasets
+        self.class_weights = self._calculate_class_weights()
+        
+        # Initialize facial landmark detector if available (for enhanced facial analysis)
+        # NOTE: dlib_detector and landmark_predictor are already initialized earlier in __init__
+        # for the main process (num_workers=0). The worker_init_fn re-initializes them
+        # inside spawned workers. Do NOT reset them to None here.
+        self._worker_inited = False
+        
+        logger.info(f"Dataset initialized with {len(self.valid_indices)} valid samples out of {len(self.data)} total.")
+        logger.info(f"Class distribution: {self.class_counts}")
+
+    def worker_init_fn(self, worker_id: int):
+        """Initialize heavy detector objects inside DataLoader worker processes.
+
+        This method is safe to call multiple times; it will load the dlib
+        landmark predictor and a lightweight dlib face detector and ensure
+        the MTCNN instance is created lazily on the worker process. This
+        prevents the common Windows 'spawn' pickle issue where child workers
+        do not have detector instances, causing all-zero landmark outputs.
+        """
+        # If already initialized in this process, skip
+        if getattr(self, '_worker_inited', False):
+            return
+
+        try:
+            predictor_path = getattr(self, 'landmark_predictor_path', None)
+            exists = bool(predictor_path and os.path.exists(predictor_path))
+            print(f"[WORKER INIT] worker={worker_id} pid={os.getpid()} predictor_path={predictor_path} exists={exists}")
+
+            if exists:
+                try:
+                    self.landmark_predictor = dlib.shape_predictor(predictor_path)
+                    print(f"[WORKER INIT] worker={worker_id} loaded dlib.shape_predictor OK")
+                except Exception as e:
+                    print(f"[WORKER INIT] worker={worker_id} failed to load dlib.shape_predictor: {e}")
+                    self.landmark_predictor = None
+            else:
+                print(f"[WORKER INIT] worker={worker_id} predictor file missing or path invalid")
+                self.landmark_predictor = None
+
+            # Initialize a lightweight dlib frontal face detector as a fallback
+            try:
+                self.dlib_detector = dlib.get_frontal_face_detector()
+                print(f"[WORKER INIT] worker={worker_id} dlib.get_frontal_face_detector OK")
+            except Exception as e:
+                print(f"[WORKER INIT] worker={worker_id} failed to init dlib detector: {e}")
+                self.dlib_detector = None
+
+            # Ensure MTCNN is available in this worker if face detection is enabled
+            try:
+                self._get_mtcnn()
+                print(f"[WORKER INIT] worker={worker_id} _get_mtcnn() called, mtcnn_inited={getattr(self, '_mtcnn_inited', False)}")
+            except Exception as e:
+                print(f"[WORKER INIT] worker={worker_id} _get_mtcnn() failed: {e}")
+
+        except Exception as top_e:
+            print(f"[WORKER INIT] worker={worker_id} unexpected error: {top_e}")
+        finally:
+            # Mark worker as initialized in this process
+            self._worker_inited = True
+
+    def _validate_dataset(self):
+        """Pre-validate all samples in the dataset to identify valid ones.
+        
+        Filters by the metadata ``split`` field when present so that each
+        dataset instance (train / val / test) only contains its own samples,
+        preventing data leakage between splits.
+        """
+        logger.info("Starting dataset validation...")
+        
+        # Map dataset phase → metadata split value
+        phase_to_split = {'train': 'train', 'val': 'dev', 'test': 'test'}
+        target_split = phase_to_split.get(self.phase, None)
+        
+        # Use the entire dataset for production
+        max_to_validate = len(self.data)
+        logger.info(f"VALIDATING {max_to_validate} SAMPLES IN THE DATASET (phase={self.phase}, target_split={target_split})")
+        
+        valid_indices = []
+        
+        # Add progress indicators for validation
+        progress_interval = max(1, max_to_validate // 100)  # Show progress ~100 times
+        
+        for idx in range(max_to_validate):
+            if idx % progress_interval == 0 or idx == max_to_validate - 1:
+                print(f"Validating sample {idx+1}/{max_to_validate} ({(idx+1)/max_to_validate*100:.1f}%)...")
+            
+            sample = self.data[idx]
+            
+            # ── Split-field filtering (prevents data leakage) ──
+            if target_split is not None and 'split' in sample:
+                if sample['split'] != target_split:
+                    continue
+            
+            video_path = os.path.join(self.data_dir, sample['file'])
+            
+            # Only check video existence here; avoid doing expensive audio checks until needed
+            if os.path.exists(video_path):
+                valid_indices.append(idx)
+        
+        print(f"Found {len(valid_indices)} valid samples out of {max_to_validate} checked (phase={self.phase}, split={target_split}).")
+        return valid_indices
+
+    def _get_mtcnn(self):
+        """Lazily initialize and return an MTCNN face detector (CPU)."""
+        if not self.detect_faces:
+            return None
+        if getattr(self, 'face_detector', None) is None and not getattr(self, '_mtcnn_inited', False):
+            try:
+                from facenet_pytorch import MTCNN
+                # Initialize on CPU to avoid CUDA pickling issues in DataLoader workers
+                # Relax thresholds slightly to improve recall on small/low-quality faces
+                # Keep detector on CPU to avoid CUDA pickling issues in DataLoader workers
+                self.face_detector = MTCNN(
+                    image_size=224, margin=40, min_face_size=12,
+                    thresholds=[0.5, 0.6, 0.6], factor=0.709, post_process=True,
+                    device='cpu'
+                )
+                self._mtcnn_inited = True
+                logger.info("Initialized MTCNN face detector (lazy)")
+            except Exception as e:
+                logger.warning(f"Could not initialize MTCNN: {e}")
+                self.face_detector = None
+                self._mtcnn_inited = True
+        return self.face_detector
+
+    def _count_classes(self):
+        """Count the number of real/fake samples for balancing.
+        
+        Behavior depends on load_originals_always mode:
+        - When True (contrastive learning): Each fake sample produces 2 examples (fake + original)
+        - When False (deployment mode): Each sample produces 1 example based on its label
+        """
+        if self.load_originals_always:
+            # PAIRED/CONTRASTIVE MODE: count pairs
+            paired_count = 0  # Count of fake samples that have an original
+            unpaired_fake_count = 0
+            unpaired_real_count = 0
+            unique_originals = set()  # Track unique original video paths
+            
+            for idx in self.valid_indices:
+                sample = self.data[idx]
+                has_fake = sample.get('n_fakes', 0) > 0
+                original_path = sample.get('original')
+                
+                if has_fake and original_path:
+                    # This is a fake video with an original reference
+                    paired_count += 1
+                    unique_originals.add(original_path)  # Track unique original paths
+                elif has_fake:
+                    unpaired_fake_count += 1
+                else:
+                    unpaired_real_count += 1
+            
+            # Calculate actual training samples for paired mode
+            real_count = paired_count + unpaired_real_count  # Each paired fake brings its original
+            fake_count = paired_count + unpaired_fake_count
+            total = real_count + fake_count
+            
+            real_pct = (real_count / total * 100) if total > 0 else 0
+            fake_pct = (fake_count / total * 100) if total > 0 else 0
+            phase_name = getattr(self, 'phase', 'UNKNOWN').upper()
+            
+            print(f"\n{'='*60}")
+            print(f"📊 DATASET CLASS DISTRIBUTION ({phase_name}) - PAIRED MODE")
+            print(f"{'='*60}")
+            print(f"  Paired fakes:     {paired_count:5d} (reference an original)")
+            print(f"  Unique originals: {len(unique_originals):5d} (may be shared by multiple fakes)")
+            print(f"  Unpaired fakes:   {unpaired_fake_count:5d}")
+            print(f"  Unpaired reals:   {unpaired_real_count:5d}")
+            print(f"  ─────────────────────────────────")
+            print(f"  Real videos:      {real_count:5d} ({real_pct:5.2f}%)")
+            print(f"  Fake videos:      {fake_count:5d} ({fake_pct:5.2f}%)")
+            print(f"  Total samples:    {total:5d}")
+            print(f"  Imbalance ratio (Fake:Real): {fake_count/max(real_count, 1):.2f}:1")
+            print(f"{'='*60}\n")
+        else:
+            # DEPLOYMENT MODE: count actual labels
+            real_count = 0
+            fake_count = 0
+            
+            for idx in self.valid_indices:
+                sample = self.data[idx]
+                has_fake = sample.get('n_fakes', 0) > 0
+                if has_fake:
+                    fake_count += 1
+                else:
+                    real_count += 1
+            
+            total = real_count + fake_count
+            real_pct = (real_count / total * 100) if total > 0 else 0
+            fake_pct = (fake_count / total * 100) if total > 0 else 0
+            phase_name = getattr(self, 'phase', 'UNKNOWN').upper()
+            
+            print(f"\n{'='*60}")
+            print(f"📊 DATASET CLASS DISTRIBUTION ({phase_name}) - DEPLOYMENT MODE")
+            print(f"{'='*60}")
+            print(f"  Real videos:      {real_count:5d} ({real_pct:5.2f}%)")
+            print(f"  Fake videos:      {fake_count:5d} ({fake_pct:5.2f}%)")
+            print(f"  Total samples:    {total:5d}")
+            print(f"  Imbalance ratio (Fake:Real): {fake_count/max(real_count, 1):.2f}:1")
+            print(f"{'='*60}\n")
+                
+        return {'real': real_count, 'fake': fake_count}
+    
+    def _calculate_class_weights(self):
+        """Calculate class weights for handling imbalanced data."""
+        if self.class_counts['real'] == 0 or self.class_counts['fake'] == 0:
+            return torch.tensor([1.0, 1.0], dtype=torch.float32)
+            
+        total = self.class_counts['real'] + self.class_counts['fake']
+        
+        # Calculate imbalance ratio
+        imbalance_ratio = self.class_counts['fake'] / max(self.class_counts['real'], 1)
+        
+        # For manual_extreme mode, use a very high weight for the real class
+        # This is for cases with extreme class imbalance
+        if hasattr(self, "class_weights_mode") and self.class_weights_mode == "manual_extreme":
+            print("Using manual_extreme class weights with 10:1 ratio (applied to minority class)")
+            # Give the minority class a 10x weight to strongly counter extreme imbalance.
+            # Determine which class is minority and assign weights accordingly.
+            try:
+                if self.class_counts['real'] < self.class_counts['fake']:
+                    weight_real = 10.0
+                    weight_fake = 1.0
+                else:
+                    weight_real = 1.0
+                    weight_fake = 10.0
+            except Exception:
+                # Fallback in case class_counts are invalid
+                weight_real = 10.0
+                weight_fake = 1.0
+        
+        # For inverse_frequency mode, use direct inverse of class frequency
+        # This is the strongest automatic balancing - minority class gets weight proportional to imbalance
+        elif hasattr(self, "class_weights_mode") and self.class_weights_mode == "inverse_frequency":
+            weight_real = float(total / (2.0 * self.class_counts['real']))  # ~1.87 for 27% real
+            weight_fake = float(total / (2.0 * self.class_counts['fake']))  # ~0.68 for 73% fake
+            print(f"Using inverse_frequency class weights (imbalance ratio {imbalance_ratio:.2f}:1)")
+            print(f"   Real class will have {weight_real/weight_fake:.2f}x more weight than Fake")
+        
+        # For sqrt_balanced mode, explicitly use square root balanced weights
+        elif hasattr(self, "class_weights_mode") and self.class_weights_mode == "sqrt_balanced":
+            weight_real = float(np.sqrt(total / (2.0 * self.class_counts['real'])))
+            weight_fake = float(np.sqrt(total / (2.0 * self.class_counts['fake'])))
+            print(f"Using sqrt_balanced class weights (imbalance ratio {imbalance_ratio:.2f}:1)")
+        
+        # For severe imbalance (ratio > 2), use inverse_frequency by default in balanced mode
+        elif imbalance_ratio > 2.0:
+            # Use full inverse frequency for stronger weighting on minority class
+            weight_real = float(total / (2.0 * self.class_counts['real']))
+            weight_fake = float(total / (2.0 * self.class_counts['fake']))
+            print(f"⚠️  Severe class imbalance detected (ratio {imbalance_ratio:.2f}:1)")
+            print(f"Using inverse_frequency class weights (auto-selected for severe imbalance)")
+        
+        else:
+            # Standard balanced weights
+            weight_real = float(total / (2.0 * self.class_counts['real']))
+            weight_fake = float(total / (2.0 * self.class_counts['fake']))
+            print("Using standard balanced class weights")
+            
+        weights = torch.tensor([weight_real, weight_fake], dtype=torch.float32)
+        print(f"📊 Final class weights: Real={weight_real:.4f}, Fake={weight_fake:.4f}")
+        print(f"   (Real class weight is {weight_real/weight_fake:.2f}x higher than Fake)\n")
+        
+        return weights
+
+    def __len__(self):
+        return len(self.valid_indices)
+
+    def __getitem__(self, idx):
+        """Get a sample by its index in the valid indices list."""
+        # Map the provided index to the actual valid index in the dataset
+        actual_idx = self.valid_indices[idx]
+        sample = self.data[actual_idx]
+        
+        try:
+            video_path = os.path.join(self.data_dir, sample['file'])
+            audio_path = video_path.replace('.mp4', '.wav')
+
+            original_video_path = (
+                os.path.join(self.data_dir, sample['original'])
+                if 'original' in sample and sample['original']
+                else None
+            )
+            original_audio_path = (
+                original_video_path.replace('.mp4', '.wav')
+                if original_video_path
+                else None
+            )
+
+            # Load video/audio with proper error handling
+            video_frames, face_embeddings, temporal_consistency, facial_landmarks = self._load_video(video_path)
+            if video_frames is None:
+                raise ValueError(f"Video loading failed for sample {actual_idx}. Path: {video_path}")
+                
+            audio_tensor, audio_spectrogram, mfcc_features = self._load_audio(audio_path)
+            if audio_tensor is None:
+                raise ValueError(f"Audio loading failed for sample {actual_idx}. Path: {audio_path}")
+            
+            # Extract voice stress features (jitter, shimmer, HNR)
+            voice_stress_features = self._extract_voice_stress(audio_tensor)
+
+            # Load original video/audio if needed
+            original_video_frames = None
+            original_audio_tensor = None
+            original_mfcc_features = None  # Initialize here to ensure it's always defined
+            original_facial_landmarks_raw = None  # Initialize here
+            original_voice_stress_features = None  # Initialize here
+            audio_visual_sync_features = None
+            
+            # ✅ DEPLOYMENT MODE: Skip loading originals (disabled by default)
+            # load_originals_always=False prevents data leakage and overfitting
+            if self.load_originals_always and sample.get('n_fakes', 0) > 0 and original_video_path:
+                # Only load originals if explicitly enabled (NOT RECOMMENDED for training)
+                load_video_orig = bool(self.load_originals_always) or sample.get('modify_video', False)
+                load_audio_orig = bool(self.load_originals_always) or sample.get('modify_audio', False)
+
+                if load_video_orig:
+                        # if self.logging:
+                        #     print(f"🎥 [PAIR] Loading FAKE video: {sample['file']}")
+                        #     print(f"🎥 [PAIR] Loading REAL (original) video: {sample['original']}")
+                        # CRITICAL: Capture ALL outputs including landmarks from original video
+                        original_video_frames, original_face_embeddings, original_temporal_consistency, original_facial_landmarks_raw = self._load_video(original_video_path)
+                        if original_video_frames is None:
+                            # Try a minimal, more tolerant loader as a fallback
+                            try:
+                                original_video_frames, original_face_embeddings, original_temporal_consistency, original_facial_landmarks_raw = self._load_video_minimal(original_video_path)
+                                if original_video_frames is not None and self.logging:
+                                    print(f"ℹ️ Fallback minimal original video loader succeeded for sample {actual_idx}")
+                            except Exception as fb_err:
+                                if self.logging:
+                                    print(f"⚠️ Warning: Original video loading failed for sample {actual_idx}. Path: {original_video_path}. Error: {fb_err}")
+                                # Set to None on failure
+                                original_facial_landmarks_raw = None
+
+                if load_audio_orig and original_audio_path:
+                    original_audio_tensor, original_audio_spectrogram, original_mfcc_features = self._load_audio(original_audio_path)
+                    if original_audio_tensor is None:
+                        # Try a minimal librosa-based fallback
+                        try:
+                            original_audio_tensor, original_audio_spectrogram, original_mfcc_features = self._load_audio_minimal(original_audio_path)
+                            if original_audio_tensor is not None and self.logging:
+                                print(f"ℹ️ Fallback minimal original audio loader succeeded for sample {actual_idx}")
+                        except Exception as fb_err:
+                            if self.logging:
+                                print(f"⚠️ Warning: Original audio loading failed for sample {actual_idx}. Path: {original_audio_path}. Error: {fb_err}")
+                            original_mfcc_features = None
+                    
+                    # Extract voice stress from original audio
+                    if original_audio_tensor is not None:
+                        original_voice_stress_features = self._extract_voice_stress(original_audio_tensor)
+                else:
+                    original_mfcc_features = None
+                    original_voice_stress_features = None
+
+                # Extract audio-visual synchronization features (for fake pair)
+                if video_frames is not None and audio_tensor is not None:
+                    audio_visual_sync_features = self._extract_av_sync_features(video_frames, audio_tensor)
+
+                # If originals were loaded, compute sync features for the original pair as well
+                original_audio_visual_sync = None
+                if original_video_frames is not None and original_audio_tensor is not None:
+                    try:
+                        original_audio_visual_sync = self._extract_av_sync_features(original_video_frames, original_audio_tensor)
+                    except Exception:
+                        original_audio_visual_sync = None
+
+            # Create fake mask
+            timestamps = sample.get('timestamps', [])
+            fake_mask = torch.zeros(len(timestamps))
+            for i, (_, start, end) in enumerate(timestamps):
+                for f_start, f_end in sample.get('fake_periods', []):
+                    if start < f_end and end > f_start:
+                        fake_mask[i] = 1
+                        break
+
+            # Extract metadata features (e.g., compression artifacts, noise patterns)
+            metadata_features = self._extract_metadata_features(video_path)
+            
+            # Calculate ELA (Error Level Analysis) for forgery detection
+            ela_features = self._extract_ela_features(video_frames) if video_frames is not None else None
+            
+            # NEW: Extract pulse signal features if enhanced preprocessing is enabled
+            pulse_signal = None
+            skin_color_variations = None
+            if self.enhanced_preprocessing and video_frames is not None:
+                pulse_signal = self._extract_pulse_signal(video_frames)
+                skin_color_variations = self._extract_skin_color_variations(video_frames)
+                
+            # NEW: Extract head pose features
+            head_pose_features = None
+            if facial_landmarks is not None:
+                head_pose_features = self._estimate_head_pose(facial_landmarks)
+            
+            # NEW: Extract eye blinking patterns
+            eye_blink_features = self._extract_eye_blink_patterns(video_frames, facial_landmarks)
+            # If eye blink features are present but degenerate (all zeros or near-constant), treat as missing
+            try:
+                if isinstance(eye_blink_features, torch.Tensor):
+                    # If entirely zero or extremely low variance, mark as missing so model skips auxiliary signals
+                    if eye_blink_features.numel() == 0 or float(eye_blink_features.abs().sum().item()) == 0.0 or (eye_blink_features.numel() > 1 and float(torch.std(eye_blink_features).item()) < 1e-6):
+                        if self.logging and not hasattr(self, '_eye_blink_warning_shown'):
+                            print("[DATA] Eye blink features are degenerate (zeros/low-variance) — marking as missing")
+                            self._eye_blink_warning_shown = True
+                        eye_blink_features = None
+            except Exception:
+                # Non-fatal: if check fails, keep original value
+                pass
+            
+            # NEW: Extract frequency domain features
+            frequency_features = self._extract_frequency_features(video_frames)
+            
+            # CRITICAL: Extract features from ORIGINAL video for contrastive learning
+            original_pulse_signal = None
+            original_skin_color_variations = None
+            original_head_pose = None
+            original_eye_blink_features = None
+            original_frequency_features = None
+            original_facial_landmarks = None
+            # original_mfcc_features already extracted from _load_audio() above
+            
+            if original_video_frames is not None:
+                # Extract physiological features from ORIGINAL video
+                if self.enhanced_preprocessing:
+                    original_pulse_signal = self._extract_pulse_signal(original_video_frames)
+                    original_skin_color_variations = self._extract_skin_color_variations(original_video_frames)
+                    original_frequency_features = self._extract_frequency_features(original_video_frames)
+                
+                # Use landmarks already extracted during _load_video() call (line 366)
+                if 'original_facial_landmarks_raw' in locals() and original_facial_landmarks_raw is not None:
+                    # Already a tensor from _load_video(), just normalize shape
+                    original_facial_landmarks = original_facial_landmarks_raw.clone().detach()
+                    if len(original_facial_landmarks) < self.max_frames:
+                        padding = torch.zeros((self.max_frames - len(original_facial_landmarks), 136))
+                        original_facial_landmarks = torch.cat([original_facial_landmarks, padding], dim=0)
+                    elif len(original_facial_landmarks) > self.max_frames:
+                        original_facial_landmarks = original_facial_landmarks[:self.max_frames]
+                    
+                    # Extract derivative features from landmarks
+                    original_head_pose = self._estimate_head_pose(original_facial_landmarks)
+                    original_eye_blink_features = self._extract_eye_blink_patterns(original_video_frames, original_facial_landmarks)
+                else:
+                    # Fallback: create zero tensors if landmarks not available
+                    original_facial_landmarks = torch.zeros((self.max_frames, 136), dtype=torch.float32)
+                    original_head_pose = torch.zeros((self.max_frames, 3), dtype=torch.float32)
+                    original_eye_blink_features = torch.zeros(self.max_frames, dtype=torch.float32)
+            
+            # Ensure ALL original features have fallbacks (if original video not available)
+            if original_mfcc_features is None:
+                original_mfcc_features = torch.zeros((20, 50), dtype=torch.float32)
+            if original_pulse_signal is None:
+                original_pulse_signal = torch.zeros(self.max_frames, dtype=torch.float32)
+            if original_skin_color_variations is None:
+                original_skin_color_variations = torch.zeros((self.max_frames, 3), dtype=torch.float32)
+            if original_head_pose is None:
+                original_head_pose = torch.zeros((self.max_frames, 3), dtype=torch.float32)
+            if original_eye_blink_features is None:
+                original_eye_blink_features = torch.zeros(self.max_frames, dtype=torch.float32)
+            if original_frequency_features is None:
+                original_frequency_features = torch.zeros((1, 16, 16), dtype=torch.float32)
+            if original_facial_landmarks is None:
+                original_facial_landmarks = torch.zeros((self.max_frames, 136), dtype=torch.float32)
+            
+            # Label: 1 for fake, 0 for real
+            label = torch.tensor(1 if sample.get('n_fakes', 0) > 0 else 0, dtype=torch.long)
+            
+            # Fine-grained deepfake type if available
+            deepfake_type = sample.get('deepfake_type', 'unknown')
+            deepfake_type_id = self._get_deepfake_type_id(deepfake_type)
+
+            # Debugging: Log successful data loading with feature details
+            if self.logging:
+                # Increment sample counter
+                self._sample_count = getattr(self, '_sample_count', 0) + 1
+                
+                # Build concise feature summary
+                features_extracted = []
+                if pulse_signal is not None:
+                    features_extracted.append("pulse")
+                if skin_color_variations is not None:
+                    features_extracted.append("skin")
+                if head_pose_features is not None:
+                    features_extracted.append("pose")
+                if eye_blink_features is not None:
+                    features_extracted.append("blink")
+                if frequency_features is not None:
+                    features_extracted.append("freq")
+                if facial_landmarks is not None and len(facial_landmarks) > 0:
+                    features_extracted.append("landmarks")
+                
+                # Concise one-line output (disabled to reduce spam)
+                # features_str = "+".join(features_extracted) if features_extracted else "basic"
+                # print(f"✅ Sample {actual_idx}: {features_str}")
+
+            result = {
+                'video_frames': video_frames,
+                'audio': audio_tensor,
+                'audio_spectrogram': audio_spectrogram,
+                'label': label,
+                'deepfake_type': deepfake_type_id,
+                'original_video_frames': original_video_frames,
+                'original_audio': original_audio_tensor,
+                'original_audio_visual_sync': original_audio_visual_sync if 'original_audio_visual_sync' in locals() else None,
+                'fake_periods': sample.get('fake_periods', []),
+                'timestamps': timestamps,
+                'transcript': sample.get('transcript', ''),
+                'fake_mask': fake_mask,
+                'face_embeddings': face_embeddings,
+                'temporal_consistency': temporal_consistency,
+                'metadata_features': metadata_features,
+                'ela_features': ela_features,
+                'audio_visual_sync': audio_visual_sync_features,
+                'file_path': video_path,  # For explainability and error analysis
+                'facial_landmarks': facial_landmarks,  # From FAKE video
+                'mfcc_features': mfcc_features,  # From FAKE audio
+                'voice_stress_features': voice_stress_features,  # NEW: Jitter/shimmer from FAKE audio
+                'pulse_signal': pulse_signal,  # From FAKE video
+                'skin_color_variations': skin_color_variations,  # From FAKE video
+                'head_pose': head_pose_features,  # From FAKE video
+                'eye_blink_features': eye_blink_features,  # From FAKE video
+                'frequency_features': frequency_features,  # From FAKE video
+                # ORIGINAL VIDEO FEATURES (for contrastive learning)
+                'original_facial_landmarks': original_facial_landmarks,
+                'original_mfcc_features': original_mfcc_features,
+                'original_voice_stress_features': original_voice_stress_features,  # NEW: From REAL audio
+                'original_pulse_signal': original_pulse_signal,
+                'original_skin_color_variations': original_skin_color_variations,
+                'original_head_pose': original_head_pose,
+                'original_eye_blink_features': original_eye_blink_features,
+                'original_frequency_features': original_frequency_features
+            }
+
+            # CRITICAL: Detach and make contiguous all tensors to prevent Windows access violations
+            # This ensures tensors don't share memory with internal buffers
+            for key, value in result.items():
+                if isinstance(value, torch.Tensor):
+                    result[key] = value.detach().clone().contiguous()
+            
+            return result
+
+        except Exception as e:
+            if self.logging:
+                print(f"❌ Error in __getitem__ for index {actual_idx}: {e}")
+                import traceback
+                traceback.print_exc()
+            # Return a placeholder sample instead of raising to avoid training crashes
+            return self._get_placeholder_sample()
+
+    def _get_deepfake_type_id(self, deepfake_type):
+        """Map deepfake type to an ID for fine-grained classification."""
+        deepfake_types = {
+            'unknown': 0,
+            'face_swap': 1,
+            'face_reenactment': 2,
+            'lip_sync': 3, 
+            'audio_only': 4,
+            'entire_synthesis': 5,
+            'attribute_manipulation': 6
+        }
+        return deepfake_types.get(deepfake_type, 0)
+        
+    def _get_placeholder_sample(self):
+        """Generate a placeholder sample when an error occurs."""
+        # Create a blank tensor with appropriate dimensions (reduced for memory efficiency)
+        video_frames = torch.zeros((self.max_frames, 3, 224, 224))
+        audio_tensor = torch.zeros(self.audio_length)
+        audio_spectrogram = torch.zeros((1, 64, 64))  # Reduced from 128x128
+        # Mark placeholder samples with a sentinel label -1 so training can filter them
+        label = torch.tensor(-1, dtype=torch.long)
+        facial_landmarks = torch.zeros((self.max_frames, 136))  # 68 landmarks with x,y coordinates
+        
+        # Additional placeholder features (reduced sizes)
+        mfcc_features = torch.zeros((20, 50))  # Reduced from (40, 100)
+        voice_stress_features = torch.zeros(6)  # NEW: jitter, shimmer, hnr + flags
+        pulse_signal = torch.zeros(self.max_frames)
+        skin_color_variations = torch.zeros((self.max_frames, 3))
+        head_pose_features = torch.zeros((self.max_frames, 3))  # pitch, yaw, roll
+        eye_blink_features = torch.zeros(self.max_frames)
+        frequency_features = torch.zeros((1, 16, 16))  # Reduced from (1, 32, 32)
+        
+        return {
+            'video_frames': video_frames,
+            'audio': audio_tensor,
+            'audio_spectrogram': audio_spectrogram,
+            'label': label,
+            'deepfake_type': 0,
+            'original_video_frames': None,  # Don't create dummy tensors - use None
+            'original_audio': None,  # Don't create dummy tensors - use None
+            'fake_periods': [],
+            'timestamps': [],
+            'transcript': '',
+            'fake_mask': torch.zeros(1),
+            'face_embeddings': torch.zeros((1, 256)),  # Reduced from 512
+            'temporal_consistency': torch.tensor(1.0),
+            'metadata_features': torch.zeros(10),
+            'ela_features': torch.zeros((112, 112)),  # Reduced from (224, 224)
+            'audio_visual_sync': torch.zeros(5),
+            'file_path': 'placeholder',
+            'facial_landmarks': facial_landmarks,
+            'mfcc_features': mfcc_features,
+            'voice_stress_features': voice_stress_features,  # NEW
+            'pulse_signal': pulse_signal,
+            'skin_color_variations': skin_color_variations,
+            'head_pose': head_pose_features,
+            'eye_blink_features': eye_blink_features,
+            # ORIGINAL VIDEO FEATURES (placeholder zeros)
+            'original_facial_landmarks': torch.zeros((self.max_frames, 136)),
+            'original_mfcc_features': torch.zeros((20, 50)),
+            'original_voice_stress_features': torch.zeros(6),  # NEW
+            'original_pulse_signal': torch.zeros(self.max_frames),
+            'original_skin_color_variations': torch.zeros((self.max_frames, 3)),
+            'original_head_pose': torch.zeros((self.max_frames, 3)),
+            'original_eye_blink_features': torch.zeros(self.max_frames),
+            'original_frequency_features': torch.zeros((1, 16, 16))
+        }
+
+    def _load_video(self, path):
+        if not path or not os.path.exists(path):
+            if self.logging:
+                warnings.warn(f"⚠️ Video file not found: {path}")
+            return None, None, None, None
+
+        cap = None
+        try:
+            cap = cv2.VideoCapture(path)
+            if not cap.isOpened():
+                if self.logging:
+                    warnings.warn(f"⚠️ Failed to open video: {path}")
+                return None, None, None, None
+
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            
+            # Only show detailed info every 100 samples
+            show_details = self.logging and (hasattr(self, '_sample_count') and self._sample_count % 100 == 0)
+            
+            if show_details:
+                print(f"📹 Loading video: {os.path.basename(path)}")
+                print(f"   📐 Dimensions: {width}x{height}, {total_frames} frames @ {fps:.1f} FPS")
+            
+            if total_frames <= 0:
+                if self.logging:
+                    warnings.warn(f"⚠️ Video has no frames: {path}")
+                return None, None, None, None
+                
+            # Create sampling indices for frames - more intelligent sampling strategy
+            if self.phase == 'train':
+                # Random sampling during training for data augmentation
+                if total_frames <= self.max_frames:
+                    frame_indices = list(range(total_frames))
+                    # Repeat frames if not enough
+                    if len(frame_indices) < self.max_frames:
+                        repeat_times = math.ceil(self.max_frames / max(len(frame_indices), 1))
+                        frame_indices = (frame_indices * repeat_times)[:self.max_frames]
+                else:
+                    # Random frame sampling during training
+                    frame_indices = sorted(random.sample(range(total_frames), min(self.max_frames, total_frames)))
+            else:
+                # Evenly distributed frames for validation/testing
+                frame_indices = np.linspace(0, total_frames - 1, self.max_frames, dtype=int)
+            
+            if show_details:
+                print(f"   🎯 Sampling {len(frame_indices)} frames: {frame_indices[:5]}{'...' if len(frame_indices) > 5 else ''}")
+                
+            video_frames = []
+            face_crops = []
+            all_landmarks = []
+            missed_frames = []
+            landmark_failure_frames = []
+            prev_face_locs = None
+
+            for i, frame_idx in enumerate(frame_indices):
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                ret, frame = cap.read()
+                if not ret:
+                    if self.logging:
+                        warnings.warn(f"⚠️ Failed to read frame {frame_idx} from {path}")
+                    continue
+                
+                # Validate frame before processing
+                if frame is None or frame.size == 0:
+                    if self.logging:
+                        warnings.warn(f"⚠️ Empty frame at index {frame_idx}")
+                    continue
+                
+                original_shape = frame.shape
+                
+                # Convert to RGB with error handling
+                try:
+                    # CRITICAL: Make a copy of the frame immediately after reading
+                    # OpenCV reuses internal buffers, which causes access violations later
+                    frame = np.array(frame, copy=True)
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    # Make another copy after color conversion to be safe
+                    frame_rgb = np.array(frame_rgb, copy=True)
+                    
+                    # Validate converted frame
+                    if frame_rgb is None or frame_rgb.size == 0 or len(frame_rgb.shape) != 3 or frame_rgb.shape[2] != 3:
+                        if self.logging:
+                            warnings.warn(f"⚠️ Invalid RGB conversion for frame {frame_idx}")
+                        continue
+                        
+                except Exception as e:
+                    if self.logging:
+                        warnings.warn(f"⚠️ Color conversion error for frame {frame_idx}: {e}")
+                    continue
+                
+                # Apply face detection if enabled and not too many errors
+                face_crop = None
+                face_detected = False
+                consistency_score = 1.0  # Default - perfect consistency
+                landmarks = []
+                
+                # Skip face detection if too many errors have occurred
+                if self.face_detection_error_count >= 50 and self.face_detection_error_count == 50:
+                    print("\n" + "="*70)
+                    print("⚠️  CRITICAL: FACE DETECTION DISABLED")
+                    print("="*70)
+                    print("Face detection failed 50 times and has been disabled permanently.")
+                    print("This will cause ALL facial features to be zeros!")
+                    print("Check if mediapipe/dlib is installed and working properly.")
+                    print("="*70 + "\n")
+                    self.face_detection_error_count += 1  # Prevent repeated warnings
+                
+                if self.detect_faces and self.face_detection_error_count < 50:
+                    try:
+                        # Skip face detection if frame has invalid dimensions or values
+                        if frame_rgb.shape[2] != 3 or np.isnan(frame_rgb).any() or frame_rgb.size == 0:
+                            raise ValueError("Invalid frame format - skipping face detection")
+                        
+                        # Convert to 8-bit RGB with robust error handling
+                        try:
+                            # Ensure frame is properly formatted before conversion
+                            if frame_rgb.dtype != np.uint8:
+                                # Check if values are in 0-1 range
+                                if frame_rgb.max() <= 1.0 and frame_rgb.min() >= 0.0:
+                                    frame_rgb_8bit = (frame_rgb * 255.0).astype(np.uint8)
+                                else:
+                                    # Values might be in 0-255 range but wrong dtype
+                                    frame_rgb_8bit = np.clip(frame_rgb, 0, 255).astype(np.uint8)
+                            else:
+                                frame_rgb_8bit = frame_rgb.copy()
+                            
+                            # Ensure values are in valid range and correct shape
+                            frame_rgb_8bit = np.clip(frame_rgb_8bit, 0, 255).astype(np.uint8)
+                            
+                            # Verify shape and data integrity
+                            if len(frame_rgb_8bit.shape) != 3 or frame_rgb_8bit.shape[2] != 3 or frame_rgb_8bit.size == 0:
+                                raise ValueError(f"Invalid image shape: {frame_rgb_8bit.shape}")
+                            
+                            # Additional validation - check for corrupted data
+                            if np.any(np.isnan(frame_rgb_8bit)) or np.any(np.isinf(frame_rgb_8bit)):
+                                raise ValueError("Frame contains NaN or inf values")
+                            
+                            # Ensure minimum size for face detection
+                            if frame_rgb_8bit.shape[0] < 20 or frame_rgb_8bit.shape[1] < 20:
+                                raise ValueError("Frame too small for face detection")
+                            
+                            # Convert to PIL with explicit mode and additional error handling
+                            pil_img = Image.fromarray(frame_rgb_8bit, mode='RGB')
+                            
+                            # Verify PIL image was created successfully
+                            if pil_img.size[0] == 0 or pil_img.size[1] == 0:
+                                raise ValueError("PIL image has zero dimensions")
+                                
+                        except Exception as conversion_error:
+                            raise ValueError(f"Frame conversion failed: {conversion_error}")
+                            
+                        
+                        # Detect faces using lazy-initialized detector
+                        detector = self._get_mtcnn()
+                        if detector is None:
+                            boxes, probs = None, None
+                            missed_frames.append(frame_idx)
+                        else:
+                            boxes, probs = detector.detect(pil_img)
+                            if boxes is None or len(boxes) == 0:
+                                missed_frames.append(frame_idx)
+                        
+                        if boxes is not None and len(boxes) > 0:
+                            # Take the face with highest probability
+                            box = boxes[0]
+                            face_detected = True
+                            
+                            # Check temporal consistency with previous frame
+                            if self.temporal_features and prev_face_locs is not None:
+                                # Calculate movement between consecutive frames
+                                movement = np.mean(np.abs(box - prev_face_locs))
+                                
+                                # Normalize by frame size and convert to a consistency score
+                                # Lower movement = higher consistency
+                                frame_diag = np.sqrt(frame.shape[0]**2 + frame.shape[1]**2)
+                                consistency_score = 1.0 - min(1.0, movement / (frame_diag * 0.1))
+                                
+                            prev_face_locs = box
+                            
+                            # Crop and resize face
+                            x1, y1, x2, y2 = box.astype(int)
+                            face_crop = frame_rgb[max(0, y1):min(frame.shape[0], y2), 
+                                               max(0, x1):min(frame.shape[1], x2)]
+                                               
+                            if face_crop.size != 0:
+                                face_crop = cv2.resize(face_crop, (224, 224))
+                                face_crops.append(face_crop)
+                                
+                            # Extract facial landmarks if enhanced preprocessing is enabled
+                            if self.enhanced_preprocessing and hasattr(self, 'landmark_predictor') and self.landmark_predictor is not None:
+                                try:
+                                    # Use MTCNN bounding box with dlib landmark predictor
+                                    # This is much more reliable than running dlib face detection again
+                                    dlib_frame = frame_rgb.copy()
+                                    
+                                    # Ensure frame is in proper format and range
+                                    if dlib_frame.dtype != np.uint8:
+                                        if dlib_frame.max() <= 1.0:
+                                            dlib_frame = (dlib_frame * 255).astype(np.uint8)
+                                        else:
+                                            dlib_frame = np.clip(dlib_frame, 0, 255).astype(np.uint8)
+                                    
+                                    # Ensure values are in valid range
+                                    dlib_frame = np.clip(dlib_frame, 0, 255).astype(np.uint8)
+                                    
+                                    # Convert RGB to grayscale for dlib
+                                    gray = cv2.cvtColor(dlib_frame, cv2.COLOR_RGB2GRAY)
+                                    
+                                    # Ensure gray image is 8-bit
+                                    gray = gray.astype(np.uint8)
+                                    
+                                    # Use MTCNN bounding box directly with dlib (FIX: don't re-detect faces!)
+                                    # Convert MTCNN box to dlib rectangle
+                                    mtcnn_x1, mtcnn_y1, mtcnn_x2, mtcnn_y2 = box.astype(int)
+                                    # Clamp to image bounds
+                                    mtcnn_x1 = max(0, mtcnn_x1)
+                                    mtcnn_y1 = max(0, mtcnn_y1)
+                                    mtcnn_x2 = min(gray.shape[1], mtcnn_x2)
+                                    mtcnn_y2 = min(gray.shape[0], mtcnn_y2)
+                                    
+                                    # Create dlib rectangle from MTCNN box
+                                    dlib_rect = dlib.rectangle(mtcnn_x1, mtcnn_y1, mtcnn_x2, mtcnn_y2)
+                                    
+                                    # Get facial landmarks using MTCNN's bounding box
+                                    shape = self.landmark_predictor(gray, dlib_rect)
+                                    
+                                    # Convert landmarks to list of (x, y) coordinates
+                                    # Normalize by frame dimensions to make landmarks resolution-invariant
+                                    landmarks = []
+                                    h, w = gray.shape[:2]
+                                    for i in range(68):
+                                        x = shape.part(i).x
+                                        y = shape.part(i).y
+                                        landmarks.extend([x / w, y / h])  # Flatten to [x1, y1, x2, y2, ...] normalized
+                                
+                                except Exception as e:
+                                    if self.logging and self.face_detection_error_count < self.max_face_detection_errors_to_print:
+                                        print(f"Face detection / landmark error on frame {frame_idx}: {e}")
+                                        self.face_detection_error_count += 1
+                                    elif self.face_detection_error_count == self.max_face_detection_errors_to_print:
+                                        print("Face detection error limit reached. Suppressing further error messages.")
+                                        self.face_detection_error_count += 1
+                                    else:
+                                        # Silent increment after limit reached
+                                        self.face_detection_error_count += 1
+                                    landmarks = []  # Reset landmarks on error
+                                    landmark_failure_frames.append(frame_idx)
+                                    
+                    except Exception as e:
+                        # Handle MTCNN face detection errors
+                        if self.logging and self.face_detection_error_count < self.max_face_detection_errors_to_print:
+                            print(f"Face detection error on frame {frame_idx}: {e}")
+                            self.face_detection_error_count += 1
+                        elif self.face_detection_error_count == self.max_face_detection_errors_to_print:
+                            print("Face detection error limit reached. Suppressing further error messages.")
+                            self.face_detection_error_count += 1
+                        else:
+                            # Silent increment after limit reached
+                            self.face_detection_error_count += 1
+                            
+                        # Disable face detection if too many consecutive errors
+                        if self.face_detection_error_count > 50:
+                            print("⚠️ Too many face detection errors. Disabling face detection for this video.")
+                            self.detect_faces = False
+                
+                # Fallback: Try dlib face detection if MTCNN failed but dlib is available
+                if not landmarks and self.enhanced_preprocessing and hasattr(self, 'dlib_detector') and self.dlib_detector is not None:
+                    try:
+                        dlib_frame = frame_rgb.copy()
+                        if dlib_frame.dtype != np.uint8:
+                            dlib_frame = np.clip(dlib_frame * 255 if dlib_frame.max() <= 1.0 else dlib_frame, 0, 255).astype(np.uint8)
+                        gray = cv2.cvtColor(dlib_frame, cv2.COLOR_RGB2GRAY).astype(np.uint8)
+                        
+                        # Try dlib face detection as fallback
+                        dlib_faces = self.dlib_detector(gray)
+                        if dlib_faces and hasattr(self, 'landmark_predictor') and self.landmark_predictor is not None:
+                            shape = self.landmark_predictor(gray, dlib_faces[0])
+                            landmarks = []
+                            # FIX: Normalize landmarks by frame dimensions (same as MTCNN primary path)
+                            h_fb, w_fb = gray.shape[:2]
+                            for i in range(68):
+                                landmarks.extend([shape.part(i).x / w_fb, shape.part(i).y / h_fb])
+                        else:
+                            # dlib detected no faces
+                            landmark_failure_frames.append(frame_idx)
+                    except:
+                        # Silent fallback failure, record frame index for inspection
+                        landmark_failure_frames.append(frame_idx)
+                        pass
+                
+                # Extract facial landmarks even if no face was detected (for consistency)
+                all_landmarks.append(landmarks if landmarks else [0] * 136)  # 68 landmarks * 2 coordinates
+                
+                # Ensure frame is in correct format for transforms (uint8, 0-255 range)
+                if frame_rgb.dtype != np.uint8:
+                    if frame_rgb.max() <= 1.0:
+                        frame_rgb = (frame_rgb * 255).astype(np.uint8)
+                    else:
+                        frame_rgb = np.clip(frame_rgb, 0, 255).astype(np.uint8)
+                
+                # Apply transformations
+                if self.transform:
+                    try:
+                        # CRITICAL: Make a copy to prevent OpenCV buffer reuse issues
+                        frame_rgb = np.array(frame_rgb, copy=True)
+                        
+                        # Check if using Albumentation transforms (require named arguments)
+                        if hasattr(self.transform, 'processors'):
+                            # Albumentation Compose object - use named argument
+                            # Frame must be uint8 for Albumentation
+                            transformed = self.transform(image=frame_rgb)
+                            frame_rgb = transformed['image']
+                        else:
+                            # PyTorch transforms - resize first
+                            frame_rgb = cv2.resize(frame_rgb, (224, 224))
+                            frame_rgb = self.transform(frame_rgb)
+                        
+                        # Ensure result is a tensor
+                        if not isinstance(frame_rgb, torch.Tensor):
+                            frame_rgb_copy = np.array(frame_rgb, copy=True) if isinstance(frame_rgb, np.ndarray) else frame_rgb
+                            frame_rgb = torch.tensor(frame_rgb_copy).float()
+                            
+                        # Ensure proper shape [C, H, W]
+                        if len(frame_rgb.shape) == 3 and frame_rgb.shape[0] not in [1, 3]:
+                            frame_rgb = frame_rgb.permute(2, 0, 1)
+                            
+                    except Exception as transform_error:
+                        if self.logging:
+                            warnings.warn(f"⚠️ Transform error on frame {frame_idx}: {transform_error}")
+                        # Fallback to manual conversion
+                        try:
+                            if frame_rgb.shape != (224, 224, 3):
+                                if self.logging:
+                                    warnings.warn(f"⚠️ Unexpected frame shape in fallback {frame_rgb.shape}, skipping frame {frame_idx}")
+                                continue
+                            # CRITICAL: Copy numpy array before tensor conversion
+                            frame_rgb_copy = np.array(frame_rgb, copy=True)
+                            frame_rgb = torch.tensor(frame_rgb_copy, dtype=torch.float32).permute(2, 0, 1) / 255.0
+                        except Exception as fallback_error:
+                            if self.logging:
+                                warnings.warn(f"⚠️ Fallback conversion failed on frame {frame_idx}: {fallback_error}")
+                            continue
+                else:
+                    # Manual conversion without transforms
+                    try:
+                        # Validate frame dimensions before permute
+                        if frame_rgb.shape != (224, 224, 3):
+                            if self.logging:
+                                warnings.warn(f"⚠️ Unexpected frame shape {frame_rgb.shape}, skipping frame {frame_idx}")
+                            continue
+                        
+                        # CRITICAL: Make a copy of the numpy array to prevent OpenCV buffer reuse issues
+                        # This prevents Windows access violations when cap.release() frees the buffer
+                        frame_rgb_copy = np.array(frame_rgb, copy=True)
+                        frame_rgb = torch.tensor(frame_rgb_copy, dtype=torch.float32)
+                        
+                        # Safe permute operation
+                        if len(frame_rgb.shape) == 3:
+                            frame_rgb = frame_rgb.permute(2, 0, 1) / 255.0
+                        else:
+                            if self.logging:
+                                warnings.warn(f"⚠️ Invalid frame shape for permute: {frame_rgb.shape}")
+                            continue
+                            
+                    except Exception as manual_error:
+                        if self.logging:
+                            warnings.warn(f"⚠️ Manual conversion error on frame {frame_idx}: {manual_error}")
+                        continue  # Skip this frame
+                
+                video_frames.append(frame_rgb)
+            cap.release()
+
+            if not video_frames:
+                if self.logging:
+                    warnings.warn(f"⚠️ No valid frames extracted from video: {path}")
+                return None, None, None, None
+
+            # Stack frames into a tensor - ensure we have the correct number of frames
+            if len(video_frames) < self.max_frames:
+                # Pad with last frame if not enough frames
+                while len(video_frames) < self.max_frames:
+                    video_frames.append(video_frames[-1].clone() if video_frames else torch.zeros(3, 224, 224))
+            elif len(video_frames) > self.max_frames:
+                # Truncate if too many frames
+                video_frames = video_frames[:self.max_frames]
+            
+            video_tensor = torch.stack(video_frames)
+            
+            # Process face crops if available
+            face_embeddings = None
+            if face_crops:
+                try:
+                    # Stack face crops with error handling for different tensor shapes
+                    face_crops_tensors = []
+                    for crop in face_crops:
+                        try:
+                            if len(crop.shape) == 3 and crop.shape[2] == 3:
+                                # Convert HWC to CHW format
+                                crop_tensor = torch.tensor(crop).permute(2, 0, 1).float() / 255.0
+                            elif len(crop.shape) == 3 and crop.shape[0] == 3:
+                                # Already in CHW format
+                                crop_tensor = torch.tensor(crop).float() / 255.0
+                            else:
+                                # Handle unexpected formats
+                                crop_tensor = torch.tensor(crop).float()
+                                if crop_tensor.max() > 1.0:
+                                    crop_tensor = crop_tensor / 255.0
+                                # Ensure it has 3 channels and proper shape
+                                if len(crop_tensor.shape) == 2:
+                                    crop_tensor = crop_tensor.unsqueeze(0).repeat(3, 1, 1)
+                                elif len(crop_tensor.shape) == 3 and crop_tensor.shape[0] == 1:
+                                    crop_tensor = crop_tensor.repeat(3, 1, 1)
+                                elif len(crop_tensor.shape) == 3 and crop_tensor.shape[0] != 3:
+                                    crop_tensor = crop_tensor.permute(2, 0, 1)
+                            
+                            face_crops_tensors.append(crop_tensor)
+                        except Exception as crop_error:
+                            if self.logging:
+                                warnings.warn(f"⚠️ Error processing face crop: {crop_error}")
+                            continue
+                    
+                    if face_crops_tensors:
+                        face_crops_tensor = torch.stack(face_crops_tensors)
+                        
+                        # Create simple face embeddings (in a real model, you would use a face recognition network here)
+                        # This is just a placeholder - in practice use a pre-trained face embedding network
+                        
+                        # Flatten each face crop to create embeddings
+                        batch_size, channels, height, width = face_crops_tensor.shape
+                        flattened_crops = face_crops_tensor.view(batch_size, -1)
+                        
+                        # Take mean across all face crops to get a single embedding per sample
+                        if batch_size > 1:
+                            # Average multiple face detections to get single embedding
+                            raw_embedding = torch.mean(flattened_crops, dim=0, keepdim=True)
+                        else:
+                            raw_embedding = flattened_crops
+                        
+                        # Ensure consistent dimensions: resize to fixed 256-dimensional embeddings
+                        embedding_dim = raw_embedding.size(1)
+                        if embedding_dim != 256:
+                            # Create a simple projection to 256 dimensions
+                            if embedding_dim > 256:
+                                # Simple downsampling by taking every nth element
+                                step = embedding_dim // 256
+                                face_embeddings = raw_embedding[:, ::step][:, :256]
+                            else:
+                                # Pad with zeros
+                                padding = torch.zeros(raw_embedding.size(0), 256 - embedding_dim)
+                                face_embeddings = torch.cat([raw_embedding, padding], dim=1)
+                        else:
+                            face_embeddings = raw_embedding
+                            
+                        # Ensure we always have exactly one embedding per sample
+                        if face_embeddings.size(0) != 1:
+                            face_embeddings = face_embeddings[0:1]  # Take only first
+                    else:
+                        face_embeddings = torch.zeros((1, 256))
+                except Exception as face_error:
+                    if self.logging:
+                        warnings.warn(f"⚠️ Error processing face embeddings: {face_error}")
+                    face_embeddings = torch.zeros((1, 256))
+            else:
+                # No faces detected, use zeros as placeholder
+                face_embeddings = torch.zeros((1, 256))  # Match placeholder size
+                
+            # Temporal consistency feature
+            temporal_consistency = torch.tensor(consistency_score).float()
+            
+            # Convert facial landmarks to tensor
+            facial_landmarks_tensor = torch.tensor(all_landmarks, dtype=torch.float32)
+
+            # Quick runtime check: if most or all landmark frames are zeros, log the video path and per-frame diagnostics
+            try:
+                if facial_landmarks_tensor.numel() > 0:
+                    zero_frame_mask = (facial_landmarks_tensor.abs().sum(dim=1) == 0)
+                    zero_count = int(zero_frame_mask.sum().item())
+                    total_count = int(facial_landmarks_tensor.shape[0])
+                    # If all frames are zero or very high fraction, write a compact failure record
+                    if total_count > 0 and zero_count / float(total_count) >= 0.8:
+                        sample_missed = missed_frames[:10]
+                        sample_landmark_failures = landmark_failure_frames[:10]
+                        msg = (f"[LANDMARKS] Mostly zeros for video={path} zero_frames={zero_count}/{total_count} "
+                               f"missed_frames_sample={sample_missed} landmark_failure_sample={sample_landmark_failures}\n")
+                        try:
+                            # Append to a local failure log for later inspection
+                            with open(os.path.join(os.getcwd(), 'landmark_failures.txt'), 'a', encoding='utf-8') as fh:
+                                fh.write(msg)
+                        except Exception:
+                            # Best-effort logging only; don't break data loading
+                            pass
+                        if self.logging:
+                            print(msg.strip())
+            except Exception:
+                # Don't let logging/analysis interfere with normal operation
+                pass
+
+            return video_tensor, face_embeddings, temporal_consistency, facial_landmarks_tensor
+
+        except Exception as e:
+            if self.logging:
+                warnings.warn(f"⚠️ Error loading video file: {path}. Error: {e}")
+            # Clean up VideoCapture if it was created
+            if cap is not None:
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+            return None, None, None, None
+
+    def _load_audio(self, path):
+        if not path or not os.path.exists(path):
+            if self.logging:
+                warnings.warn(f"⚠️ Audio file not found: {path}")
+            return None, None, None
+        try:
+            # Load audio with torchaudio and keep as tensor to avoid extra copies
+            audio, sample_rate = torchaudio.load(path)  # [channels, time]
+            audio = audio.squeeze(0)  # [time]
+            
+            # Resample to 16kHz if needed for consistent feature extraction
+            target_sr = 16000
+            if sample_rate != target_sr:
+                try:
+                    resampler = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=target_sr)
+                    audio = resampler(audio)
+                    sample_rate = target_sr
+                except Exception as resample_err:
+                    logger.warning(f"Resampling failed ({sample_rate} -> {target_sr}Hz): {resample_err}")
+
+            original_length = audio.size(0)
+            original_duration = original_length / sample_rate
+
+            # Process audio length (tensor ops)
+            if audio.size(0) > self.audio_length:
+                if self.phase == 'train':
+                    start = random.randint(0, audio.size(0) - self.audio_length)
+                    audio = audio[start:start + self.audio_length]
+                else:
+                    start = (audio.size(0) - self.audio_length) // 2
+                    audio = audio[start:start + self.audio_length]
+            else:
+                padding_needed = self.audio_length - audio.size(0)
+                if padding_needed > 0:
+                    audio = torch.nn.functional.pad(audio, (0, padding_needed))
+
+            # Apply audio augmentation if provided (audiomentations expects numpy)
+            if self.audio_transform and self.phase == 'train':
+                try:
+                    audio_np = audio.cpu().numpy()
+                    audio_np = self.audio_transform(samples=audio_np, sample_rate=sample_rate)
+                    audio = torch.tensor(audio_np, dtype=torch.float32)
+                except Exception as audio_transform_error:
+                    logger.warning(f"Audio transform error for file {path}: {audio_transform_error}")
+
+            # Compute mel spectrogram for additional audio features using torchaudio when possible
+            audio_spec = None
+            if self.compute_spectrograms:
+                try:
+                    mel_transform = torchaudio.transforms.MelSpectrogram(sample_rate=sample_rate, n_mels=64, n_fft=2048, hop_length=512)
+                    mel_spec = mel_transform(audio)  # [n_mels, time]
+                    # Convert to dB
+                    try:
+                        db_transform = torchaudio.transforms.AmplitudeToDB(stype='power')
+                        mel_db = db_transform(mel_spec)
+                    except Exception:
+                        mel_db = torchaudio.functional.amplitude_to_DB(mel_spec, multiplier=10.0, amin=1e-10, db_multiplier=0.0)
+
+                    # Resize to 64x64
+                    mel_db = mel_db.unsqueeze(0).unsqueeze(0)  # [1,1,n_mels,T]
+                    mel_db = F.interpolate(mel_db, size=(64, 64), mode='bilinear', align_corners=False).squeeze(0).squeeze(0)
+                    # Normalize
+                    mel_norm = (mel_db - mel_db.min()) / (mel_db.max() - mel_db.min() + 1e-8)
+                    audio_spec = mel_norm.unsqueeze(0)  # [1, 64, 64]
+                except Exception as e:
+                    logger.warning(f"Error computing spectrogram with torchaudio: {e}, falling back to librosa")
+                    try:
+                        audio_np = audio.cpu().numpy()
+                        mel_spec = librosa.feature.melspectrogram(y=audio_np, sr=sample_rate, n_mels=64, hop_length=512, n_fft=2048)
+                        mel_spec = librosa.power_to_db(mel_spec, ref=np.max)
+                        mel_spec = cv2.resize(mel_spec, (64, 64))
+                        mel_spec = (mel_spec - mel_spec.min()) / (mel_spec.max() - mel_spec.min() + 1e-8)
+                        audio_spec = torch.tensor(mel_spec, dtype=torch.float32).unsqueeze(0)  # [1, 64, 64]
+                    except Exception as e2:
+                        logger.warning(f"Fallback spectrogram error: {e2}")
+                        audio_spec = torch.zeros((1, 64, 64), dtype=torch.float32)
+            else:
+                audio_spec = torch.zeros((1, 64, 64), dtype=torch.float32)
+
+            # Extract MFCC features (prefer torchaudio)
+            mfcc_features = None
+            try:
+                mfcc_transform = torchaudio.transforms.MFCC(sample_rate=sample_rate, n_mfcc=20, melkwargs={'n_fft':2048, 'n_mels':64, 'hop_length':512})
+                mfccs = mfcc_transform(audio)  # [n_mfcc, time]
+                mfccs = (mfccs - mfccs.mean()) / (mfccs.std() + 1e-8)
+                # Resize to fixed time dimension (50) for consistent batching
+                if mfccs.shape[1] != 50:
+                    mfccs = F.interpolate(mfccs.unsqueeze(0), size=50, mode='linear', align_corners=False).squeeze(0)
+                mfcc_features = mfccs
+            except Exception as e:
+                logger.warning(f"Error computing MFCC with torchaudio: {e}, falling back to librosa")
+                try:
+                    audio_np = audio.cpu().numpy()
+                    mfccs = librosa.feature.mfcc(y=audio_np, sr=sample_rate, n_mfcc=20, hop_length=512, n_fft=2048)
+                    mfccs = (mfccs - np.mean(mfccs)) / (np.std(mfccs) + 1e-8)
+                    mfcc_features = torch.tensor(mfccs, dtype=torch.float32)
+                    # Resize to fixed time dimension (50) for consistent batching
+                    if mfcc_features.shape[1] != 50:
+                        mfcc_features = F.interpolate(mfcc_features.unsqueeze(0), size=50, mode='linear', align_corners=False).squeeze(0)
+                except Exception as e2:
+                    logger.warning(f"Fallback MFCC error: {e2}")
+                    mfcc_features = torch.zeros((20, 50), dtype=torch.float32)
+
+            return audio.to(dtype=torch.float32), audio_spec, mfcc_features
+            
+        except Exception as e:
+            if self.logging:
+                warnings.warn(f"⚠️ Error loading audio file: {path}. Error: {e}")
+            return None, None, None
+
+    def _load_audio_minimal(self, path):
+        """Fallback audio loader using librosa for robustness."""
+        try:
+            import librosa as _librosa
+            y, sr = _librosa.load(path, sr=None, mono=True)
+            y = y.astype('float32')
+            tensor = torch.tensor(y, dtype=torch.float32)
+            # pad/trim to audio_length
+            if tensor.size(0) > self.audio_length:
+                start = 0 if self.phase != 'train' else random.randint(0, tensor.size(0) - self.audio_length)
+                tensor = tensor[start:start + self.audio_length]
+            else:
+                pad = self.audio_length - tensor.size(0)
+                if pad > 0:
+                    tensor = torch.nn.functional.pad(tensor, (0, pad))
+            # minimal spectrogram placeholder
+            spect = torch.zeros((64, 64), dtype=torch.float32)
+            mfcc = torch.zeros((20, 50), dtype=torch.float32)
+            return tensor, spect, mfcc
+        except Exception as e:
+            if self.logging:
+                warnings.warn(f"Fallback audio loader failed for {path}: {e}")
+            return None, None, None
+
+    def _load_video_minimal(self, path):
+        """Fallback video loader that reads frames without heavy processing or face detection."""
+        if not path or not os.path.exists(path):
+            if self.logging:
+                warnings.warn(f"Fallback: video file not found: {path}")
+            return None, None, None, None
+        cap = None
+        try:
+            cap = cv2.VideoCapture(path)
+            if not cap.isOpened():
+                if self.logging:
+                    warnings.warn(f"Fallback: failed to open video: {path}")
+                return None, None, None, None
+
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            if total_frames <= 0:
+                cap.release()
+                return None, None, None, None
+
+            # Evenly sample frames
+            indices = np.linspace(0, total_frames - 1, self.max_frames, dtype=int)
+            frames = []
+            for fi in indices:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, int(fi))
+                ret, fr = cap.read()
+                if not ret or fr is None:
+                    # insert zeros frame
+                    fr = np.zeros((224, 224, 3), dtype=np.uint8)
+                try:
+                    fr_rgb = cv2.cvtColor(fr, cv2.COLOR_BGR2RGB)
+                except Exception:
+                    fr_rgb = np.zeros((224, 224, 3), dtype=np.uint8)
+                fr_rgb = cv2.resize(fr_rgb, (224, 224))
+                t = torch.tensor(fr_rgb, dtype=torch.float32).permute(2, 0, 1) / 255.0
+                frames.append(t)
+            cap.release()
+            video_tensor = torch.stack(frames)
+            # Minimal placeholders for face features
+            face_embeddings = torch.zeros((1, 256))
+            temporal_consistency = torch.tensor(1.0)
+            facial_landmarks = torch.zeros((self.max_frames, 136), dtype=torch.float32)
+            return video_tensor, face_embeddings, temporal_consistency, facial_landmarks
+        except Exception as e:
+            if self.logging:
+                warnings.warn(f"Fallback video loader error for {path}: {e}")
+            # Clean up VideoCapture if it was created
+            if cap is not None:
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+            return None, None, None, None
+            
+    def _extract_metadata_features(self, video_path):
+        """Extract metadata features like compression artifacts."""
+        try:
+            # Get video metadata using OpenCV
+            cap = cv2.VideoCapture(video_path)
+            
+            # Extract basic metadata
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            
+            # Get file size in MB
+            file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
+            
+            # Calculate bitrate estimate
+            duration = frame_count / fps if fps > 0 else 0
+            bitrate = file_size_mb * 8 / duration if duration > 0 else 0
+            
+            # Extract noise level from first few frames
+            noise_level = 0
+            frames_to_check = min(10, frame_count)
+            frame_diffs = []
+            
+            ret, prev_frame = cap.read()
+            if ret:
+                prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
+                
+                for _ in range(frames_to_check - 1):
+                    ret, curr_frame = cap.read()
+                    if not ret:
+                        break
+                        
+                    curr_gray = cv2.cvtColor(curr_frame, cv2.COLOR_BGR2GRAY)
+                    diff = cv2.absdiff(prev_gray, curr_gray)
+                    noise_level += np.mean(diff)
+                    frame_diffs.append(np.mean(diff))
+                    prev_gray = curr_gray
+                    
+                noise_level /= max(1, len(frame_diffs))
+                noise_std = np.std(frame_diffs) if frame_diffs else 0
+            
+            cap.release()
+            
+            # Check for quantization artifacts
+            quantization_metric = bitrate / (width * height) if width and height else 0
+            
+            # Compile features into tensor
+            metadata_features = torch.tensor([
+                fps / 30.0,  # Normalize fps
+                min(1.0, file_size_mb / 10.0),  # Normalized file size
+                min(1.0, bitrate / 5000.0),  # Normalized bitrate
+                noise_level / 10.0,  # Normalized noise level
+                noise_std / 10.0,  # Normalized noise std
+                min(1.0, quantization_metric * 10),  # Normalized quantization
+                width / 1920.0,  # Normalized width
+                height / 1080.0,  # Normalized height
+                min(1.0, (width * height) / (1920 * 1080)),  # Normalized resolution
+                1.0 if file_size_mb < 0.5 else 0.0  # Small file flag (potential compression sign)
+            ], dtype=torch.float32)
+            
+            return metadata_features
+            
+        except Exception as e:
+            if self.logging:
+                warnings.warn(f"⚠️ Error extracting metadata features: {e}")
+            return torch.zeros(10, dtype=torch.float32)
+    
+    def _extract_ela_features(self, video_frames):
+        """Extract Error Level Analysis features for the first frame."""
+        try:
+            if video_frames is None or len(video_frames) == 0:
+                return torch.zeros((112, 112), dtype=torch.float32)
+                
+            # Use first frame for ELA
+            first_frame = video_frames[0]
+            
+            # Ensure frame has correct dimensions for permute
+            if len(first_frame.shape) == 3 and first_frame.shape[0] == 3:
+                first_frame = first_frame.permute(1, 2, 0).cpu().numpy()
+            else:
+                # Handle unexpected frame shapes - convert to expected format
+                first_frame = first_frame.cpu().numpy()
+                if len(first_frame.shape) == 2:
+                    # Grayscale frame, convert to RGB
+                    first_frame = np.stack([first_frame, first_frame, first_frame], axis=2)
+                elif len(first_frame.shape) == 3 and first_frame.shape[2] == 3:
+                    # Already in HWC format
+                    pass
+                else:
+                    # Unexpected format, return zeros
+                    return torch.zeros((112, 112), dtype=torch.float32)
+            
+            # Convert to uint8
+            first_frame = (first_frame * 255).astype(np.uint8)
+            
+            # Convert to PIL Image
+            img = Image.fromarray(first_frame)
+            
+            # Save with a specific quality
+            quality = 90
+            import uuid
+            import time
+            # Save ELA image in-memory to avoid disk I/O
+            buf = io.BytesIO()
+            img.save(buf, format='JPEG', quality=quality)
+            buf.seek(0)
+            saved_img = np.array(Image.open(buf))
+            
+            # Calculate absolute difference
+            ela = np.abs(first_frame.astype(np.float32) - saved_img.astype(np.float32))
+            
+            # Use grayscale ELA 
+            ela_gray = np.mean(ela, axis=2)
+            
+            # Resize to 112x112 (reduced from 224x224 for memory efficiency)
+            ela_resized = cv2.resize(ela_gray, (112, 112))
+            
+            # Normalize
+            ela_normalized = ela_resized / ela_resized.max() if ela_resized.max() > 0 else ela_resized
+            
+            # In-memory approach uses no temp files to clean up
+
+            return torch.tensor(ela_normalized, dtype=torch.float32)
+            
+        except Exception as e:
+            if self.logging:
+                warnings.warn(f"⚠️ Error extracting ELA features: {e}")
+            return torch.zeros((112, 112), dtype=torch.float32)
+    
+    def _extract_av_sync_features(self, video_frames, audio_tensor):
+        """Extract features for audio-visual synchronization analysis."""
+        try:
+            # Calculate visual temporal features
+            if video_frames.shape[0] < 2:
+                return torch.zeros(5, dtype=torch.float32)
+                
+            # Calculate frame differences to detect motion
+            frame_diffs = torch.mean(torch.abs(video_frames[1:] - video_frames[:-1]), dim=[1, 2, 3])
+            
+            # Calculate audio energy
+            audio_chunks = audio_tensor.unfold(0, self.audio_length // self.max_frames, 
+                                            self.audio_length // self.max_frames)
+            audio_energy = torch.mean(audio_chunks**2, dim=1)
+            
+            # Ensure same lengths
+            min_length = min(frame_diffs.shape[0], audio_energy.shape[0])
+            frame_diffs = frame_diffs[:min_length]
+            audio_energy = audio_energy[:min_length]
+            
+            # Calculate correlation
+            if min_length > 1:
+                # Normalize
+                frame_diffs = (frame_diffs - frame_diffs.mean()) / (frame_diffs.std() + 1e-8)
+                audio_energy = (audio_energy - audio_energy.mean()) / (audio_energy.std() + 1e-8)
+                
+                # Correlation
+                correlation = torch.mean(frame_diffs * audio_energy)
+                
+                # Calculate lag by trying different offsets
+                max_lag = min(5, min_length-1)
+                best_lag = 0
+                best_corr = correlation
+                
+                for lag in range(1, max_lag+1):
+                    # Positive lag
+                    corr_pos = torch.mean(frame_diffs[lag:] * audio_energy[:-lag]) if min_length > lag else torch.tensor(0.)
+                    # Negative lag
+                    corr_neg = torch.mean(frame_diffs[:-lag] * audio_energy[lag:]) if min_length > lag else torch.tensor(0.)
+                    
+                    if corr_pos > best_corr:
+                        best_corr = corr_pos
+                        best_lag = lag
+                    if corr_neg > best_corr:
+                        best_corr = corr_neg
+                        best_lag = -lag
+                
+                # Features
+                sync_features = torch.tensor([
+                    correlation,  # Base correlation
+                    float(best_lag),  # Best lag
+                    best_corr,  # Best correlation
+                    torch.std(frame_diffs),  # Motion consistency
+                    torch.std(audio_energy)  # Audio consistency
+                ], dtype=torch.float32)
+                
+                return sync_features
+            else:
+                return torch.zeros(5, dtype=torch.float32)
+                
+        except Exception as e:
+            if self.logging:
+                warnings.warn(f"⚠️ Error extracting A/V sync features: {e}")
+            return torch.zeros(5, dtype=torch.float32)
+    
+    # NEW METHODS FOR ENHANCED FEATURES
+    
+    def _extract_pulse_signal(self, video_frames):
+        """Extract subtle color variations to detect pulse signal (rPPG)."""
+        try:
+            if video_frames is None or len(video_frames) < 2:
+                return torch.zeros(self.max_frames, dtype=torch.float32)
+            
+            # Extract green channel from frames (most sensitive to blood flow changes)
+            green_values = []
+            
+            for i in range(len(video_frames)):
+                frame = video_frames[i]
+                
+                # Ensure frame has correct dimensions for permute
+                if len(frame.shape) == 3 and frame.shape[0] == 3:
+                    frame = frame.permute(1, 2, 0).cpu().numpy()
+                elif len(frame.shape) == 3 and frame.shape[2] == 3:
+                    frame = frame.cpu().numpy()
+                else:
+                    green_values.append(0.5)
+                    continue
+                
+                frame_ycrcb = cv2.cvtColor((frame * 255).astype(np.uint8), cv2.COLOR_RGB2YCrCb)
+                y, cr, cb = cv2.split(frame_ycrcb)
+                skin_mask = (cr > 135) & (cr < 180) & (cb > 85) & (cb < 135)
+                if np.any(skin_mask):
+                    green_mean = np.mean(frame[:, :, 1][skin_mask])
+                else:
+                    green_mean = np.mean(frame[:, :, 1])
+                
+                green_values.append(green_mean)
+            
+            # Convert to numpy array
+            signal = np.array(green_values)
+            
+            # Simple signal processing: bandpass filter for heart rate range (0.7-4Hz, approx 40-240 BPM)
+            if len(signal) > 30:  # Need enough points for filtering (increased minimum)
+                try:
+                    # Estimated frame rate: assume 30fps for simplicity
+                    fps = 30
+                    
+                    # Design bandpass filter
+                    nyquist = fps / 2
+                    low = 0.7 / nyquist
+                    high = 4.0 / nyquist
+                    b, a = scipy.signal.butter(3, [low, high], btype='band')
+                    
+                    # Apply filter with padlen adjustment
+                    padlen = min(len(signal) // 4, 10)  # Adaptive padlen
+                    filtered_signal = scipy.signal.filtfilt(b, a, signal, padlen=padlen)
+                    
+                    # Normalize
+                    filtered_signal = (filtered_signal - np.mean(filtered_signal)) / (np.std(filtered_signal) + 1e-8)
+                except Exception as filter_error:
+                    if self.logging:
+                        warnings.warn(f"⚠️ Filtering failed, using raw signal: {filter_error}")
+                    filtered_signal = signal
+            else:
+                # Not enough signal points for filtering, use raw signal
+                filtered_signal = signal
+            
+            # Ensure correct length
+            if len(filtered_signal) < self.max_frames:
+                filtered_signal = np.pad(filtered_signal, 
+                                        (0, self.max_frames - len(filtered_signal)), 
+                                        mode='constant')
+            else:
+                filtered_signal = filtered_signal[:self.max_frames]
+            
+            return torch.tensor(filtered_signal, dtype=torch.float32)
+            
+        except Exception as e:
+            if self.logging:
+                warnings.warn(f"⚠️ Error extracting pulse signal: {e}")
+            # Return None so model can use fallback/skip this feature
+            return None
+    
+    def _extract_skin_color_variations(self, video_frames):
+        """Extract skin color variations over time to detect blood flow patterns."""
+        try:
+            if video_frames is None or len(video_frames) < 2:
+                return torch.zeros((self.max_frames, 3), dtype=torch.float32)
+            
+            # Extract average skin color (RGB) from each frame
+            skin_colors = []
+            
+            for i in range(len(video_frames)):
+                frame = video_frames[i]
+                
+                # Ensure frame has correct dimensions for permute
+                if len(frame.shape) == 3 and frame.shape[0] == 3:
+                    frame = frame.permute(1, 2, 0).cpu().numpy()
+                elif len(frame.shape) == 3 and frame.shape[2] == 3:
+                    # Already in HWC format
+                    frame = frame.cpu().numpy()
+                else:
+                    skin_colors.append([0.5, 0.5, 0.5])
+                    continue
+                
+                frame_ycrcb = cv2.cvtColor((frame * 255).astype(np.uint8), cv2.COLOR_RGB2YCrCb)
+                y, cr, cb = cv2.split(frame_ycrcb)
+                skin_mask = (cr > 135) & (cr < 180) & (cb > 85) & (cb < 135)
+                if np.any(skin_mask):
+                    r_mean = np.mean(frame[:, :, 0][skin_mask])
+                    g_mean = np.mean(frame[:, :, 1][skin_mask])
+                    b_mean = np.mean(frame[:, :, 2][skin_mask])
+                else:
+                    r_mean = np.mean(frame[:, :, 0])
+                    g_mean = np.mean(frame[:, :, 1])
+                    b_mean = np.mean(frame[:, :, 2])
+                
+                skin_colors.append([r_mean, g_mean, b_mean])
+            
+            # Convert to numpy array
+            skin_colors = np.array(skin_colors)
+            
+            # Ensure correct length
+            if len(skin_colors) < self.max_frames:
+                skin_colors = np.pad(skin_colors, 
+                                    ((0, self.max_frames - len(skin_colors)), (0, 0)), 
+                                    mode='constant')
+            else:
+                skin_colors = skin_colors[:self.max_frames]
+            
+            return torch.tensor(skin_colors, dtype=torch.float32)
+            
+        except Exception as e:
+            if self.logging:
+                warnings.warn(f"⚠️ Error extracting skin color variations: {e}")
+            # Return None so model can use fallback/skip this feature
+            return None
+    
+    def _estimate_head_pose(self, facial_landmarks):
+        """Estimate head pose (pitch, yaw, roll) from facial landmarks."""
+        try:
+            if facial_landmarks is None or facial_landmarks.size(0) == 0:
+                return torch.zeros((self.max_frames, 3), dtype=torch.float32)
+            
+            # Simple head pose estimation from 2D landmarks
+            # This is a very simplified approach - more sophisticated methods exist
+            
+            # Get number of frames
+            num_frames = facial_landmarks.size(0)
+            
+            # Placeholder for head pose estimates
+            head_poses = []
+            
+            # Debug: Count how many frames actually produce non-zero values
+            non_zero_frames = 0
+            
+            for i in range(num_frames):
+                landmarks = facial_landmarks[i]
+                
+                # Check if landmarks are valid (non-zero and reasonable values)
+                landmarks_sum = torch.sum(torch.abs(landmarks)).item()
+                if landmarks_sum < 1e-6:
+                    head_poses.append([0, 0, 0])  # Default pose for failed detection
+                    continue
+                
+                # Additional validation: check if landmarks are in reasonable pixel range
+                if torch.max(torch.abs(landmarks)).item() > 5000:
+                    # Landmarks are corrupted (too large values)
+                    head_poses.append([0, 0, 0])
+                    continue
+                
+                # Extract key landmarks for pose estimation
+                # These indices are based on the 68-point facial landmark model
+                # Left eye center
+                left_eye_x = (landmarks[2*36] + landmarks[2*39]) / 2
+                left_eye_y = (landmarks[2*36+1] + landmarks[2*39+1]) / 2
+                
+                # Right eye center
+                right_eye_x = (landmarks[2*42] + landmarks[2*45]) / 2
+                right_eye_y = (landmarks[2*42+1] + landmarks[2*45+1]) / 2
+                
+                # Nose tip
+                nose_x = landmarks[2*30]
+                nose_y = landmarks[2*30+1]
+                
+                # Mouth center
+                mouth_x = (landmarks[2*48] + landmarks[2*54]) / 2
+                mouth_y = (landmarks[2*48+1] + landmarks[2*54+1]) / 2
+                
+                # Calculate simplified pose estimates
+                # Yaw: horizontal head rotation (left-right) - eye separation distance
+                eye_diff_x = left_eye_x - right_eye_x
+                yaw_raw = eye_diff_x.item()
+                
+                # Pitch: vertical head rotation (up-down) - vertical alignment of features
+                eyes_center_y = (left_eye_y + right_eye_y) / 2
+                pitch_raw = (eyes_center_y - nose_y).item()
+                
+                # Roll: tilting of the head - vertical eye alignment
+                eye_diff_y = left_eye_y - right_eye_y
+                roll_raw = eye_diff_y.item()
+                
+                # Normalize based on typical facial landmark pixel distances
+                # Typical eye separation in images: 30-100 pixels
+                # Normalize to [-1, 1] range using typical distances
+                yaw = np.clip(yaw_raw / 50.0, -2.0, 2.0)  # Eye separation: ~50px nominal
+                pitch = np.clip(pitch_raw / 40.0, -2.0, 2.0)  # Vertical distances: ~40px nominal
+                roll = np.clip(roll_raw / 15.0, -2.0, 2.0)  # Roll typically smaller: ~15px nominal
+                
+                # Ensure we have non-zero values (if all are very close to zero, something's wrong)
+                if abs(yaw) < 0.01 and abs(pitch) < 0.01 and abs(roll) < 0.01:
+                    # This might indicate normalized/rescaled landmarks - use raw values with different scaling
+                    yaw = np.clip(yaw_raw / 5.0, -2.0, 2.0)
+                    pitch = np.clip(pitch_raw / 5.0, -2.0, 2.0)
+                    roll = np.clip(roll_raw / 2.0, -2.0, 2.0)
+                
+                head_poses.append([pitch, yaw, roll])
+                
+                # Count non-zero frames for debugging
+                if abs(pitch) > 0.01 or abs(yaw) > 0.01 or abs(roll) > 0.01:
+                    non_zero_frames += 1
+            
+            # Convert to tensor
+            head_poses = np.array(head_poses)
+            
+            # If all frames produced zero head pose, return None so model can use fallback
+            if non_zero_frames == 0 and num_frames > 0:
+                if self.logging:
+                    warnings.warn(f"⚠️ Head pose extraction produced all zeros for {num_frames} frames - returning None for fallback")
+                # Return None so the model can use its fallback estimator
+                return None
+            
+            # Ensure correct length
+            if len(head_poses) < self.max_frames:
+                head_poses = np.pad(head_poses, 
+                                    ((0, self.max_frames - len(head_poses)), (0, 0)), 
+                                    mode='constant')
+            else:
+                head_poses = head_poses[:self.max_frames]
+            
+            return torch.tensor(head_poses, dtype=torch.float32)
+            
+        except Exception as e:
+            if self.logging:
+                warnings.warn(f"⚠️ Error estimating head pose: {e}")
+            # Return None so model can use fallback estimator
+            return None
+    
+    def _extract_eye_blink_patterns(self, video_frames, facial_landmarks):
+        """Extract eye blinking patterns from facial landmarks or direct frame analysis."""
+        try:
+            if video_frames is None or len(video_frames) < 2:
+                return torch.zeros(self.max_frames, dtype=torch.float32)
+            
+            num_frames = len(video_frames)
+            blink_scores = []
+            
+            if facial_landmarks is not None and facial_landmarks.size(0) > 0:
+                # Extract eye aspect ratio from landmarks
+                for i in range(min(num_frames, facial_landmarks.size(0))):
+                    landmarks = facial_landmarks[i]
+                    
+                    # Check if landmarks are valid
+                    if torch.sum(landmarks) < 1e-6:
+                        blink_scores.append(0.5)  # Default value (undefined)
+                        continue
+                    
+                    try:
+                        # Extract eye landmarks (68-point model)
+                        # Left eye: points 36-41, Right eye: points 42-47
+                        left_eye_pts = []
+                        right_eye_pts = []
+                        
+                        # Left eye landmarks - ensure indices are valid
+                        for j in range(36, 42):
+                            x_idx = j * 2
+                            y_idx = j * 2 + 1
+                            if x_idx < len(landmarks) and y_idx < len(landmarks):
+                                left_eye_pts.append([landmarks[x_idx], landmarks[y_idx]])
+                        
+                        # Right eye landmarks - ensure indices are valid
+                        for j in range(42, 48):
+                            x_idx = j * 2
+                            y_idx = j * 2 + 1
+                            if x_idx < len(landmarks) and y_idx < len(landmarks):
+                                right_eye_pts.append([landmarks[x_idx], landmarks[y_idx]])
+                        
+                        # Calculate eye aspect ratio if we have enough points
+                        if len(left_eye_pts) >= 6 and len(right_eye_pts) >= 6:
+                            def eye_aspect_ratio(eye):
+                                # Ensure we have valid points
+                                if len(eye) < 6:
+                                    return torch.tensor(0.3)  # Default EAR value
+                                
+                                try:
+                                    # Compute vertical distances
+                                    v1 = torch.sqrt((eye[1][0] - eye[5][0])**2 + (eye[1][1] - eye[5][1])**2)
+                                    v2 = torch.sqrt((eye[2][0] - eye[4][0])**2 + (eye[2][1] - eye[4][1])**2)
+                                    
+                                    # Compute horizontal distance
+                                    h = torch.sqrt((eye[0][0] - eye[3][0])**2 + (eye[0][1] - eye[3][1])**2)
+                                    
+                                    # Return ratio
+                                    return (v1 + v2) / (2.0 * h + 1e-6)
+                                except Exception:
+                                    return torch.tensor(0.3)  # Default EAR value
+                            
+                            left_ear = eye_aspect_ratio(left_eye_pts)
+                            right_ear = eye_aspect_ratio(right_eye_pts)
+                            
+                            # Average EAR
+                            ear = (left_ear + right_ear) / 2.0
+                            
+                            # Convert to blink score (lower EAR = more closed eyes)
+                            # Typical threshold for blink detection is around 0.2
+                            blink_score = 1.0 - min(1.0, max(0.0, ear * 3))  # Scale and invert
+                            blink_scores.append(float(blink_score) if isinstance(blink_score, torch.Tensor) else blink_score)
+                        else:
+                            blink_scores.append(0.5)  # Default value if not enough landmarks
+                            
+                    except Exception as landmark_error:
+                        blink_scores.append(0.5)  # Default value on error
+            else:
+                # Fallback to simpler detection directly from frames
+                for i in range(num_frames):
+                    try:
+                        frame = video_frames[i]
+                        # Ensure frame has correct dimensions for permute
+                        if len(frame.shape) == 3 and frame.shape[0] == 3:
+                            frame = frame.permute(1, 2, 0).cpu().numpy()
+                        else:
+                            # Handle unexpected frame shapes
+                            blink_scores.append(0.5)  # Default value
+                            continue
+                        
+                        # Very basic eye detection and scoring (placeholder)
+                        # In a real implementation, this would be more sophisticated
+                        blink_scores.append(0.5)  # Default (undefined)
+                    except Exception as frame_error:
+                        blink_scores.append(0.5)  # Default value on error
+            
+            # Ensure correct length
+            if len(blink_scores) < self.max_frames:
+                blink_scores = np.pad(blink_scores, (0, self.max_frames - len(blink_scores)), mode='constant')
+            else:
+                blink_scores = blink_scores[:self.max_frames]
+            
+            return torch.tensor(blink_scores, dtype=torch.float32)
+            
+        except Exception as e:
+            if self.logging:
+                warnings.warn(f"⚠️ Error extracting eye blink patterns: {e}")
+            # Return None so model can use fallback/skip this feature
+            return None
+    
+    def _extract_voice_stress(self, audio_waveform):
+        """
+        Extract voice stress features: jitter, shimmer, and HNR.
+        
+        Args:
+            audio_waveform: Audio tensor [samples]
+            
+        Returns:
+            Voice stress feature tensor [6]: [jitter, shimmer, hnr, jitter_flag, shimmer_flag, hnr_flag]
+        """
+        try:
+            import numpy as np
+            
+            if audio_waveform is None or audio_waveform.numel() == 0:
+                return torch.zeros(6, dtype=torch.float32)
+            
+            audio_np = audio_waveform.cpu().numpy()
+            sample_rate = 16000  # Default sample rate
+            
+            # Compute jitter (cycle-to-cycle pitch variations)
+            def compute_jitter(audio, sr):
+                try:
+                    frame_length = 2048
+                    hop_length = 512
+                    pitches = []
+                    
+                    for i in range(0, len(audio) - frame_length, hop_length):
+                        frame = audio[i:i+frame_length]
+                        autocorr = np.correlate(frame, frame, mode='full')
+                        autocorr = autocorr[len(autocorr)//2:]
+                        
+                        if len(autocorr) > 1 and autocorr[0] != 0:
+                            autocorr = autocorr / autocorr[0]
+                            min_lag = int(sr / 500)
+                            max_lag = int(sr / 50)
+                            
+                            if max_lag < len(autocorr):
+                                search_range = autocorr[min_lag:max_lag]
+                                if len(search_range) > 0:
+                                    peak_idx = np.argmax(search_range) + min_lag
+                                    pitch = sr / peak_idx if peak_idx > 0 else 0
+                                    pitches.append(pitch)
+                    
+                    if len(pitches) < 2:
+                        return 0.0
+                    
+                    periods = [1.0/p if p > 0 else 0 for p in pitches]
+                    periods = [p for p in periods if p > 0]
+                    
+                    if len(periods) < 2:
+                        return 0.0
+                    
+                    period_diffs = np.abs(np.diff(periods))
+                    avg_period = np.mean(periods)
+                    jitter = np.mean(period_diffs) / avg_period if avg_period > 0 else 0.0
+                    
+                    return float(jitter * 100.0)
+                except:
+                    return 0.0
+            
+            # Compute shimmer (amplitude variations)
+            def compute_shimmer(audio, sr):
+                try:
+                    frame_length = 2048
+                    hop_length = 512
+                    amplitudes = []
+                    
+                    for i in range(0, len(audio) - frame_length, hop_length):
+                        frame = audio[i:i+frame_length]
+                        rms = np.sqrt(np.mean(frame**2))
+                        amplitudes.append(rms)
+                    
+                    if len(amplitudes) < 2:
+                        return 0.0
+                    
+                    amplitudes = np.array(amplitudes)
+                    amplitude_diffs = np.abs(np.diff(amplitudes))
+                    avg_amplitude = np.mean(amplitudes)
+                    shimmer = np.mean(amplitude_diffs) / avg_amplitude if avg_amplitude > 0 else 0.0
+                    
+                    return float(shimmer * 100.0)
+                except:
+                    return 0.0
+            
+            # Compute HNR (Harmonic-to-Noise Ratio)
+            def compute_hnr(audio, sr):
+                try:
+                    frame_length = 2048
+                    hop_length = 512
+                    hnr_values = []
+                    
+                    for i in range(0, len(audio) - frame_length, hop_length):
+                        frame = audio[i:i+frame_length]
+                        autocorr = np.correlate(frame, frame, mode='full')
+                        autocorr = autocorr[len(autocorr)//2:]
+                        
+                        if len(autocorr) > 1 and autocorr[0] > 0:
+                            min_lag = int(sr / 500)
+                            max_lag = int(sr / 50)
+                            
+                            if max_lag < len(autocorr):
+                                search_range = autocorr[min_lag:max_lag]
+                                if len(search_range) > 0:
+                                    max_autocorr = np.max(search_range)
+                                    noise = autocorr[0] - max_autocorr
+                                    if noise > 0:
+                                        hnr = 10 * np.log10(max_autocorr / noise)
+                                        hnr_values.append(hnr)
+                    
+                    if len(hnr_values) == 0:
+                        return 0.0
+                    
+                    return float(np.mean(hnr_values))
+                except:
+                    return 0.0
+            
+            # Extract features
+            jitter = compute_jitter(audio_np, sample_rate)
+            shimmer = compute_shimmer(audio_np, sample_rate)
+            hnr = compute_hnr(audio_np, sample_rate)
+            
+            # Abnormality flags
+            jitter_flag = 1.0 if jitter > 1.0 else 0.0
+            shimmer_flag = 1.0 if shimmer > 3.0 else 0.0
+            hnr_flag = 1.0 if hnr < 10.0 else 0.0
+            
+            features = torch.tensor([jitter, shimmer, hnr, jitter_flag, shimmer_flag, hnr_flag], dtype=torch.float32)
+            return features
+            
+        except Exception as e:
+            if self.logging:
+                warnings.warn(f"⚠️ Error extracting voice stress features: {e}")
+            return torch.zeros(6, dtype=torch.float32)
+    
+    def _extract_frequency_features(self, video_frames):
+        """Extract frequency domain features to detect artifacts from generative models.
+        
+        Averages FFT magnitude spectra over multiple frames to capture temporal
+        frequency inconsistencies that are hallmarks of deepfake generation.
+        """
+        try:
+            if video_frames is None or len(video_frames) == 0:
+                return torch.zeros((1, 16, 16), dtype=torch.float32)
+            
+            # Sample up to 8 evenly-spaced frames for frequency analysis
+            num_frames = len(video_frames)
+            if num_frames <= 8:
+                sample_indices = list(range(num_frames))
+            else:
+                sample_indices = [int(i * num_frames / 8) for i in range(8)]
+            
+            magnitude_accum = None
+            count = 0
+            
+            for idx in sample_indices:
+                frame = video_frames[idx].cpu()
+                
+                # Convert to grayscale if it's RGB
+                if frame.shape[0] == 3:
+                    gray_frame = 0.299 * frame[0] + 0.587 * frame[1] + 0.114 * frame[2]
+                else:
+                    gray_frame = frame[0]
+                
+                # Apply 2D FFT
+                freq_domain = torch.fft.fft2(gray_frame)
+                freq_domain_shifted = torch.fft.fftshift(freq_domain)
+                magnitude = torch.log(torch.abs(freq_domain_shifted) + 1e-10)
+                
+                if magnitude_accum is None:
+                    magnitude_accum = magnitude
+                else:
+                    magnitude_accum = magnitude_accum + magnitude
+                count += 1
+            
+            # Average over all sampled frames
+            magnitude_spectrum = magnitude_accum / count
+            
+            # Resize to fixed dimensions for consistent processing
+            magnitude_spectrum = F.interpolate(
+                magnitude_spectrum.unsqueeze(0).unsqueeze(0),
+                size=(16, 16),
+                mode='bilinear',
+                align_corners=False
+            ).squeeze(0)  # Remove batch dim, keep channel dim
+            
+            # Normalize
+            magnitude_spectrum = (magnitude_spectrum - magnitude_spectrum.min()) / (magnitude_spectrum.max() - magnitude_spectrum.min() + 1e-8)
+            
+            return magnitude_spectrum
+            
+        except Exception as e:
+            if self.logging:
+                warnings.warn(f"⚠️ Error extracting frequency features: {e}")
+            return torch.zeros((1, 16, 16), dtype=torch.float32)
+
+
+def get_transforms(phase='train'):
+    """Get appropriate transforms for the dataset phase."""
+    if phase == 'train':
+        # Training transforms with augmentation
+        video_transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.RandomResizedCrop(224, scale=(0.8, 1.0)),
+            transforms.RandomHorizontalFlip(),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+            transforms.RandomRotation(10),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+        
+        audio_transform = Compose([
+            AddGaussianNoise(min_amplitude=0.001, max_amplitude=0.015, p=0.5),
+            PitchShift(min_semitones=-4, max_semitones=4, p=0.5),
+            Shift(min_shift=-0.5, max_shift=0.5, p=0.5),
+        ])
+    else:
+        # Validation/test transforms
+        video_transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Resize((224, 224)),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+        
+        audio_transform = None
+        
+    return video_transform, audio_transform
+
+
+def get_transforms_enhanced(phase='train'):
+    """Enhanced transforms with more diverse augmentations from improved_augmentation.py."""
+    try:
+        # Try to use the advanced augmentation techniques from improved_augmentation.py
+        if phase == 'train':
+            # Use our advanced video transforms with temporal consistency
+            video_transform = get_advanced_video_transforms(train=True)
+            
+            # Use our advanced audio transforms 
+            audio_transform = get_advanced_audio_transforms(train=True)
+            
+            # Add temporal consistency augmenter if available
+            if 'TemporalConsistencyAugmenter' in globals():
+                print("✅ Using Temporal Consistency Augmenter")
+                # This will be applied at the batch level in the training loop
+        else:
+            # Validation/test transforms - use standard transforms for consistency
+            video_transform = get_advanced_video_transforms(train=False)
+            audio_transform = get_advanced_audio_transforms(train=False)
+            
+    except (NameError, ImportError) as e:
+        # Fallback to standard enhanced transforms if advanced ones aren't available
+        print(f"⚠️ Falling back to standard enhanced transforms: {e}")
+        if phase == 'train':
+            # Advanced training transforms with augmentation
+            video_transform = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.RandomResizedCrop(224, scale=(0.8, 1.0)),
+                transforms.RandomHorizontalFlip(),
+                transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+                transforms.RandomRotation(15),
+                transforms.RandomAffine(degrees=0, translate=(0.1, 0.1), scale=(0.9, 1.1)),
+                transforms.RandomPerspective(distortion_scale=0.2, p=0.5),
+                transforms.RandomErasing(p=0.2, scale=(0.02, 0.15), ratio=(0.3, 3.3)),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ])
+            
+            audio_transform = Compose([
+                AddGaussianNoise(min_amplitude=0.001, max_amplitude=0.02, p=0.6),
+                PitchShift(min_semitones=-4, max_semitones=4, p=0.6),
+                TimeStretch(min_rate=0.8, max_rate=1.2, p=0.5),
+                Shift(min_shift=-0.5, max_shift=0.5, p=0.5),
+            ])
+        else:
+            # Validation/test transforms (same as before for consistency)
+            video_transform = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Resize((224, 224)),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ])
+            
+            audio_transform = None
+        
+    return video_transform, audio_transform
+
+
+def get_data_loaders(
+    json_path, data_dir, batch_size=4, validation_split=0.2, test_split=0.1,
+    shuffle=True, num_workers=2, max_samples=None, detect_faces=True,
+    compute_spectrograms=True, temporal_features=True, enhanced_preprocessing=True,
+    enhanced_augmentation=False, multiprocessing_context=None, 
+    use_mixup=True, mixup_alpha=0.2, cutmix_prob=0.3, class_weights_mode='balanced',
+    oversample_minority=False, oversample_factor=1.0,
+    label_assignment_fn=None, max_frames=None
+):
+    """
+    Load data loaders with an option to restrict the maximum number of samples.
+    
+    Parameters:
+        json_path (str): Path to the dataset metadata JSON file.
+        data_dir (str): Directory containing video and audio files.
+        batch_size (int): Batch size for the data loaders.
+        validation_split (float): Fraction of the dataset to use for validation.
+        test_split (float): Fraction of the dataset to use for testing.
+        shuffle (bool): Whether to shuffle the dataset.
+        num_workers (int): Number of worker threads for loading data.
+        max_samples (int, optional): Maximum number of samples to load from the dataset.
+        detect_faces (bool): Whether to detect and extract facial features.
+        compute_spectrograms (bool): Whether to compute audio spectrograms.
+        temporal_features (bool): Whether to compute temporal consistency features.
+        enhanced_preprocessing (bool): Whether to enable enhanced preprocessing features.
+        enhanced_augmentation (bool): Whether to use enhanced data augmentation techniques.
+        multiprocessing_context (str, optional): Multiprocessing context method ('spawn', 'fork', etc.) for safety.
+        use_mixup (bool): Whether to enable MixUp data augmentation (when enhanced_augmentation is True).
+        mixup_alpha (float): Alpha parameter for MixUp augmentation.
+        cutmix_prob (float): Probability of applying CutMix instead of MixUp.
+    
+    Returns:
+        tuple: Training, validation, and test data loaders, plus class weights and optionally a mixup function.
+    """
+    # Store if we're using MixUp
+    using_mixup = enhanced_augmentation and use_mixup
+   
+    mixup_fn = None
+    
+    # Get transforms for training and validation
+    if enhanced_augmentation:
+        train_video_transform, train_audio_transform = get_transforms_enhanced('train')
+        val_video_transform, val_audio_transform = get_transforms_enhanced('val')
+        
+        # Set up MixUp/CutMix if we're using advanced augmentations
+        if using_mixup:
+            try:
+                # Create MixUp augmentation function from improved_augmentation.py
+                mixup_fn = mix_up_augmentation
+                print("✅ Using MixUp/CutMix augmentation from improved_augmentation.py")
+            except (NameError, AttributeError) as e:
+                print(f"⚠️ MixUp augmentation not available: {e}")
+                using_mixup = False
+    else:
+        train_video_transform, train_audio_transform = get_transforms('train')
+        val_video_transform, val_audio_transform = get_transforms('val')
+    
+    # Create training dataset
+    train_dataset = MultiModalDeepfakeDataset(
+        json_path=json_path,
+        data_dir=data_dir,
+        transform=train_video_transform,
+        audio_transform=train_audio_transform,
+        logging=True,  # Enable logging for debugging
+        phase='train',
+        detect_faces=detect_faces,
+        compute_spectrograms=compute_spectrograms,
+        temporal_features=temporal_features,
+        enhanced_preprocessing=enhanced_preprocessing,
+        max_frames=(max_frames if max_frames is not None else DEFAULT_MAX_FRAMES),
+        label_assignment_fn=label_assignment_fn,
+        load_originals_always=False  # Disable paired training to prevent overfitting
+    )
+    # Set class_weights_mode after initialization and recalculate weights
+    train_dataset.class_weights_mode = class_weights_mode
+    train_dataset.class_weights = train_dataset._calculate_class_weights()
+    
+    # Create validation dataset
+    val_dataset = MultiModalDeepfakeDataset(
+        json_path=json_path,
+        data_dir=data_dir,
+        transform=val_video_transform,
+        audio_transform=val_audio_transform,
+        logging=True,  # Enable logging for debugging
+        phase='val',
+        detect_faces=detect_faces,
+        compute_spectrograms=compute_spectrograms,
+        temporal_features=temporal_features,
+        enhanced_preprocessing=enhanced_preprocessing,
+        max_frames=(max_frames if max_frames is not None else DEFAULT_MAX_FRAMES),
+        load_originals_always=False  # Disable paired training to prevent overfitting
+    )
+    # Set class_weights_mode after initialization and recalculate weights
+    val_dataset.class_weights_mode = class_weights_mode
+    val_dataset.class_weights = val_dataset._calculate_class_weights()
+    
+    # Create test dataset
+    test_dataset = MultiModalDeepfakeDataset(
+        json_path=json_path,
+        data_dir=data_dir,
+        transform=val_video_transform,
+        audio_transform=val_audio_transform,
+        logging=True,
+        phase='test',
+        detect_faces=detect_faces,
+        compute_spectrograms=compute_spectrograms,
+        temporal_features=temporal_features,
+        enhanced_preprocessing=enhanced_preprocessing,
+        max_frames=(max_frames if max_frames is not None else DEFAULT_MAX_FRAMES),
+        load_originals_always=False  # Disable paired training to prevent overfitting
+    )
+    # Set class_weights_mode after initialization and recalculate weights
+    test_dataset.class_weights_mode = class_weights_mode
+    test_dataset.class_weights = test_dataset._calculate_class_weights()
+    
+    # ── Each dataset is already filtered by its metadata ``split`` field ──
+    # No random splitting needed; use all valid indices from each dataset.
+    num_train = len(train_dataset)
+    num_val = len(val_dataset)
+    num_test = len(test_dataset)
+    
+    if num_train == 0:
+        raise ValueError("No valid training samples found in the dataset!")
+    
+    # Restrict training set if max_samples is specified
+    train_indices = list(range(num_train))
+    if max_samples is not None and max_samples < num_train:
+        if shuffle:
+            np.random.seed(42)
+            np.random.shuffle(train_indices)
+        train_indices = train_indices[:max_samples]
+    elif shuffle:
+        np.random.seed(42)
+        np.random.shuffle(train_indices)
+    
+    val_indices = list(range(num_val))
+    test_indices = list(range(num_test))
+
+    # Create samplers
+    train_sampler = SubsetRandomSampler(train_indices)
+    val_sampler = SubsetRandomSampler(val_indices)
+    test_sampler = SubsetRandomSampler(test_indices)
+    
+    # Get class weights for weighted sampling
+    class_weights = train_dataset.class_weights
+
+    # Safety: prevent extremely large class weight ratios which destabilize training
+    try:
+        if isinstance(class_weights, torch.Tensor) and class_weights.numel() == 2:
+            w0 = float(class_weights[0].item())
+            w1 = float(class_weights[1].item())
+            if w1 == 0:
+                ratio = float('inf')
+            else:
+                ratio = max(w0 / w1, w1 / w0)
+            if ratio > 3.0:
+                # If the user explicitly requested extreme manual weights, respect that choice
+                if hasattr(train_dataset, 'class_weights_mode') and train_dataset.class_weights_mode == 'manual_extreme':
+                    print(f"[DATA LOADER] manual_extreme requested; keeping extreme computed weights (ratio={ratio:.2f}).")
+                else:
+                    print(f"[DATA LOADER] Warning: computed class weight ratio {ratio:.2f} is large. Overriding to safer weights [2.0, 1.0].")
+                    class_weights = torch.tensor([2.0, 1.0], dtype=torch.float32)
+    except Exception:
+        # If anything goes wrong, keep the computed weights
+        pass
+
+    # Handle multiprocessing context for safety
+    mp_context = None
+    if num_workers > 0 and multiprocessing_context:
+        import multiprocessing as mp
+        try:
+            mp_context = mp.get_context(multiprocessing_context)
+        except Exception as e:
+            print(f"⚠️ Warning: Could not set multiprocessing context '{multiprocessing_context}': {e}")
+            mp_context = None
+
+    # Create data loaders
+    # If oversample_minority is requested, create a Subset dataset for the train indices
+    # and use a WeightedRandomSampler to oversample the minority class (Real=0 by default)
+    if oversample_minority:
+        # Build subset dataset
+        subset_train_dataset = Subset(train_dataset, train_indices)
+
+        # Compute labels for the subset and class counts
+        labels_subset = []
+        for i in range(len(train_indices)):
+            actual_idx = train_dataset.valid_indices[train_indices[i]]
+            sample = train_dataset.data[actual_idx]
+            if label_assignment_fn is not None:
+                lbl = label_assignment_fn(sample)
+            else:
+                lbl = 1 if sample.get('n_fakes', 0) > 0 else 0
+            labels_subset.append(lbl)
+
+        # Count classes on the subset
+        from collections import Counter
+        c = Counter(labels_subset)
+        class_count_0 = c.get(0, 0)
+        class_count_1 = c.get(1, 0)
+        total_subset = len(labels_subset)
+
+        # Avoid division by zero
+        class_count_0 = max(1, class_count_0)
+        class_count_1 = max(1, class_count_1)
+
+        # Inverse frequency weighting (so minority has higher weight)
+        weight_per_class = {0: total_subset / class_count_0, 1: total_subset / class_count_1}
+        sample_weights = [weight_per_class[lbl] for lbl in labels_subset]
+
+        # Allow increasing the effective oversample size via oversample_factor
+        try:
+            oversample_factor = float(oversample_factor)
+        except Exception:
+            oversample_factor = 1.0
+
+        num_samples_to_draw = max(1, int(len(sample_weights) * max(1.0, oversample_factor)))
+        sampler = WeightedRandomSampler(weights=sample_weights, num_samples=num_samples_to_draw, replacement=True)
+
+        train_loader_kwargs = {
+            'dataset': subset_train_dataset,
+            'batch_size': batch_size,
+            'sampler': sampler,
+            'num_workers': num_workers,
+            'pin_memory': False,
+            'drop_last': True,
+            'collate_fn': collate_fn,
+            'persistent_workers': False,
+        }
+        print(f"[DATA LOADER] Oversampling enabled: subset size={len(subset_train_dataset)}, class_counts={dict(c)}")
+    else:
+        train_loader_kwargs = {
+            'dataset': train_dataset,
+            'batch_size': batch_size,
+            'sampler': train_sampler,
+            'num_workers': num_workers,
+            'pin_memory': False,  # Disabled for Windows compatibility (causes "invalid device pointer" crash)
+            'drop_last': True,  # Prevent BatchNorm crash when last batch has only 1 sample
+            'collate_fn': collate_fn,
+            'persistent_workers': False,  # Disabled for Windows compatibility (num_workers > 0 can cause hangs)
+        }
+    if mp_context is not None:
+        train_loader_kwargs['multiprocessing_context'] = mp_context
+    # Attach worker init fn to safely create per-worker detector instances
+    if train_loader_kwargs.get('num_workers', 0) > 0:
+        train_loader_kwargs['worker_init_fn'] = worker_init_fn
+
+    train_loader = DataLoader(**train_loader_kwargs)
+    
+    val_loader_kwargs = {
+        'dataset': val_dataset,
+        'batch_size': batch_size,
+        'sampler': val_sampler,
+        'num_workers': num_workers,
+        'pin_memory': False,  # Disabled for Windows compatibility (causes "invalid device pointer" crash)
+        'drop_last': False,
+        'collate_fn': collate_fn,
+        'persistent_workers': False,  # Disabled for Windows compatibility (num_workers > 0 can cause hangs)
+    }
+    if mp_context is not None:
+        val_loader_kwargs['multiprocessing_context'] = mp_context
+    if val_loader_kwargs.get('num_workers', 0) > 0:
+        val_loader_kwargs['worker_init_fn'] = worker_init_fn
+
+    val_loader = DataLoader(**val_loader_kwargs)
+    
+    test_loader_kwargs = {
+        'dataset': test_dataset,
+        'batch_size': batch_size,
+        'sampler': test_sampler,
+        'num_workers': num_workers,
+        'pin_memory': False,  # Disabled for Windows compatibility (causes "invalid device pointer" crash)
+        'drop_last': False,
+        'collate_fn': collate_fn,
+        'persistent_workers': False,  # Disabled for Windows compatibility (num_workers > 0 can cause hangs)
+    }
+    if mp_context is not None:
+        test_loader_kwargs['multiprocessing_context'] = mp_context
+    if test_loader_kwargs.get('num_workers', 0) > 0:
+        test_loader_kwargs['worker_init_fn'] = worker_init_fn
+
+    test_loader = DataLoader(**test_loader_kwargs)
+
+    print(f"✅ Dataset loaded with {len(train_indices)} training, {len(val_indices)} validation, and {len(test_indices)} test samples.")
+    # --- Sanity checks for labels / dataset leakage ---
+    try:
+        # Build label list for entire training set (using provided label_assignment_fn if present)
+        full_labels = []
+        filename_label_map = {}
+        source_data = getattr(train_dataset, 'data', None)
+        valid_idx_map = getattr(train_dataset, 'valid_indices', None)
+        if source_data is not None and valid_idx_map is not None:
+            for i in range(len(valid_idx_map)):
+                actual_idx = valid_idx_map[i]
+                sample = source_data[actual_idx]
+                if label_assignment_fn is not None:
+                    lbl = int(label_assignment_fn(sample))
+                else:
+                    lbl = 1 if sample.get('n_fakes', 0) > 0 else 0
+                full_labels.append(lbl)
+                # Track filename conflicts
+                fname = sample.get('file', sample.get('video', sample.get('path', None)))
+                if fname is not None:
+                    if fname in filename_label_map and filename_label_map[fname] != lbl:
+                        print(f"[DATA CHECK] Warning: conflicting labels for file {fname}: {filename_label_map[fname]} vs {lbl}")
+                    else:
+                        filename_label_map[fname] = lbl
+
+        # Count classes and warn if imbalance or single-class
+        if len(full_labels) > 0:
+            from collections import Counter
+            c_all = Counter(full_labels)
+            total = sum(c_all.values())
+            print(f"[DATA CHECK] Label distribution (train dataset): {dict(c_all)}")
+            # If only single class present, raise an error to prevent silent training collapse
+            if len(c_all.keys()) < 2:
+                raise ValueError(f"Dataset label check failed: only one class present in training data: {dict(c_all)}")
+            # Warn if extreme imbalance
+            min_count = min(c_all.values())
+            max_count = max(c_all.values())
+            if max_count / max(1, min_count) > 20:
+                print(f"[DATA CHECK] Warning: extreme class imbalance detected ({max_count}:{min_count}). Consider stronger rebalancing or dataset fixes.")
+    except Exception as e:
+        print(f"[DATA CHECK] Error during dataset sanity checks: {e}")
+
+    # Return mixup function if using enhanced augmentation
+    if enhanced_augmentation and 'mixup_fn' in locals() and mixup_fn is not None:
+        return train_loader, val_loader, test_loader, class_weights, mixup_fn
+    else:
+        return train_loader, val_loader, test_loader, class_weights
+
+
+def worker_init_fn(worker_id):
+    """Initialize heavy per-worker resources (dlib, MTCNN, etc.) safely inside worker.
+
+    This function uses torch.utils.data.get_worker_info() to access the dataset
+    instance for this worker and attach per-worker detector objects to it. This
+    avoids pickling non-pickleable objects when DataLoader spawns subprocesses.
+    """
+    try:
+        from torch.utils.data import get_worker_info
+        worker_info = get_worker_info()
+        if worker_info is None:
+            return
+        dataset = worker_info.dataset
+        # If DataLoader was given a Subset, unwrap to get the original dataset
+        try:
+            # torch.utils.data.Subset exposes the underlying dataset via .dataset
+            if hasattr(dataset, 'dataset'):
+                dataset = dataset.dataset
+        except Exception:
+            pass
+        # If the dataset class provides its own worker init, prefer that
+        if hasattr(dataset, 'worker_init_fn') and callable(getattr(dataset, 'worker_init_fn')):
+            try:
+                dataset.worker_init_fn(worker_id)
+            except Exception:
+                # Fall through to the generic init below if dataset method fails
+                pass
+        # Re-fetch worker_info.dataset in case underlying reference changed
+        # (not strictly necessary, but keeps behavior explicit)
+        # Only initialize once per worker/dataset
+        if getattr(dataset, '_worker_inited', False):
+            return
+        # Initialize MTCNN face detector lazily if requested
+        if getattr(dataset, 'detect_faces', False):
+            try:
+                from facenet_pytorch import MTCNN
+                dataset.face_detector = MTCNN(image_size=224, margin=40, min_face_size=20)
+                dataset._mtcnn_inited = True
+            except Exception:
+                dataset.face_detector = None
+                dataset._mtcnn_inited = False
+        # Initialize dlib detector and landmark predictor if enhanced_preprocessing requested
+        if getattr(dataset, 'enhanced_preprocessing', False):
+            try:
+                dataset.dlib_detector = dlib.get_frontal_face_detector()
+                if os.path.exists(dataset.landmark_predictor_path):
+                    dataset.landmark_predictor = dlib.shape_predictor(dataset.landmark_predictor_path)
+                else:
+                    dataset.landmark_predictor = None
+            except Exception:
+                dataset.dlib_detector = None
+                dataset.landmark_predictor = None
+        dataset._worker_inited = True
+    except Exception:
+        # Don't fail the worker init on error; dataset will operate without detectors
+        return
+
+
+def collate_fn(batch):
+    """
+    Custom collate function that handles variable-sized data and ensures consistent batch dimensions.
+    
+    NOTE: This function runs in the main process on Windows (num_workers=0).
+    Avoid complex tensor operations that can cause access violations under memory pressure.
+    """
+    import gc
+
+    result = {}
+
+    # Safety: handle empty batch
+    if not batch:
+        return result
+
+    # Filter out None items from batch
+    batch = [item for item in batch if item is not None]
+    if not batch:
+        return result
+
+    # Periodic garbage collection to prevent Windows access violations
+    gc.collect()
+
+    # CRITICAL: Safe tensor cloning function to prevent Windows access violations
+    # Uses multiple fallback methods to ensure memory isolation
+    def safe_clone_tensor(t):
+        if t is None:
+            return None
+
+        try:
+            if isinstance(t, torch.Tensor):
+                if getattr(t, 'is_cuda', False):
+                    # Move to CPU, clone, then move back to original device
+                    cpu_copy = t.detach().cpu().clone()
+                    return cpu_copy.to(t.dtype).to(t.device)
+                else:
+                    return t.detach().clone()
+
+            # If it's a numpy array-like, convert safely
+            try:
+                import numpy as _np
+                if isinstance(t, (_np.ndarray, list, tuple)):
+                    arr = _np.array(t, copy=True)
+                    return torch.from_numpy(arr)
+            except Exception:
+                pass
+
+        except Exception:
+            # Fallbacks: try numpy roundtrip, then zeros_like
+            try:
+                if getattr(t, 'is_cuda', False):
+                    np_arr = t.detach().cpu().numpy().copy()
+                else:
+                    np_arr = t.detach().numpy().copy()
+                tensor_copy = torch.from_numpy(np_arr).to(t.dtype)
+                if getattr(t, 'is_cuda', False):
+                    return tensor_copy.to(t.device)
+                return tensor_copy
+            except Exception:
+                try:
+                    return torch.zeros_like(t)
+                except Exception:
+                    return t
+    
+    # Process all possible keys that might be in batch
+    all_keys = set()
+    for item in batch:
+        if item is not None:
+            all_keys.update(item.keys())
+    
+    # Get the actual batch size
+    actual_batch_size = len(batch)
+    
+    for key in all_keys:
+        values = [item.get(key) for item in batch]
+        valid_values = []
+        valid_indices = []
+        for i, v in enumerate(values):
+            if v is not None:
+                valid_values.append(v)
+                valid_indices.append(i)
+        if key in ['video_frames', 'audio', 'audio_spectrogram', 'facial_landmarks', 'mfcc_features', 'pulse_signal', 'skin_color_variations', 'head_pose', 'eye_blink_features', 'frequency_features',
+                   'original_facial_landmarks', 'original_mfcc_features', 'original_pulse_signal', 'original_skin_color_variations', 'original_head_pose', 'original_eye_blink_features', 'original_frequency_features',
+                   'voice_stress_features', 'original_voice_stress_features']:
+            try:
+                if valid_values and all(isinstance(v, torch.Tensor) for v in valid_values):
+                    # Use safe_clone_tensor defined at top of collate_fn - with protection
+                    try:
+                        valid_values = [safe_clone_tensor(v) for v in valid_values]
+                    except Exception:
+                        # If cloning fails, fallback to best-effort copies without GPU sync
+                        valid_values = [safe_clone_tensor(v) for v in valid_values]
+                    
+                    if len(valid_values) == actual_batch_size:
+                        ref_shape = valid_values[0].shape
+                        if all(v.shape == ref_shape for v in valid_values):
+                            result[key] = torch.stack(valid_values)
+                        else:
+                            max_shape = list(ref_shape)
+                            for v in valid_values[1:]:
+                                for j in range(len(v.shape)):
+                                    max_shape[j] = max(max_shape[j], v.shape[j])
+                            padded_tensors = []
+                            for v in valid_values:
+                                if list(v.shape) == max_shape:
+                                    padded_tensors.append(safe_clone_tensor(v))
+                                else:
+                                    pad_spec = []
+                                    for j in range(len(v.shape)):
+                                        pad_amount = max_shape[j] - v.shape[j]
+                                        pad_spec = [0, pad_amount] + pad_spec
+                                    padded = torch.nn.functional.pad(v, pad_spec)
+                                    padded_tensors.append(safe_clone_tensor(padded))
+                            result[key] = torch.stack(padded_tensors)
+                    else:
+                        ref_shape = valid_values[0].shape
+                        full_batch_tensor = torch.zeros(actual_batch_size, *ref_shape, dtype=valid_values[0].dtype)
+                        for i, valid_idx in enumerate(valid_indices):
+                            if valid_idx < actual_batch_size:
+                                full_batch_tensor[valid_idx] = safe_clone_tensor(valid_values[i])
+                        result[key] = full_batch_tensor
+                else:
+                    if key == 'video_frames':
+                        result[key] = torch.zeros(actual_batch_size, DEFAULT_MAX_FRAMES, 3, 224, 224)
+                    elif key == 'audio':
+                        result[key] = torch.zeros(actual_batch_size, 8000)
+                    elif key == 'audio_spectrogram':
+                        result[key] = torch.zeros(actual_batch_size, 1, 64, 64)
+                    elif key == 'facial_landmarks' or key == 'original_facial_landmarks':
+                        result[key] = torch.zeros(actual_batch_size, DEFAULT_MAX_FRAMES, 136)
+                    elif key == 'mfcc_features' or key == 'original_mfcc_features':
+                        result[key] = torch.zeros(actual_batch_size, 20, 50)
+                    elif key == 'pulse_signal' or key == 'original_pulse_signal':
+                        result[key] = torch.zeros(actual_batch_size, DEFAULT_MAX_FRAMES)
+                    elif key == 'skin_color_variations' or key == 'original_skin_color_variations':
+                        result[key] = torch.zeros(actual_batch_size, DEFAULT_MAX_FRAMES, 3)
+                    elif key == 'head_pose' or key == 'original_head_pose':
+                        result[key] = torch.zeros(actual_batch_size, DEFAULT_MAX_FRAMES, 3)
+                    elif key == 'eye_blink_features' or key == 'original_eye_blink_features':
+                        result[key] = torch.zeros(actual_batch_size, DEFAULT_MAX_FRAMES)
+                    elif key == 'frequency_features' or key == 'original_frequency_features':
+                        result[key] = torch.zeros(actual_batch_size, 1, 16, 16)
+                    elif key == 'voice_stress_features' or key == 'original_voice_stress_features':
+                        result[key] = torch.zeros(actual_batch_size, 6)
+                    else:
+                        result[key] = None
+                # NOTE: Removed zero-tensor warning check that caused Windows access violation crashes
+                # after long training sessions. The check was:
+                #   zero_count = (result[key] == 0).all(dim=tuple(range(1, result[key].ndim))).sum().item()
+                # This triggered segfaults in PyTorch tensor operations under memory pressure.
+            except Exception as e:
+                print(f"[ERROR] Failed to collate {key}: {e}")
+                if key == 'video_frames':
+                    result[key] = torch.zeros(actual_batch_size, DEFAULT_MAX_FRAMES, 3, 224, 224)
+                elif key == 'audio':
+                    result[key] = torch.zeros(actual_batch_size, 8000)
+                elif key == 'audio_spectrogram':
+                    result[key] = torch.zeros(actual_batch_size, 1, 64, 64)
+                elif key == 'facial_landmarks' or key == 'original_facial_landmarks':
+                    result[key] = torch.zeros(actual_batch_size, DEFAULT_MAX_FRAMES, 136)
+                elif key == 'mfcc_features' or key == 'original_mfcc_features':
+                    result[key] = torch.zeros(actual_batch_size, 20, 50)
+                elif key == 'pulse_signal' or key == 'original_pulse_signal':
+                    result[key] = torch.zeros(actual_batch_size, DEFAULT_MAX_FRAMES)
+                elif key == 'skin_color_variations' or key == 'original_skin_color_variations':
+                    result[key] = torch.zeros(actual_batch_size, DEFAULT_MAX_FRAMES, 3)
+                elif key == 'head_pose' or key == 'original_head_pose':
+                    result[key] = torch.zeros(actual_batch_size, DEFAULT_MAX_FRAMES, 3)
+                elif key == 'eye_blink_features' or key == 'original_eye_blink_features':
+                    result[key] = torch.zeros(actual_batch_size, DEFAULT_MAX_FRAMES)
+                elif key == 'frequency_features' or key == 'original_frequency_features':
+                    result[key] = torch.zeros(actual_batch_size, 1, 16, 16)
+                else:
+                    result[key] = None
+        elif key in ['ela_features', 'metadata_features', 'face_embeddings', 'temporal_consistency']:
+            # Optional tensor features
+            if valid_values and all(isinstance(v, torch.Tensor) for v in valid_values):
+                try:
+                    # Stack valid tensors and pad batch if needed
+                    if len(valid_values) == actual_batch_size:
+                        # Check if all tensors have the same shape
+                        ref_shape = valid_values[0].shape
+                        if all(v.shape == ref_shape for v in valid_values):
+                            result[key] = torch.stack(valid_values)
+                        else:
+                            # Handle different shapes by padding
+                            max_shape = list(ref_shape)
+                            for v in valid_values[1:]:
+                                for j in range(len(v.shape)):
+                                    max_shape[j] = max(max_shape[j], v.shape[j])
+                            
+                            # Pad all tensors to max shape
+                            padded_tensors = []
+                            for v in valid_values:
+                                if list(v.shape) == max_shape:
+                                    padded_tensors.append(v.clone())  # Clone to avoid memory sharing
+                                else:
+                                    # Create padding specification
+                                    pad_spec = []
+                                    for j in range(len(v.shape)):
+                                        pad_amount = max_shape[j] - v.shape[j]
+                                        pad_spec = [0, pad_amount] + pad_spec
+                                    
+                                    padded = torch.nn.functional.pad(v, pad_spec)
+                                    padded_tensors.append(padded.clone())  # Clone to avoid memory sharing
+                            
+                            result[key] = torch.stack(padded_tensors)
+                    else:
+                        # Create tensor with zeros for missing samples
+                        ref_shape = valid_values[0].shape
+                        full_batch_tensor = torch.zeros(actual_batch_size, *ref_shape, dtype=valid_values[0].dtype)
+                        
+                        for i, valid_idx in enumerate(valid_indices):
+                            if valid_idx < actual_batch_size:
+                                full_batch_tensor[valid_idx] = valid_values[i].clone()  # Clone to avoid memory sharing
+                        
+                        result[key] = full_batch_tensor
+                except Exception as e:
+                    print(f"[WARNING] Failed to collate optional feature {key}: {e}")
+                    result[key] = None
+            else:
+                result[key] = None
+                
+        elif key in ['original_video_frames', 'original_audio', 'audio_visual_sync']:
+            # These may have different batch sizes, handle gracefully by creating zeros for missing samples
+            if valid_values and all(isinstance(v, torch.Tensor) for v in valid_values):
+                try:
+                    # Check if we can create a consistent batch
+                    ref_shape = valid_values[0].shape
+                    compatible = all(v.shape[1:] == ref_shape[1:] for v in valid_values)
+                    
+                    if compatible and len(valid_values) == actual_batch_size:
+                        result[key] = torch.stack(valid_values)
+                    else:
+                        # For mismatched batches, create full batch tensor with zeros for missing samples
+                        if len(valid_values) > 0:
+                            # Create full batch tensor filled with zeros
+                            full_batch_tensor = torch.zeros(actual_batch_size, *ref_shape, dtype=valid_values[0].dtype)
+                            
+                            # Fill in the valid values at their correct positions
+                            for i, valid_idx in enumerate(valid_indices):
+                                if valid_idx < actual_batch_size and i < len(valid_values):
+                                    full_batch_tensor[valid_idx] = valid_values[i].clone()
+                            
+                            result[key] = full_batch_tensor
+                        else:
+                            # ❌ Don't create zero tensors - causes model to enter contrastive mode!
+                            # Set to None to properly signal absence of original data
+                            result[key] = None
+                except Exception as e:
+                    # ❌ Don't create zero tensors - causes model to enter contrastive mode!
+                    # Set to None to properly signal absence of original data
+                    result[key] = None
+            else:
+                # ❌ Don't create zero tensors - causes model to enter contrastive mode!
+                # Set to None to properly signal absence of original data
+                result[key] = None
+                
+        elif key in ['fake_periods', 'timestamps']:
+            # List of lists, don't stack
+            result[key] = [item.get(key, []) for item in batch]
+        elif key in ['transcript', 'file_path']:
+            # List of strings
+            result[key] = [item.get(key, "") for item in batch]
+        elif key == 'fake_mask':
+            # Don't stack fake_masks of different sizes, keep as list
+            result[key] = [item.get(key, []) for item in batch]
+        elif key == 'label':
+            # Labels should always be stackable
+            if valid_values and all(isinstance(v, (int, torch.Tensor)) for v in valid_values):
+                # Create full batch labels
+                labels = torch.zeros(actual_batch_size, dtype=torch.long)
+                for i, valid_idx in enumerate(valid_indices):
+                    if isinstance(valid_values[i], torch.Tensor):
+                        labels[valid_idx] = valid_values[i].clone()
+                    else:
+                        labels[valid_idx] = torch.tensor(valid_values[i], dtype=torch.long)
+                result[key] = labels
+            else:
+                # Fallback to all zeros
+                result[key] = torch.zeros(actual_batch_size, dtype=torch.long)
+        else:
+            # Handle other types if needed
+            result[key] = [item.get(key) for item in batch]
+    
+    return result
